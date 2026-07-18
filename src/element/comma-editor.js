@@ -324,6 +324,11 @@ export class CommaEditorElement extends HTMLElement {
             <button class="ce-button primary" type="button" data-action="apply-review" data-el="apply-review">Add ready notes</button>
           </div>
         </footer>
+      </section>
+      <section class="ce-lightbox" data-el="lightbox" data-action="close-lightbox" hidden aria-label="Image preview">
+        <button class="ce-lightbox-close" type="button" data-action="close-lightbox" data-el="lightbox-close" aria-label="Close image preview">×</button>
+        <img data-el="lightbox-image" alt="">
+        <div class="ce-lightbox-caption" data-el="lightbox-caption"></div>
       </section>`;
   }
 
@@ -348,6 +353,14 @@ export class CommaEditorElement extends HTMLElement {
       }
       if (event.key === 'Escape') this._exitSource();
     });
+    this._el('preview').addEventListener('error', (event) => {
+      if (event.target instanceof HTMLImageElement && event.target.dataset.assetState !== 'resolving') {
+        this._replaceImageWithFallback(event.target);
+      }
+    }, true);
+    this.shadowRoot.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !this._el('lightbox').hidden) this._closeImageLightbox();
+    });
   }
 
   async _onClick(event) {
@@ -369,6 +382,14 @@ export class CommaEditorElement extends HTMLElement {
       if (action === 'close-review') this._closeReviewQueue();
       if (action === 'toggle-review-item') this._toggleReviewItem(event.target.dataset.proposalId, event.target.checked);
       if (action === 'apply-review') await this._applyCommentBatch();
+      if (action === 'close-lightbox') this._closeImageLightbox();
+      return;
+    }
+
+    const image = event.target.closest('.ce-preview img');
+    if (image) {
+      event.preventDefault();
+      this._openImageLightbox(image);
       return;
     }
 
@@ -421,16 +442,90 @@ export class CommaEditorElement extends HTMLElement {
       preview.innerHTML = '<div class="ce-empty"><p>This document is empty.</p><p>Open Source mode to begin writing.</p></div>';
       return;
     }
+    const assetDocument = this.documentState;
+    const resolveAsset = this._capabilities.assets?.resolve && this._adapter?.resolveAsset
+      ? (src) => this._adapter.resolveAsset({ src, document: assetDocument })
+      : null;
     for (const block of this._blocks) {
       const wrapper = document.createElement('section');
       wrapper.className = 'ce-block';
       wrapper.dataset.blockIndex = String(block.index);
       wrapper.dataset.blockType = block.type;
-      wrapper.innerHTML = this._renderer.render(block.raw);
+      wrapper.innerHTML = this._renderer.render(block.raw, { resolveAsset });
       preview.appendChild(wrapper);
     }
     this._applyCommentAnchors();
+    this._hydrateScientificContent(preview);
     this._renderer.hydrate(preview).catch((error) => this._emit('comma-error', { phase: 'render-mermaid', error }));
+  }
+
+  _hydrateScientificContent(preview) {
+    preview.querySelectorAll('table').forEach((table) => {
+      if (table.parentElement?.classList.contains('ce-table-scroll')) return;
+      const scroller = document.createElement('div');
+      scroller.className = 'ce-table-scroll';
+      table.replaceWith(scroller);
+      scroller.appendChild(table);
+    });
+
+    const images = Array.from(preview.querySelectorAll('img'));
+    for (const image of images) {
+      image.dataset.originalSrc = image.dataset.originalSrc || image.getAttribute('src') || '';
+      image.dataset.assetState = 'loading';
+      this._promoteImageFigure(image);
+      if (image.complete) {
+        if (image.naturalWidth > 0) image.dataset.assetState = 'ready';
+        else this._replaceImageWithFallback(image);
+      } else {
+        image.addEventListener('load', () => { image.dataset.assetState = 'ready'; }, { once: true });
+      }
+    }
+  }
+
+  _promoteImageFigure(image) {
+    const paragraph = image.closest('p');
+    if (!paragraph || paragraph.textContent.trim() || paragraph.childElementCount !== 1) return;
+    const media = paragraph.firstElementChild;
+    if (media !== image && !(media?.matches('a') && media.querySelector(':scope > img') === image)) return;
+    const figure = document.createElement('figure');
+    paragraph.replaceWith(figure);
+    figure.appendChild(media);
+    const caption = String(image.getAttribute('alt') || '').trim();
+    if (caption) {
+      const figcaption = document.createElement('figcaption');
+      figcaption.textContent = caption;
+      figure.appendChild(figcaption);
+    }
+  }
+
+  _replaceImageWithFallback(image, reason = '') {
+    if (!image?.isConnected || image.dataset.assetState === 'failed') return;
+    image.dataset.assetState = 'failed';
+    const source = image.dataset.originalSrc || image.getAttribute('src') || '';
+    const fallback = document.createElement('a');
+    fallback.className = 'ce-image-fallback';
+    fallback.href = image.getAttribute('src') || source || '#';
+    fallback.target = '_blank';
+    fallback.rel = 'noopener noreferrer';
+    fallback.textContent = reason
+      ? `Image unavailable: ${reason}`
+      : `Image unavailable: ${image.alt || source || 'unnamed image'}`;
+    image.replaceWith(fallback);
+  }
+
+  _openImageLightbox(image) {
+    if (!image?.src || image.dataset.assetState === 'failed') return;
+    this._el('lightbox-image').src = image.currentSrc || image.src;
+    this._el('lightbox-image').alt = image.alt || '';
+    this._el('lightbox-caption').textContent = image.alt || image.dataset.originalSrc || '';
+    this._el('lightbox').hidden = false;
+    this._el('lightbox-close').focus?.();
+  }
+
+  _closeImageLightbox() {
+    this._el('lightbox').hidden = true;
+    this._el('lightbox-image').removeAttribute('src');
+    this._el('lightbox-caption').textContent = '';
   }
 
   _enterBlockEdit(index) {

@@ -62,6 +62,7 @@ function mathExtensions() {
 
 export class MarkdownRenderer {
   constructor() {
+    this.assetResolver = null;
     this.marked = new Marked({ gfm: true, breaks: false });
     this.marked.use({
       extensions: mathExtensions(),
@@ -81,6 +82,16 @@ export class MarkdownRenderer {
           const className = language ? ` class="hljs language-${escapeHtml(language)}"` : ' class="hljs"';
           return `<pre><code${className}>${highlighted}</code></pre>`;
         },
+        image: ({ href, title, text }) => {
+          const original = String(href || '');
+          let resolved = original;
+          try {
+            const candidate = this.assetResolver?.(original);
+            if (typeof candidate === 'string' && candidate) resolved = candidate;
+          } catch { /* the rendered fallback will explain a failed URL */ }
+          const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+          return `<img src="${escapeHtml(resolved)}" data-original-src="${escapeHtml(original)}" alt="${escapeHtml(text || '')}"${titleAttr}>`;
+        },
       },
     });
   }
@@ -89,12 +100,17 @@ export class MarkdownRenderer {
     return this.marked.lexer(String(source ?? ''));
   }
 
-  render(source) {
-    const unsafe = this.marked.parse(String(source ?? ''));
-    return DOMPurify.sanitize(unsafe, {
-      USE_PROFILES: { html: true },
-      ADD_ATTR: ['target', 'rel', 'data-language'],
-    });
+  render(source, { resolveAsset = null } = {}) {
+    this.assetResolver = typeof resolveAsset === 'function' ? resolveAsset : null;
+    try {
+      const unsafe = this.marked.parse(String(source ?? ''));
+      return DOMPurify.sanitize(unsafe, {
+        USE_PROFILES: { html: true },
+        ADD_ATTR: ['target', 'rel', 'data-language', 'data-original-src'],
+      });
+    } finally {
+      this.assetResolver = null;
+    }
   }
 
   async hydrate(root) {

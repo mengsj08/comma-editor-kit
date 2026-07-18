@@ -57,7 +57,7 @@ await editor.load();
 ```
 
 ```html
-<comma-editor actor="june"></comma-editor>
+<comma-editor actor="june" theme="scientific"></comma-editor>
 ```
 
 The component dispatches host-level events instead of binding to a particular AI provider:
@@ -102,6 +102,7 @@ adapter.capabilities = {
   document: { load: true, save: true, replace: false },
   comments: { list: true, create: true, batch: true, update: true, delete: true },
   events: { list: true },
+  assets: { resolve: true },
 };
 ```
 
@@ -119,7 +120,14 @@ createComments({ comments, baseRev, actor, source }) -> { comments, rev }
 updateComment(id, patch) -> Comment
 deleteComment(id) -> void
 listEvents() -> EditEvent[]
+resolveAsset({ src, document }) -> URL string
 ```
+
+`theme="scientific"` selects the white, figure-safe manuscript surface used by
+Review Studio. The component adds image captions from Markdown alt text, a
+lightbox, explicit load-failure fallbacks, horizontally scrollable wide tables,
+and adapter-mediated local asset URLs. Hosts retain filesystem and network
+authority; the component never opens a local path directly.
 
 `save` must reject stale `baseRev` values with `RevisionConflictError`. The component never owns filesystem, Chrome, or AI permissions.
 

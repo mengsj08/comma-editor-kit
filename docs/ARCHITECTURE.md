@@ -39,6 +39,8 @@ The component consumes a document contract. It does not know where a document li
 - `comma-ai-request`: host decides whether Codex, Claude, another model, or no AI handles a request.
 - `previewCommentBatch`: validates a structured response and opens a human confirmation queue; it never writes by itself.
 - CSS custom properties: host-level visual tuning without DOM coupling.
+- `resolveAsset`: optional adapter capability for turning document-relative
+  image references into host-authorized URLs; editor-core never reads files.
 - Future MCP: maps semantic document tools to an adapter/service, not to UI clicks.
 
 ## Promotion gate

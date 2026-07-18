@@ -44,6 +44,7 @@ const adapter = new HttpDocumentAdapter({
   documentUrl: `/api/doc?path=${encodeURIComponent(DOC_PATH)}`,
   commentsUrl: `/api/comments?path=${encodeURIComponent(DOC_PATH)}`,
   commentsBatchUrl: `/api/comments/batch?path=${encodeURIComponent(DOC_PATH)}`,
+  assetUrl: `/api/asset?doc=${encodeURIComponent(DOC_PATH)}`,
 });
 
 editor.adapter = adapter;

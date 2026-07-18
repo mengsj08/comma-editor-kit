@@ -99,6 +99,17 @@ test('adapter capabilities distinguish a valid document-only host', () => {
   const capabilities = assertDocumentAdapter(adapter, { writable: true });
   assert.equal(capabilities.document.save, true);
   assert.equal(capabilities.comments.create, false);
+  assert.equal(capabilities.assets.resolve, false);
   assert.equal(capabilities.savePolicy, 'explicit');
   assert.equal(resolveAdapterCapabilities({ capabilities: { comments: { create: true } } }).comments.create, false);
+});
+
+test('adapter capabilities expose asset resolution only when implemented', () => {
+  const adapter = {
+    async load() { return {}; },
+    resolveAsset({ src }) { return `/asset?source=${encodeURIComponent(src)}`; },
+    capabilities: { assets: { resolve: true } },
+  };
+  assert.equal(resolveAdapterCapabilities(adapter).assets.resolve, true);
+  assert.equal(resolveAdapterCapabilities({ capabilities: { assets: { resolve: true } } }).assets.resolve, false);
 });

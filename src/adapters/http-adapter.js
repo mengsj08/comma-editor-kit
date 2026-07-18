@@ -18,12 +18,13 @@ async function requestJson(url, init = {}) {
 }
 
 export class HttpDocumentAdapter {
-  constructor({ documentUrl, commentsUrl, commentsBatchUrl = '', eventsUrl = '', headers = {} } = {}) {
+  constructor({ documentUrl, commentsUrl, commentsBatchUrl = '', eventsUrl = '', assetUrl = '', headers = {} } = {}) {
     if (!documentUrl || !commentsUrl) throw new TypeError('documentUrl and commentsUrl are required');
     this.documentUrl = documentUrl;
     this.commentsUrl = commentsUrl;
     this.commentsBatchUrl = commentsBatchUrl;
     this.eventsUrl = eventsUrl;
+    this.assetUrl = assetUrl;
     this.headers = { ...headers };
     this.capabilities = {
       savePolicy: 'immediate',
@@ -36,6 +37,7 @@ export class HttpDocumentAdapter {
         delete: true,
       },
       events: { list: Boolean(eventsUrl) },
+      assets: { resolve: Boolean(assetUrl) },
     };
   }
 
@@ -97,5 +99,13 @@ export class HttpDocumentAdapter {
     if (!this.eventsUrl) return [];
     const data = await requestJson(this.eventsUrl, { headers: this.headers });
     return data.events || [];
+  }
+
+  resolveAsset({ src }) {
+    const source = String(src || '').trim();
+    if (!this.assetUrl || !source) return source;
+    if (/^(?:https?:|data:|blob:)/i.test(source) || source.startsWith('//')) return source;
+    const separator = this.assetUrl.includes('?') ? '&' : '?';
+    return `${this.assetUrl}${separator}source=${encodeURIComponent(source)}`;
   }
 }

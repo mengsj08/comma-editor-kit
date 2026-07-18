@@ -13,6 +13,38 @@ import server
 
 
 class ReviewApiTests(unittest.TestCase):
+    def test_document_relative_assets_are_served_and_confined(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            nested = os.path.join(tmp, "nested")
+            figures = os.path.join(nested, "figures")
+            os.makedirs(figures)
+            with open(os.path.join(nested, "paper.md"), "w", encoding="utf-8") as fh:
+                fh.write("![Control](figures/control.png)\n")
+            payload = b"\x89PNG\r\n\x1a\ncontrolled-test-image"
+            with open(os.path.join(figures, "control.png"), "wb") as fh:
+                fh.write(payload)
+            with mock.patch.object(server, "DATA_ROOT", tmp):
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    with urllib.request.urlopen(
+                        base + "/api/asset?doc=nested%2Fpaper.md&source=figures%2Fcontrol.png"
+                    ) as response:
+                        self.assertEqual(response.headers.get_content_type(), "image/png")
+                        self.assertEqual(response.read(), payload)
+                    escaped = self._request_error(
+                        base + "/api/asset?doc=nested%2Fpaper.md&source=..%2F..%2Foutside.png"
+                    )
+                    self.assertEqual(escaped[0], 400)
+                    self.assertIn("escapes data root", escaped[1]["error"])
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
     def test_public_comment_contract_and_atomic_batch_revision(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = os.path.realpath(raw_tmp)

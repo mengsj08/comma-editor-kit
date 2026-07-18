@@ -8,6 +8,7 @@ const METHOD_CAPABILITIES = Object.freeze({
   updateComment: ['comments', 'update'],
   deleteComment: ['comments', 'delete'],
   listEvents: ['events', 'list'],
+  resolveAsset: ['assets', 'resolve'],
 });
 
 export const COMMA_ADAPTER_SCHEMA = 'comma-document-adapter/v1';
@@ -33,6 +34,7 @@ export function resolveAdapterCapabilities(adapter) {
     document: { load: false, save: false, replace: false },
     comments: { list: false, create: false, batch: false, update: false, delete: false },
     events: { list: false },
+    assets: { resolve: false },
     savePolicy: normalizeSavePolicy(adapter?.capabilities?.savePolicy || adapter?.savePolicy),
   };
   for (const [method, [group, name]] of Object.entries(METHOD_CAPABILITIES)) {

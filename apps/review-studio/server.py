@@ -9,6 +9,7 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
   GET  /                      -> editor shell
   GET  /static/<file>         -> js/css assets
   GET  /api/doc?path=         -> read document {ok, body, rev, path}
+  GET  /api/asset?doc=&source= -> serve a document-relative scientific image
   PUT  /api/doc               -> save document (atomic, optimistic-concurrency)
   GET  /api/comments?path=    -> list sidecar comments
   POST /api/comments          -> create anchored comment
@@ -33,6 +34,7 @@ Data model:
 """
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -73,6 +75,10 @@ _SESSION_ID_RE = re.compile(r"^review-[a-f0-9]{12}$")
 _MUTATION_LOCK = threading.RLock()
 _PRIORITIES = {"P0", "P1", "P2", "P3"}
 _DECISIONS = {"accepted", "proposed", "rejected"}
+_ASSET_MIME_TYPES = {
+    "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml",
+}
+_MAX_ASSET_BYTES = 40 * 1024 * 1024
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
@@ -145,6 +151,30 @@ def _safe_doc_path(rel: str) -> str:
     if not candidate.endswith(".md"):
         raise ValueError("only .md documents")
     return candidate
+
+
+def _safe_asset_path(doc_rel: str, source: str):
+    """Resolve a Markdown image beside its document without escaping DATA_ROOT."""
+    doc = _safe_doc_path(doc_rel)
+    raw = urllib.parse.unquote(str(source or "")).strip()
+    if not raw or re.match(r"^(?:https?:|data:|blob:|//)", raw, re.I):
+        raise ValueError("asset source must be a local document path")
+    path_only = raw.split("#", 1)[0].split("?", 1)[0].replace("\\", "/")
+    if path_only.startswith("/"):
+        candidate = os.path.realpath(os.path.join(DATA_ROOT, path_only.lstrip("/")))
+    else:
+        candidate = os.path.realpath(os.path.join(os.path.dirname(doc), path_only))
+    root = os.path.realpath(DATA_ROOT)
+    if not candidate.startswith(root + os.sep):
+        raise ValueError("asset path escapes data root")
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError("asset not found")
+    if os.path.getsize(candidate) > _MAX_ASSET_BYTES:
+        raise ValueError("asset exceeds 40 MB limit")
+    content_type = mimetypes.guess_type(candidate)[0] or "application/octet-stream"
+    if content_type not in _ASSET_MIME_TYPES:
+        raise ValueError("unsupported asset type")
+    return candidate, content_type
 
 
 def _atomic_write(path: str, content: str) -> None:
@@ -683,11 +713,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path, content_type):
+    def _send_file(self, path, content_type, headers=None):
         with open(path, "rb") as fh:
             body = fh.read()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -739,6 +771,21 @@ class Handler(BaseHTTPRequestHandler):
                         "application/json" if fp.endswith(".json") or fp.endswith(".map") else \
                         "text/css" if fp.endswith(".css") else "application/octet-stream"
                 return self._send_file(fp, ctype + "; charset=utf-8")
+            if route == "/api/asset":
+                try:
+                    asset, content_type = _safe_asset_path(
+                        (qs.get("doc") or [""])[0],
+                        (qs.get("source") or [""])[0],
+                    )
+                except FileNotFoundError:
+                    return self._send_json({"ok": False, "error": "asset not found"}, 404)
+                headers = {
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                }
+                if content_type == "image/svg+xml":
+                    headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+                return self._send_file(asset, content_type, headers)
             if route == "/api/doc":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 if not os.path.exists(doc):

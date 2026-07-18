@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemoryDocumentAdapter } from '../src/adapters/memory-adapter.js';
 import { StorageDocumentAdapter } from '../src/adapters/storage-adapter.js';
+import { HttpDocumentAdapter } from '../src/adapters/http-adapter.js';
 import { RevisionConflictError } from '../src/core/revision.js';
 
 test('memory adapter rejects stale writes and records actors', async () => {
@@ -88,4 +89,19 @@ test('storage adapter writes one complete comment batch in one record update', a
   });
   assert.equal(writes, writesBeforeBatch + 1);
   assert.equal((await adapter.listComments()).length, 2);
+});
+
+test('HTTP adapter resolves local assets without proxying remote images', () => {
+  const adapter = new HttpDocumentAdapter({
+    documentUrl: '/api/doc?path=nested/paper.md',
+    commentsUrl: '/api/comments?path=nested/paper.md',
+    assetUrl: '/api/asset?doc=nested%2Fpaper.md',
+  });
+  assert.equal(adapter.capabilities.assets.resolve, true);
+  assert.equal(
+    adapter.resolveAsset({ src: 'figures/plot 1.png' }),
+    '/api/asset?doc=nested%2Fpaper.md&source=figures%2Fplot%201.png',
+  );
+  assert.equal(adapter.resolveAsset({ src: 'https://example.org/plot.png' }), 'https://example.org/plot.png');
+  assert.equal(adapter.resolveAsset({ src: 'data:image/png;base64,AA==' }), 'data:image/png;base64,AA==');
 });

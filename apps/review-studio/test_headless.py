@@ -6,6 +6,7 @@ COMMA_REVIEW_PORT (default 8891). The fixture is restored on exit.
 """
 import json
 import os
+import base64
 import time
 import urllib.request
 
@@ -17,6 +18,10 @@ URL = f"{BASE}/?doc=paper.md"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DOC = os.path.join(ROOT, "data", "paper.md")
 COMMENTS = DOC + ".comments.json"
+ASSET = os.path.join(ROOT, "data", "scientific-control.png")
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z9xkAAAAASUVORK5CYII="
+)
 
 
 def api(path, method="GET", payload=None):
@@ -55,12 +60,20 @@ def editor_snapshot(page):
         katex: root.querySelectorAll('.katex').length,
         katexErrors: root.querySelectorAll('.katex-error').length,
         tables: root.querySelectorAll('table').length,
+        tableScrolls: root.querySelectorAll('.ce-table-scroll').length,
+        figures: root.querySelectorAll('figure').length,
+        images: root.querySelectorAll('.ce-preview img').length,
+        imageStates: Array.from(root.querySelectorAll('.ce-preview img')).map(image => image.dataset.assetState),
         code: root.querySelectorAll('pre code').length,
         comments: root.querySelectorAll('.ce-comment').length,
         resolved: resolutions.filter(item => Number.isInteger(item.blockIndex) && item.blockIndex >= 0).length,
         stale: resolutions.filter(item => item.state === 'missing').length,
         ambiguous: resolutions.filter(item => item.state === 'ambiguous').length,
         resolutionStates: resolutions.map(item => item.state),
+        theme: editor.getAttribute('theme'),
+        shellBackground: getComputedStyle(root.querySelector('.ce-shell')).backgroundColor,
+        paperBackground: getComputedStyle(root.querySelector('.ce-document')).backgroundColor,
+        textureDisplay: getComputedStyle(root.querySelector('.ce-shell'), '::before').display,
       };
     }""")
 
@@ -68,6 +81,20 @@ def editor_snapshot(page):
 def main():
     reset_comments()
     original = read_doc()
+    scientific_fixture = original + """
+
+## Scientific media fixture
+
+![Scientific control image](scientific-control.png)
+
+| Marker | Cohort | Condition | Assay | Timepoint | Replicate | Mean | SD | CI | P value | Effect | Batch | Source | Note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| EPCAM | Validation | Treated | Imaging | Day 14 | R03 | 18.2 | 1.4 | 16.8–19.6 | 0.004 | 1.82 | B-2026-07 | PMID:00000000 | controlled fixture |
+"""
+    with open(DOC, "w", encoding="utf-8") as handle:
+        handle.write(scientific_fixture)
+    with open(ASSET, "wb") as handle:
+        handle.write(PNG_1X1)
     results = {}
     errors = []
     try:
@@ -80,6 +107,7 @@ def main():
             page.goto(URL, wait_until="load")
             page.locator("comma-editor").locator(".ce-block").first.wait_for(timeout=15000)
             page.locator("comma-editor").locator(".katex").first.wait_for(timeout=15000)
+            page.wait_for_function("document.querySelector('comma-editor').shadowRoot.querySelector('.ce-preview img')?.dataset.assetState === 'ready'")
             page.wait_for_function("document.querySelector('comma-editor').documentState.rev.length > 0")
             first = editor_snapshot(page)
             first["fullLoadMs"] = round((time.time() - started) * 1000)
@@ -90,6 +118,10 @@ def main():
               return performance.now() - started;
             }"""))
             results["public_component_render"] = first
+            page.locator("comma-editor").locator(".ce-preview img").click()
+            page.wait_for_function("!document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=lightbox]').hidden")
+            results["image_lightbox_opened"] = True
+            page.locator("comma-editor").locator("[data-el=lightbox-close]").click()
 
             document = api("/api/doc?path=paper.md")
             markers = [
@@ -111,6 +143,45 @@ def main():
             page.evaluate("document.querySelector('comma-editor').refreshComments()")
             page.wait_for_function("document.querySelector('comma-editor').shadowRoot.querySelectorAll('.ce-comment').length === 5")
             results["anchors_baseline"] = editor_snapshot(page)
+
+            api("/api/comments", "POST", {
+                "path": "paper.md",
+                "kind": "overall",
+                "actor": "LayoutBot",
+                "content": "continuous-scientific-review-token-" * 40,
+            })
+            page.evaluate("document.querySelector('comma-editor').refreshComments()")
+            page.wait_for_function("document.querySelector('comma-editor').shadowRoot.querySelectorAll('.ce-comment').length === 6")
+            page.set_viewport_size({"width": 2036, "height": 1143})
+            results["scientific_layout"] = page.evaluate("""() => {
+              const root = document.querySelector('comma-editor').shadowRoot;
+              const sidebar = root.querySelector('.ce-sidebar');
+              const comments = root.querySelector('.ce-comments');
+              const card = root.querySelector('.ce-comment');
+              return {
+                sidebarWidth: sidebar.getBoundingClientRect().width,
+                sidebarScrollWidth: sidebar.scrollWidth,
+                commentsWidth: comments.getBoundingClientRect().width,
+                commentsScrollWidth: comments.scrollWidth,
+                cardWidth: card.getBoundingClientRect().width,
+                cardScrollWidth: card.scrollWidth,
+              };
+            }""")
+            page.set_viewport_size({"width": 700, "height": 900})
+            results["narrow_layout"] = page.evaluate("""() => {
+              const root = document.querySelector('comma-editor').shadowRoot;
+              const shell = root.querySelector('.ce-shell');
+              const comments = root.querySelector('.ce-comments');
+              const card = root.querySelector('.ce-comment');
+              return {
+                shellWidth: shell.getBoundingClientRect().width,
+                shellScrollWidth: shell.scrollWidth,
+                commentsWidth: comments.getBoundingClientRect().width,
+                commentsScrollWidth: comments.scrollWidth,
+                cardWidth: card.getBoundingClientRect().width,
+                cardScrollWidth: card.scrollWidth,
+              };
+            }""")
 
             body = read_doc()
             insertion = "\n\nINSERTED-UPSTREAM: " + ("provenance " * 20).strip() + "\n"
@@ -144,10 +215,26 @@ def main():
     finally:
         with open(DOC, "w", encoding="utf-8") as handle:
             handle.write(original)
+        if os.path.exists(ASSET):
+            os.remove(ASSET)
         reset_comments()
 
     assert results["public_component_render"]["blocks"] > 100
     assert results["public_component_render"]["katex"] > 0
+    assert results["public_component_render"]["images"] == 1
+    assert results["public_component_render"]["figures"] == 1
+    assert results["public_component_render"]["tableScrolls"] == results["public_component_render"]["tables"]
+    assert results["public_component_render"]["imageStates"] == ["ready"]
+    assert results["public_component_render"]["theme"] == "scientific"
+    assert results["public_component_render"]["shellBackground"] == "rgb(255, 255, 255)"
+    assert results["public_component_render"]["paperBackground"] == "rgb(255, 255, 255)"
+    assert results["public_component_render"]["textureDisplay"] == "none"
+    assert results["image_lightbox_opened"] is True
+    assert results["scientific_layout"]["commentsScrollWidth"] <= results["scientific_layout"]["commentsWidth"] + 1
+    assert results["scientific_layout"]["cardScrollWidth"] <= results["scientific_layout"]["cardWidth"] + 1
+    assert results["narrow_layout"]["shellScrollWidth"] <= results["narrow_layout"]["shellWidth"] + 1
+    assert results["narrow_layout"]["commentsScrollWidth"] <= results["narrow_layout"]["commentsWidth"] + 1
+    assert results["narrow_layout"]["cardScrollWidth"] <= results["narrow_layout"]["cardWidth"] + 1
     assert results["anchors_baseline"]["resolved"] == 5
     assert results["anchors_after_upstream_edit"]["resolved"] == 5
     assert results["anchors_after_quote_rewrite"]["stale"] == 1
