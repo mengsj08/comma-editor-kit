@@ -15,3 +15,26 @@ The migration deliberately excluded:
 - `node_modules`, `dist`, Chrome release builds, and browser artifacts.
 
 The original directories remain read-only migration sources until host parity and launch-path switching are verified. They are not canonical development locations after this record.
+
+## 2026-07-19 v0.3 host convergence
+
+The first convergence slice is implemented in the canonical repositories:
+
+- the public core versions `Document`, `Comment`, `Finding`, `ReviewSession`,
+  `WritebackReceipt`, and `EditEvent`, and normalizes legacy snake/camel fields;
+- adapters expose a truthful capability manifest and one of two save policies;
+- Review Studio consumes `<comma-editor>` for the full document surface. Its
+  copied renderer and anchor modules were removed; the review drawer remains a
+  host workflow above public events and comment APIs;
+- ResearchLab Markdown Studio consumes the same component through an explicit-
+  save Adapter. Disk and comment writes remain revision-locked and confined to
+  a confirmed RLP project;
+- kanban-personal has a document-only Adapter and contract tests. It is not yet
+  wired into the live detail page because that worktree contains active UI work;
+  this preserves a clean, reviewable pilot boundary.
+
+The next slice is the bounded kanban detail-page pilot, followed by removal of
+its duplicate renderer/block editor only after parity tests pass. The public
+`8891` launch path now runs canonical code while preserving the existing private
+data directory; `8892` remains a parallel rollback service. The old TaskSpace
+source stays as a rollback reference and is no longer the running application.

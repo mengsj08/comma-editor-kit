@@ -13,6 +13,54 @@ import server
 
 
 class ReviewApiTests(unittest.TestCase):
+    def test_public_comment_contract_and_atomic_batch_revision(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            body = "# Results\n\nA precise sentence for an anchored comment.\n"
+            with open(os.path.join(tmp, "paper.md"), "w", encoding="utf-8") as fh:
+                fh.write(body)
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")):
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    document = self._request(base + "/api/doc?path=paper.md")
+                    overall = self._request(base + "/api/comments?path=paper.md", "POST", {
+                        "kind": "overall", "actor": "June", "content": "整体意见",
+                    })
+                    self.assertEqual(overall["comment"]["kind"], "overall")
+                    self.assertEqual(overall["comment"]["author"], "June")
+                    batch = self._request(base + "/api/comments/batch?path=paper.md", "POST", {
+                        "baseRev": document["rev"],
+                        "actor": "AI Reviewer",
+                        "source": "contract-test",
+                        "comments": [{
+                            "kind": "anchored",
+                            "quoteText": "A precise sentence for an anchored comment.",
+                            "content": "请补来源",
+                            "priority": "P1",
+                            "sourceLocator": {"bodyRev": document["rev"]},
+                        }],
+                    })
+                    self.assertEqual(len(batch["comments"]), 1)
+                    self.assertEqual(batch["comments"][0]["source"], "contract-test")
+                    self.assertEqual(batch["comments"][0]["quote_text"], "A precise sentence for an anchored comment.")
+
+                    conflict = self._request_error(base + "/api/comments/batch?path=paper.md", "POST", {
+                        "base_rev": "sha256-stale",
+                        "comments": [{"kind": "overall", "content": "不应写入"}],
+                    })
+                    self.assertEqual(conflict[0], 409)
+                    self.assertTrue(conflict[1]["conflict"])
+                    comments = self._request(base + "/api/comments?path=paper.md")
+                    self.assertEqual(len(comments["comments"]), 2)
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
     def test_review_discussion_and_incremental_writeback(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = os.path.realpath(raw_tmp)
@@ -90,6 +138,21 @@ class ReviewApiTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8")
             raise AssertionError(f"HTTP {exc.code}: {detail}") from exc
+
+    @staticmethod
+    def _request_error(url, method="GET", payload=None):
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            urllib.request.urlopen(request, timeout=10)
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+            finally:
+                exc.close()
+        raise AssertionError("request unexpectedly succeeded")
 
 
 if __name__ == "__main__":

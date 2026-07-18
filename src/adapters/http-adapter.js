@@ -25,6 +25,18 @@ export class HttpDocumentAdapter {
     this.commentsBatchUrl = commentsBatchUrl;
     this.eventsUrl = eventsUrl;
     this.headers = { ...headers };
+    this.capabilities = {
+      savePolicy: 'immediate',
+      document: { load: true, save: true, replace: false },
+      comments: {
+        list: true,
+        create: true,
+        batch: Boolean(commentsBatchUrl),
+        update: true,
+        delete: true,
+      },
+      events: { list: Boolean(eventsUrl) },
+    };
   }
 
   _json(method, body) {

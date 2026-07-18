@@ -10,6 +10,12 @@ import {
 import { replaceBlock, segmentMarkdown } from '../src/core/blocks.js';
 import { previewCommentBatch } from '../src/core/comment-batch.js';
 import { revisionOf } from '../src/core/revision.js';
+import {
+  normalizeFinding,
+  normalizeReviewSession,
+  normalizeWritebackReceipt,
+} from '../src/core/models.js';
+import { assertDocumentAdapter, resolveAdapterCapabilities } from '../src/core/adapter-contract.js';
 
 test('revision is deterministic and content-sensitive', async () => {
   assert.equal(await revisionOf('alpha'), await revisionOf('alpha'));
@@ -68,4 +74,31 @@ test('comment batch preview rejects duplicate proposals without guessing', () =>
   assert.equal(preview.counts.ready, 1);
   assert.equal(preview.counts.invalid, 1);
   assert.match(preview.items[1].reason, /Duplicate/);
+});
+
+test('review models normalize legacy snake_case without losing writeback identity', () => {
+  const finding = normalizeFinding({
+    id: 'F001', quote_text: 'Exact quote.', evidence_requirement: 'PMID',
+    anchor_state: 'ready', applied_comment_id: 'c-1', decision: 'accepted',
+  });
+  assert.equal(finding.quoteText, 'Exact quote.');
+  assert.equal(finding.appliedCommentId, 'c-1');
+  const receipt = normalizeWritebackReceipt({ base_rev: 'r1', created: ['c-1'], skipped: ['F002'] });
+  assert.equal(receipt.baseRev, 'r1');
+  const session = normalizeReviewSession({
+    id: 'review-1', doc_path: 'paper.md', base_rev: 'r1', findings: [finding],
+    writeback_receipts: [receipt],
+  });
+  assert.equal(session.documentId, 'paper.md');
+  assert.equal(session.findings[0].id, 'F001');
+  assert.equal(session.writebackReceipts.length, 1);
+});
+
+test('adapter capabilities distinguish a valid document-only host', () => {
+  const adapter = { async load() { return {}; }, async save() { return {}; } };
+  const capabilities = assertDocumentAdapter(adapter, { writable: true });
+  assert.equal(capabilities.document.save, true);
+  assert.equal(capabilities.comments.create, false);
+  assert.equal(capabilities.savePolicy, 'explicit');
+  assert.equal(resolveAdapterCapabilities({ capabilities: { comments: { create: true } } }).comments.create, false);
 });

@@ -3,6 +3,12 @@ import { revisionOf, RevisionConflictError } from '../core/revision.js';
 
 export class MemoryDocumentAdapter {
   constructor({ title = 'untitled.md', body = '', comments = [], events = [] } = {}) {
+    this.capabilities = {
+      savePolicy: 'immediate',
+      document: { load: true, save: true, replace: false },
+      comments: { list: true, create: true, batch: true, update: true, delete: true },
+      events: { list: true },
+    };
     this._record = {
       title: String(title || 'untitled.md'),
       body: String(body || ''),

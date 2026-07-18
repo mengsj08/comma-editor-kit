@@ -231,8 +231,12 @@ button { color: inherit; }
   cursor: pointer;
 }
 .ce-comment:hover { border-color: rgba(64, 95, 76, .42); }
+.ce-comment.withdrawn { opacity: .62; background: rgba(235, 229, 215, .8); }
+.ce-comment.withdrawn .ce-comment-body { text-decoration: line-through; }
+.ce-comment.pending { border-style: dashed; }
 .ce-comment-state { display: inline-block; margin-bottom: 8px; color: var(--comma-moss); font: 700 9px/1 ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .ce-comment-state.missing, .ce-comment-state.ambiguous { color: var(--comma-coral); }
+.ce-comment-state.withdrawn, .ce-comment-state.pending { color: var(--comma-coral); }
 .ce-comment-priority { display: inline-block; margin-left: 6px; padding: 3px 5px; border-radius: 4px; color: #8d3b30; background: rgba(184, 79, 62, .1); font: 700 8px/1 ui-monospace, monospace; }
 .ce-comment-quote { overflow: hidden; margin: 0 0 7px; color: var(--comma-muted); font-size: 12px; font-style: italic; text-overflow: ellipsis; white-space: nowrap; }
 .ce-comment-body { margin: 0; font-size: 14px; line-height: 1.5; }

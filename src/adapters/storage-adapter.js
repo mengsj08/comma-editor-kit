@@ -7,6 +7,12 @@ export class StorageDocumentAdapter {
       throw new TypeError('StorageDocumentAdapter requires async storage.get/set');
     }
     this.storage = storage;
+    this.capabilities = {
+      savePolicy: 'immediate',
+      document: { load: true, save: true, replace: true },
+      comments: { list: true, create: true, batch: true, update: true, delete: true },
+      events: { list: true },
+    };
     this.key = key;
     this.seed = {
       title: String(seed.title || 'untitled.md'),

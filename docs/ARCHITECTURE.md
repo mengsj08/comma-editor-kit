@@ -7,7 +7,7 @@ Host application / Chrome Side Panel / future desktop shell
                          |
                   <comma-editor>
                          |
-        DocumentAdapter + host-level events
+      capability-declared DocumentAdapter + host events
                          |
        file / HTTP / localStorage / chrome.storage
 ```
@@ -26,10 +26,16 @@ The component consumes a document contract. It does not know where a document li
 6. Mutations append an actor-labelled event through the adapter.
 7. Rendered HTML is sanitized before entering the shadow DOM.
 8. Chrome permissions stay in the Chrome wrapper.
+9. The default save policy is explicit; immediate persistence requires an
+   adapter or host to opt in.
+10. Capability discovery is truthful. A document-only host does not gain fake
+    comments or event history merely because the UI supports them elsewhere.
 
 ## Extension points
 
 - `DocumentAdapter`: persistence and revision boundary.
+- `capabilities`: host-declared load/save/comment/event surface plus
+  `explicit | immediate` save policy.
 - `comma-ai-request`: host decides whether Codex, Claude, another model, or no AI handles a request.
 - `previewCommentBatch`: validates a structured response and opens a human confirmation queue; it never writes by itself.
 - CSS custom properties: host-level visual tuning without DOM coupling.
@@ -39,8 +45,16 @@ The component consumes a document contract. It does not know where a document li
 
 Before `1.0`:
 
-- both the standalone host and academic review workbench consume the package rather than copied files;
-- one additional, non-paper host validates the adapter contract;
+- the standalone, Review Studio, and ResearchLab hosts consume the package rather than copied files;
+- the kanban document-only adapter graduates from a controlled contract test to a bounded detail-page pilot;
 - schemas receive explicit migration rules;
 - browser and long-document tests run in CI;
 - a private/public distribution and licensing decision is made.
+
+## Validated host profiles (v0.3)
+
+| Host | Save policy | Comments | Host-owned behavior |
+|---|---|---|---|
+| Comma Review Studio | immediate | full + atomic batch | provider execution, review sessions, finding decisions, multi-turn writeback |
+| ResearchLab Markdown Studio | explicit | full + atomic batch | RLP directory confinement, SHA-256 guard, 2 MB limit, project-local state |
+| kanban-personal controlled Adapter | immediate | deliberately disabled | frontmatter, acceptance criteria, AI thread/queue, handoff, task state and three-way merge |

@@ -50,6 +50,7 @@ DATA_ROOT = os.path.realpath(os.path.expanduser(
     os.environ.get("COMMA_REVIEW_DATA_ROOT", os.path.join(ROOT, "data"))
 ))
 STATIC_ROOT = os.path.join(ROOT, "static")
+KIT_DIST_ROOT = os.path.realpath(os.path.join(ROOT, "..", "..", "dist"))
 EVENTS_PATH = os.path.join(DATA_ROOT, "edits.events.jsonl")
 REVIEW_ROOT = os.path.join(DATA_ROOT, "review-sessions")
 HOST = "127.0.0.1"
@@ -189,6 +190,44 @@ def _load_comments(doc_path: str):
 def _save_comments(doc_path: str, comments) -> None:
     _atomic_write(_comments_path(doc_path), json.dumps(
         {"comments": comments}, ensure_ascii=False, indent=2))
+
+
+def _comment_record(payload, *, default_author="June"):
+    quote = str(payload.get("quote_text") or payload.get("quoteText") or "").strip()
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind not in ("overall", "anchored"):
+        kind = "anchored" if quote else "overall"
+    if kind == "anchored" and not quote:
+        raise ValueError("quote_text required for anchored comment")
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise ValueError("comment content required")
+    now = _now()
+    rec = {
+        "id": str(payload.get("id") or _new_id("c-", 10)),
+        "kind": kind,
+        "author": str(payload.get("author") or payload.get("actor") or default_author),
+        "content": content,
+        "quote_text": quote,
+        "section": str(payload.get("section") or ""),
+        "source_locator": payload.get("source_locator") or payload.get("sourceLocator") or None,
+        "anchor_state": str(payload.get("anchor_state") or payload.get("anchorState") or ("overall" if kind == "overall" else "unresolved")),
+        "created_at": str(payload.get("created_at") or payload.get("createdAt") or now),
+        "updated_at": str(payload.get("updated_at") or payload.get("updatedAt") or now),
+    }
+    aliases = {
+        "source_key": "sourceKey",
+        "finding_id": "findingId",
+        "review_session_id": "reviewSessionId",
+        "review_state": "reviewState",
+    }
+    for key in ("priority", "source", *aliases):
+        value = payload.get(key)
+        if value is None and key in aliases:
+            value = payload.get(aliases[key])
+        if value:
+            rec[key] = str(value)
+    return rec
 
 
 def _now() -> str:
@@ -691,6 +730,15 @@ class Handler(BaseHTTPRequestHandler):
                 ctype = "application/javascript" if fp.endswith(".js") else \
                         "text/css" if fp.endswith(".css") else "application/octet-stream"
                 return self._send_file(fp, ctype + "; charset=utf-8")
+            if route.startswith("/comma-kit/"):
+                name = route[len("/comma-kit/"):]
+                fp = os.path.realpath(os.path.join(KIT_DIST_ROOT, name))
+                if not fp.startswith(KIT_DIST_ROOT + os.sep) or not os.path.isfile(fp):
+                    return self._send_json({"ok": False, "error": "build Comma Editor Kit before starting Review Studio"}, 404)
+                ctype = "application/javascript" if fp.endswith(".js") else \
+                        "application/json" if fp.endswith(".json") or fp.endswith(".map") else \
+                        "text/css" if fp.endswith(".css") else "application/octet-stream"
+                return self._send_file(fp, ctype + "; charset=utf-8")
             if route == "/api/doc":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 if not os.path.exists(doc):
@@ -733,6 +781,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return self._send_json({"ok": False, "error": "blocked by same-origin guard"}, 403)
         payload = self._read_json()
+        query = urllib.parse.parse_qs(parsed.query)
+        if not payload.get("path") and (query.get("path") or [""])[0]:
+            payload["path"] = (query.get("path") or [""])[0]
         try:
             if route == "/api/doc" and method == "PUT":
                 return self._save_doc(payload)
@@ -743,6 +794,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._edit_comment(payload)
                 if method == "DELETE":
                     return self._delete_comment(payload)
+            if route == "/api/comments/batch" and method == "POST":
+                return self._create_comment_batch(payload)
             if route == "/api/ai-run" and method == "POST":
                 return self._ai_run(payload)
             if route == "/api/review-sessions" and method == "POST":
@@ -786,30 +839,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def _create_comment(self, payload):
         doc = _safe_doc_path(payload.get("path"))
-        quote = str(payload.get("quote_text") or "").strip()
-        if not quote:
-            raise ValueError("quote_text required")
         with _MUTATION_LOCK:
             comments = _load_comments(doc)
-            cid = _new_id("c-", 10)
-            rec = {
-                "id": cid,
-                "author": str(payload.get("author") or "June"),
-                "content": str(payload.get("content") or ""),
-                "quote_text": quote,
-                "section": str(payload.get("section") or ""),
-                "source_locator": payload.get("source_locator") or {},
-                "created_at": _now(),
-                "updated_at": _now(),
-            }
-            for key in ("priority", "source", "source_key", "finding_id", "review_session_id"):
-                if payload.get(key):
-                    rec[key] = str(payload[key])
+            rec = _comment_record(payload)
             comments.append(rec)
             _save_comments(doc, comments)
         _append_event(rec["author"], "add-comment", doc,
-                      f"anchor '{quote[:40]}' -> {rec['content'][:40]}")
+                      f"anchor '{rec['quote_text'][:40]}' -> {rec['content'][:40]}")
         return self._send_json({"ok": True, "comment": rec, "comments": comments})
+
+    def _create_comment_batch(self, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        rows = payload.get("comments")
+        if not isinstance(rows, list):
+            raise ValueError("comments must be an array")
+        with open(doc, encoding="utf-8") as fh:
+            body = fh.read()
+        current_rev = _rev(body)
+        base_rev = str(payload.get("base_rev") or payload.get("baseRev") or "")
+        if base_rev != current_rev:
+            return self._send_json({
+                "ok": False, "conflict": True, "expected": base_rev,
+                "rev": current_rev, "body": body,
+                "message": "document changed before comment batch writeback",
+            }, 409)
+        actor = str(payload.get("actor") or "AI Reviewer")
+        source = str(payload.get("source") or "ai-review")
+        created = []
+        with _MUTATION_LOCK:
+            comments = _load_comments(doc)
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("each comment must be an object")
+                rec = _comment_record({**row, "actor": row.get("actor") or actor, "source": row.get("source") or source})
+                comments.append(rec)
+                created.append(rec)
+            _save_comments(doc, comments)
+        _append_event(actor, "add-comment-batch", doc, f"{len(created)} comments from {source}")
+        return self._send_json({"ok": True, "comments": created, "rev": current_rev})
 
     def _edit_comment(self, payload):
         doc = _safe_doc_path(payload.get("path"))

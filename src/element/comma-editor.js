@@ -2,9 +2,10 @@ import katexCss from 'katex/dist/katex.min.css?inline';
 import highlightCss from 'highlight.js/styles/github-dark.min.css?inline';
 import componentCss from './comma-editor.css?inline';
 import { createSourceLocator, normalizeQuoteText, resolveQuote } from '../core/anchors.js';
+import { normalizeSavePolicy, resolveAdapterCapabilities } from '../core/adapter-contract.js';
 import { replaceBlock, segmentMarkdown } from '../core/blocks.js';
 import { previewCommentBatch as buildCommentBatchPreview } from '../core/comment-batch.js';
-import { normalizeComment } from '../core/models.js';
+import { normalizeComment, normalizeDocument } from '../core/models.js';
 import { RevisionConflictError } from '../core/revision.js';
 import { MarkdownRenderer } from './markdown-renderer.js';
 
@@ -62,14 +63,17 @@ function selectionInside(root) {
 }
 
 export class CommaEditorElement extends HTMLElement {
-  static observedAttributes = ['actor', 'readonly'];
+  static observedAttributes = ['actor', 'readonly', 'save-policy', 'hide-ai-review'];
 
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
     this._adapter = null;
+    this._capabilities = resolveAdapterCapabilities(null);
     this._renderer = new MarkdownRenderer();
     this._document = { ...EMPTY_DOCUMENT };
+    this._persistedBody = '';
+    this._dirty = false;
     this._comments = [];
     this._blocks = [];
     this._activeBlock = null;
@@ -94,6 +98,7 @@ export class CommaEditorElement extends HTMLElement {
 
   set adapter(value) {
     this._adapter = value;
+    this._capabilities = resolveAdapterCapabilities(value);
     if (this._connected && value) queueMicrotask(() => this.load());
   }
 
@@ -109,12 +114,28 @@ export class CommaEditorElement extends HTMLElement {
     return this.hasAttribute('readonly');
   }
 
+  get savePolicy() {
+    return normalizeSavePolicy(this.getAttribute('save-policy') || this._capabilities.savePolicy);
+  }
+
+  get dirty() {
+    return this._dirty;
+  }
+
+  get capabilities() {
+    return structuredClone(this._capabilities);
+  }
+
   get documentState() {
-    return structuredClone(this._document);
+    return structuredClone({ ...this._document, dirty: this._dirty, savePolicy: this.savePolicy });
   }
 
   requestAiReview() {
     if (this.readonly || !this._document.rev) return null;
+    if (this._dirty) {
+      this._setStatus('error', 'Save the draft before AI review');
+      return null;
+    }
     const requestId = createRequestId();
     const detail = {
       requestId,
@@ -165,13 +186,12 @@ export class CommaEditorElement extends HTMLElement {
     this._loading = true;
     this._setStatus('saving', 'Loading document');
     try {
-      const documentState = await this._adapter.load();
-      this._document = {
-        title: String(documentState.title || 'untitled.md'),
-        body: String(documentState.body || ''),
-        rev: String(documentState.rev || ''),
-      };
-      this._comments = typeof this._adapter.listComments === 'function'
+      this._capabilities = resolveAdapterCapabilities(this._adapter);
+      const documentState = normalizeDocument(await this._adapter.load());
+      this._document = documentState;
+      this._persistedBody = documentState.body;
+      this._dirty = false;
+      this._comments = this._capabilities.comments.list
         ? (await this._adapter.listComments()).map(normalizeComment)
         : [];
       this._sourceMode = false;
@@ -190,15 +210,49 @@ export class CommaEditorElement extends HTMLElement {
   async replaceDocument({ title, body, actor = this.actor }) {
     if (!this._adapter) throw new Error('No document adapter configured');
     if (typeof this._adapter.replace === 'function') {
-      this._document = await this._adapter.replace({ title, body, actor });
-      this._comments = await this._adapter.listComments();
+      this._document = normalizeDocument(await this._adapter.replace({ title, body, actor }));
+      this._comments = this._capabilities.comments.list ? await this._adapter.listComments() : [];
     } else {
       const saved = await this._adapter.save({ body, baseRev: this._document.rev, actor });
-      this._document = { ...saved, title: title || saved.title };
+      this._document = normalizeDocument({ ...saved, title: title || saved.title });
     }
+    this._persistedBody = this._document.body;
+    this._dirty = false;
     this._closeReviewQueue();
     this._renderDocument();
     return this.documentState;
+  }
+
+  async refreshComments() {
+    if (!this._capabilities.comments.list) return [];
+    this._comments = (await this._adapter.listComments()).map(normalizeComment);
+    this._renderComments();
+    this._applyCommentAnchors();
+    this._renderMeta();
+    return structuredClone(this._comments);
+  }
+
+  async save() {
+    if (this.readonly || !this._capabilities.document.save) return false;
+    if (!this._dirty) return true;
+    return this._persistBody(this._document.body);
+  }
+
+  discardChanges() {
+    if (!this._dirty) return false;
+    this._document.body = this._persistedBody;
+    this._dirty = false;
+    this._sourceMode = false;
+    this._closeReviewQueue();
+    this._renderDocument();
+    this._setStatus('saved', 'Draft discarded');
+    this._emit('comma-discard', { document: this.documentState });
+    return true;
+  }
+
+  jumpToQuote(quoteText, sourceLocator = {}) {
+    const comment = normalizeComment({ quoteText, sourceLocator, content: '', actor: 'host' });
+    return this._jumpToResolvedComment(comment);
   }
 
   _renderShell() {
@@ -212,10 +266,11 @@ export class CommaEditorElement extends HTMLElement {
             <div class="ce-meta" data-el="meta">No document loaded</div>
           </div>
           <div class="ce-actions">
-            <button class="ce-button" type="button" data-action="source">Source</button>
-            <button class="ce-button review" type="button" data-action="ai-review">AI review</button>
-            <button class="ce-button" type="button" data-action="overall-comment">Overall note</button>
-            <button class="ce-button" type="button" data-action="comments">Comments <span class="ce-count" data-el="comment-count">0</span></button>
+            <button class="ce-button" type="button" data-action="source" data-el="source-button">Source</button>
+            <button class="ce-button primary" type="button" data-action="explicit-save" data-el="explicit-save" hidden>Save</button>
+            <button class="ce-button review" type="button" data-action="ai-review" data-el="ai-review-button">AI review</button>
+            <button class="ce-button" type="button" data-action="overall-comment" data-el="overall-comment-button">Overall note</button>
+            <button class="ce-button" type="button" data-action="comments" data-el="comments-button">Comments <span class="ce-count" data-el="comment-count">0</span></button>
           </div>
         </header>
         <div class="ce-grid">
@@ -300,6 +355,7 @@ export class CommaEditorElement extends HTMLElement {
     if (action) {
       if (action !== 'toggle-review-item') event.preventDefault();
       if (action === 'source') this._enterSource();
+      if (action === 'explicit-save') await this.save();
       if (action === 'ai-review') this.requestAiReview();
       if (action === 'cancel-source') this._exitSource();
       if (action === 'save-source') await this._saveSource();
@@ -340,9 +396,20 @@ export class CommaEditorElement extends HTMLElement {
     this._el('title').textContent = this._document.title || 'untitled.md';
     const lines = this._document.body ? this._document.body.split('\n').length : 0;
     const revision = this._document.rev ? this._document.rev.replace('sha256-', '').slice(0, 8) : '—';
-    const mode = this.readonly ? 'read only' : `actor ${this.actor}`;
-    this._el('meta').textContent = `${lines} lines · rev ${revision} · ${mode}`;
+    const policy = this.savePolicy === 'explicit' ? 'explicit save' : 'immediate save';
+    const mode = this.readonly ? 'read only' : `${policy} · actor ${this.actor}`;
+    const dirty = this._dirty ? ' · unsaved' : '';
+    this._el('meta').textContent = `${lines} lines · rev ${revision} · ${mode}${dirty}`;
     this._el('comment-count').textContent = String(this._comments.length);
+    const writable = !this.readonly && this._capabilities.document.save;
+    this._el('source-button').hidden = !writable;
+    this._el('explicit-save').hidden = this.savePolicy !== 'explicit' || !writable;
+    this._el('explicit-save').disabled = !this._dirty;
+    this._el('ai-review-button').hidden = this.hasAttribute('hide-ai-review');
+    this._el('ai-review-button').disabled = this._dirty || this.readonly;
+    this._el('overall-comment-button').hidden = !this._capabilities.comments.create;
+    this._el('comments-button').hidden = !this._capabilities.comments.list;
+    this._el('sidebar').hidden = !this._capabilities.comments.list;
   }
 
   _renderPreview() {
@@ -413,7 +480,7 @@ export class CommaEditorElement extends HTMLElement {
       return;
     }
     const nextBody = replaceBlock(this._document.body, active.block, replacement);
-    await this._saveBody(nextBody);
+    await this._applyBody(nextBody);
   }
 
   _enterSource() {
@@ -437,11 +504,25 @@ export class CommaEditorElement extends HTMLElement {
       this._exitSource();
       return;
     }
-    const saved = await this._saveBody(body);
+    const saved = await this._applyBody(body);
     if (saved) this._exitSource();
   }
 
-  async _saveBody(body) {
+  async _applyBody(body) {
+    const nextBody = String(body ?? '');
+    if (this.savePolicy === 'explicit') {
+      this._document.body = nextBody;
+      this._dirty = nextBody !== this._persistedBody;
+      this._closeReviewQueue();
+      this._renderDocument();
+      this._setStatus(this._dirty ? 'saving' : 'saved', this._dirty ? 'Unsaved draft' : 'Ready');
+      this._emit('comma-change', { document: this.documentState, actor: this.actor });
+      return true;
+    }
+    return this._persistBody(nextBody);
+  }
+
+  async _persistBody(body) {
     if (!this._adapter) {
       this._setStatus('error', 'No adapter configured');
       return false;
@@ -449,11 +530,9 @@ export class CommaEditorElement extends HTMLElement {
     this._setStatus('saving', 'Saving');
     try {
       const saved = await this._adapter.save({ body, baseRev: this._document.rev, actor: this.actor });
-      this._document = {
-        title: String(saved.title || this._document.title),
-        body: String(saved.body ?? body),
-        rev: String(saved.rev || ''),
-      };
+      this._document = normalizeDocument({ ...saved, title: saved.title || this._document.title, body: saved.body ?? body });
+      this._persistedBody = this._document.body;
+      this._dirty = false;
       this._closeReviewQueue();
       this._renderDocument();
       this._setStatus('saved', 'Saved');
@@ -463,6 +542,8 @@ export class CommaEditorElement extends HTMLElement {
       if (error instanceof RevisionConflictError || error?.code === 'REVISION_CONFLICT') {
         this._document.body = error.body;
         this._document.rev = error.actual;
+        this._persistedBody = error.body;
+        this._dirty = false;
         this._renderDocument();
         this._setStatus('error', 'Conflict: reloaded latest');
         this._emit('comma-conflict', { error, document: this.documentState });
@@ -489,6 +570,8 @@ export class CommaEditorElement extends HTMLElement {
       blockIndex,
     });
     this._selection = { quoteText: captured.text, sourceLocator: locator };
+    this.shadowRoot.querySelector('[data-action="selection-comment"]').hidden = !this._capabilities.comments.create || this._dirty;
+    this.shadowRoot.querySelector('[data-action="selection-ai"]').hidden = this.hasAttribute('hide-ai-review') || this._dirty;
     const rect = captured.range.getBoundingClientRect();
     bar.style.left = `${rect.left + rect.width / 2}px`;
     bar.style.top = `${Math.max(44, rect.top)}px`;
@@ -496,7 +579,11 @@ export class CommaEditorElement extends HTMLElement {
   }
 
   _openCommentComposer(selection) {
-    if (this.readonly) return;
+    if (this.readonly || !this._capabilities.comments.create) return;
+    if (this._dirty) {
+      this._setStatus('error', 'Save the draft before adding comments');
+      return;
+    }
     this._selection = selection || null;
     this._el('selection-bar').hidden = true;
     this._el('composer-label').textContent = selection ? 'Anchored margin note' : 'Overall note';
@@ -584,6 +671,10 @@ export class CommaEditorElement extends HTMLElement {
   async _applyCommentBatch() {
     const preview = this._commentBatchPreview;
     if (!preview) return;
+    if (this._dirty) {
+      this._setStatus('error', 'Save the draft before writing comments');
+      return;
+    }
     if (!this._adapter?.createComments) {
       this._setStatus('error', 'Adapter does not support atomic comment batches');
       return;
@@ -646,8 +737,9 @@ export class CommaEditorElement extends HTMLElement {
     }
     root.innerHTML = this._comments.map((comment) => {
       const resolution = comment.kind === 'overall' ? { state: 'overall' } : this._resolveComment(comment);
-      const state = resolution.state;
-      return `<article class="ce-comment" data-comment-id="${escapeHtml(comment.id)}">
+      const state = comment.reviewState === 'withdrawn' || comment.reviewState === 'pending'
+        ? comment.reviewState : resolution.state;
+      return `<article class="ce-comment ${escapeHtml(comment.reviewState)}" data-comment-id="${escapeHtml(comment.id)}">
         <button class="ce-comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeHtml(comment.id)}" aria-label="Delete comment">×</button>
         <span class="ce-comment-state ${escapeHtml(state)}">${escapeHtml(state)}</span>
         ${comment.priority ? `<span class="ce-comment-priority">${escapeHtml(comment.priority)}</span>` : ''}
@@ -666,7 +758,7 @@ export class CommaEditorElement extends HTMLElement {
     });
     const counts = new Map();
     for (const comment of this._comments) {
-      if (comment.kind !== 'anchored') continue;
+      if (comment.kind !== 'anchored' || comment.reviewState === 'withdrawn') continue;
       const resolution = this._resolveComment(comment);
       if (!Number.isInteger(resolution.blockIndex) || resolution.blockIndex < 0) continue;
       counts.set(resolution.blockIndex, (counts.get(resolution.blockIndex) || 0) + 1);
@@ -686,16 +778,21 @@ export class CommaEditorElement extends HTMLElement {
   _jumpToComment(id) {
     const comment = this._comments.find((item) => item.id === id);
     if (!comment || comment.kind === 'overall') return;
+    return this._jumpToResolvedComment(comment);
+  }
+
+  _jumpToResolvedComment(comment) {
     const resolution = this._resolveComment(comment);
     if (!Number.isInteger(resolution.blockIndex) || resolution.blockIndex < 0) {
       this._setStatus('error', resolution.state === 'ambiguous' ? 'Anchor is ambiguous' : 'Quoted source changed');
-      return;
+      return false;
     }
     const target = this._el('preview').querySelector(`[data-block-index="${resolution.blockIndex}"]`);
-    if (!target) return;
+    if (!target) return false;
     target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     target.classList.add('is-flash');
     setTimeout(() => target.classList.remove('is-flash'), 1400);
+    return true;
   }
 
   _resolveComment(comment) {
@@ -742,6 +839,10 @@ export class CommaEditorElement extends HTMLElement {
 
   _askAi() {
     if (!this._selection) return;
+    if (this._dirty) {
+      this._setStatus('error', 'Save the draft before asking AI');
+      return;
+    }
     this._el('selection-bar').hidden = true;
     this._emit('comma-ai-request', {
       ...structuredClone(this._selection),

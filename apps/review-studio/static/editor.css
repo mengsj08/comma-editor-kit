@@ -210,3 +210,31 @@ body { margin: 0; font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", 
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #111827; color: #fff; padding: 8px 16px; border-radius: 6px; opacity: 0; transition: all .2s; z-index: 200; font-size: 13px; }
 .toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.err { background: var(--stale); }
+
+/* The document surface is now the canonical public Web Component. Review
+   Studio only composes the provider/session drawer around it. */
+.comma-host-main { display: block; }
+.comma-host-pane {
+  width: min(1320px, calc(100% - 32px));
+  max-width: none;
+  min-height: 0;
+  margin: 18px auto 64px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.comma-host-pane comma-editor {
+  --comma-paper: #fffefa;
+  --comma-paper-deep: #eee9df;
+  --comma-ink: #20211f;
+  --comma-muted: #6f706a;
+  --comma-moss: #405d67;
+  --comma-coral: #73533b;
+  display: block;
+  min-height: calc(100vh - 100px);
+}
+
+@media (max-width: 760px) {
+  .comma-host-pane { width: 100%; margin-top: 0; padding: 0; }
+}

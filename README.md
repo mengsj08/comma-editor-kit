@@ -63,6 +63,7 @@ await editor.load();
 The component dispatches host-level events instead of binding to a particular AI provider:
 
 - `comma-ready`
+- `comma-change` (an explicit-save draft changed but has not reached the adapter)
 - `comma-save`
 - `comma-conflict`
 - `comma-comment-create`
@@ -92,7 +93,22 @@ For programmatic hosts, `editor.previewCommentBatch(response)` opens the same qu
 
 ## Adapter contract
 
-An adapter implements asynchronous methods:
+An adapter declares the operations it can actually honor. Missing methods are
+not simulated by the component:
+
+```js
+adapter.capabilities = {
+  savePolicy: 'explicit', // or 'immediate'
+  document: { load: true, save: true, replace: false },
+  comments: { list: true, create: true, batch: true, update: true, delete: true },
+  events: { list: true },
+};
+```
+
+The safe default is `explicit`. Built-in memory, browser-storage, and generic
+HTTP adapters opt into `immediate`. ResearchLab uses `explicit`; its draft stays
+in the browser until the user presses Save. An adapter may implement these
+asynchronous methods:
 
 ```text
 load() -> { title, body, rev }
@@ -106,6 +122,11 @@ listEvents() -> EditEvent[]
 ```
 
 `save` must reject stale `baseRev` values with `RevisionConflictError`. The component never owns filesystem, Chrome, or AI permissions.
+
+`apps/review-studio/` now consumes this public component for rendering, source
+and block editing, comments, anchors, and AI comment batches. The host retains
+review history, multi-turn finding decisions, provider selection, and
+idempotent writeback. It no longer ships copied `markdown.js` or `anchor.js`.
 
 ## Chrome extension
 
