@@ -1,0 +1,71 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { marked } from 'marked';
+import {
+  createSourceLocator,
+  findQuoteMatches,
+  normalizeQuoteText,
+  resolveQuote,
+} from '../src/core/anchors.js';
+import { replaceBlock, segmentMarkdown } from '../src/core/blocks.js';
+import { previewCommentBatch } from '../src/core/comment-batch.js';
+import { revisionOf } from '../src/core/revision.js';
+
+test('revision is deterministic and content-sensitive', async () => {
+  assert.equal(await revisionOf('alpha'), await revisionOf('alpha'));
+  assert.notEqual(await revisionOf('alpha'), await revisionOf('beta'));
+});
+
+test('block segmentation reconstructs source byte-for-byte', () => {
+  const source = '# Title\n\nParagraph with $x$.\n\n```js\nconst a = 1;\n```\n';
+  const blocks = segmentMarkdown(marked.lexer, source);
+  assert.ok(blocks.length >= 3);
+  for (const block of blocks) assert.equal(source.slice(block.start, block.end), block.raw);
+  const target = blocks.find((block) => block.type === 'paragraph');
+  const changed = replaceBlock(source, target, target.raw.replace('Paragraph', 'Edited paragraph'));
+  assert.equal(changed, source.slice(0, target.start) + target.raw.replace('Paragraph', 'Edited paragraph') + source.slice(target.end));
+});
+
+test('anchors resolve unique, contextual, ambiguous, and missing quotes', () => {
+  const body = 'First repeated phrase.\n\nMiddle.\n\nSecond repeated phrase.';
+  const quote = 'repeated phrase';
+  assert.deepEqual(findQuoteMatches(body, quote).length, 2);
+  const locator = createSourceLocator(body, quote, { rev: 'old' });
+  locator.prefix = 'First ';
+  locator.suffix = '.\n\nMiddle';
+  assert.equal(resolveQuote(body, quote, locator, 'new').state, 'context');
+  assert.equal(resolveQuote(body, quote, {}, 'new').state, 'ambiguous');
+  assert.equal(resolveQuote(body, 'Middle', {}, 'new').state, 'unique');
+  assert.equal(resolveQuote(body, 'absent', {}, 'new').state, 'missing');
+  assert.equal(normalizeQuoteText(' a\n  b '), 'a b');
+});
+
+test('comment batch preview separates ready, ambiguous, missing, and invalid proposals', () => {
+  const body = '# Review\n\nUnique sentence.\n\nRepeated phrase.\n\nRepeated phrase.\n';
+  const preview = previewCommentBatch({
+    body,
+    rev: 'sha256-current',
+    comments: [
+      { quote_text: 'Unique sentence.', content: 'Add evidence.', priority: 'p0' },
+      { quote_text: 'Repeated phrase.', content: 'Clarify this.' },
+      { quote_text: 'Absent sentence.', content: 'Cannot anchor.' },
+      { quote_text: 'Unique sentence.', content: '' },
+      { kind: 'overall', content: 'Strengthen the central thesis.' },
+    ],
+  });
+  assert.deepEqual(preview.counts, { total: 5, ready: 2, ambiguous: 1, missing: 1, invalid: 1 });
+  const anchored = preview.items[0];
+  assert.equal(anchored.status, 'ready');
+  assert.equal(anchored.comment.priority, 'P0');
+  assert.equal(anchored.comment.sourceLocator.textIndex, body.indexOf('Unique sentence.'));
+  assert.equal(preview.items[1].matches.length, 2);
+  assert.equal(preview.items[4].comment.kind, 'overall');
+});
+
+test('comment batch preview rejects duplicate proposals without guessing', () => {
+  const input = { quote_text: 'One.', content: 'Check.' };
+  const preview = previewCommentBatch({ body: 'One.', rev: 'r1', comments: [input, input] });
+  assert.equal(preview.counts.ready, 1);
+  assert.equal(preview.counts.invalid, 1);
+  assert.match(preview.items[1].reason, /Duplicate/);
+});

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Comma Review Studio · 本地 Markdown 评审</title>
+  <!-- CDN libs, same set as kanban + KaTeX (marked / highlight / mermaid / katex) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.0/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <link rel="stylesheet" href="/static/editor.css">
+</head>
+<body>
+  <header class="doc-header">
+    <div class="doc-title">
+      <span class="studio-mark" aria-hidden="true">C,</span>
+      <span class="studio-name">Comma Review</span>
+      <span id="doc-name">paper.md</span>
+      <span id="doc-meta" class="doc-meta"></span>
+    </div>
+    <div class="doc-actions">
+      <span id="editor-status" class="editor-status"></span>
+      <button id="btn-edit" type="button" title="整篇 Markdown 源码模式（就地编辑的后备入口）">源码</button>
+      <button id="editor-save" type="button" hidden>保存</button>
+      <button id="editor-cancel" type="button" hidden>取消</button>
+      <button id="btn-comments" type="button">批注 <span id="header-comment-count">0</span></button>
+      <button id="btn-review-history" type="button">评审记录</button>
+      <button id="btn-ai-review" class="primary-action" type="button"><span class="spark">✦</span> AI Review</button>
+    </div>
+  </header>
+
+  <main class="doc-main">
+    <section class="doc-pane">
+      <!-- preview -->
+      <div id="detail-md-content" class="md-content"></div>
+      <!-- editor (edit mode) -->
+      <div id="detail-edit-mode" class="edit-mode" hidden>
+        <textarea id="detail-editor" spellcheck="false"></textarea>
+      </div>
+    </section>
+
+    <aside id="comment-sidebar" class="comment-sidebar">
+      <div class="comment-sidebar-head">
+        <strong>批注</strong>
+        <span id="comment-count" class="comment-count">0</span>
+      </div>
+      <div id="comment-list" class="comment-list"></div>
+      <div class="comment-hint">在预览里选中正文 → 弹出「加批注」。</div>
+    </aside>
+  </main>
+
+  <aside id="review-drawer" class="review-drawer" aria-hidden="true">
+    <div class="review-drawer-head">
+      <div>
+        <div class="eyebrow">REVIEW SESSION</div>
+        <h2>审稿台账</h2>
+      </div>
+      <button id="review-close" class="icon-button" type="button" aria-label="关闭评审台账">×</button>
+    </div>
+
+    <div class="review-launcher">
+      <div class="review-launch-row">
+        <div class="tool-switch" aria-label="AI 工具">
+          <label><input type="radio" name="review-tool" value="claude"><span>Claude</span></label>
+          <label><input type="radio" name="review-tool" value="codex" checked><span>Codex</span></label>
+        </div>
+        <label class="writeback-toggle"><input id="review-auto-writeback" type="checkbox" checked><span>可靠批注自动写回</span></label>
+      </div>
+      <textarea id="review-instruction" rows="2" placeholder="可选：补充这轮评审重点，例如“重点核查临床外推和引文边界”"></textarea>
+      <div class="review-launch-actions">
+        <button id="review-new" type="button">新评审</button>
+        <button id="review-start" class="review-run-button" type="button"><span>✦</span> 开始完整评审</button>
+      </div>
+      <div id="review-run-state" class="review-run-state" hidden></div>
+    </div>
+
+    <div id="review-empty" class="review-empty">
+      <div class="review-empty-glyph">¶</div>
+      <h3>从文章到可写回批注</h3>
+      <p>AI 会先生成结构化 findings，逐条核对原文锚点，再把唯一、可靠的条目写入批注侧栏。原文不会被 AI 直接改写。</p>
+    </div>
+
+    <div id="review-session" class="review-session" hidden>
+      <section class="session-summary-card">
+        <div class="session-meta-row">
+          <span id="review-status" class="review-status"></span>
+          <span id="review-session-meta" class="session-meta"></span>
+        </div>
+        <p id="review-summary"></p>
+        <div id="review-stats" class="review-stats"></div>
+      </section>
+
+      <section class="ledger-section">
+        <div class="section-heading-row">
+          <div><div class="eyebrow">FINDINGS LEDGER</div><h3>评审清单</h3></div>
+          <button id="review-writeback" type="button">同步已接受批注</button>
+        </div>
+        <div id="review-findings" class="review-findings"></div>
+      </section>
+
+      <section class="review-conversation">
+        <div class="eyebrow">REVIEW DIALOGUE</div>
+        <h3>继续讨论</h3>
+        <div id="review-messages" class="review-messages"></div>
+        <textarea id="review-message" rows="3" placeholder="例如：标题这一条不改；把重点转到引文和临床表述，再同步批注。"></textarea>
+        <button id="review-send" class="review-send" type="button">更新评审并同步</button>
+      </section>
+    </div>
+
+    <section class="review-history-section">
+      <div class="eyebrow">HISTORY</div>
+      <div id="review-history" class="review-history"></div>
+    </section>
+  </aside>
+  <div id="review-scrim" class="review-scrim" hidden></div>
+
+  <!-- selection popover -->
+  <div id="sel-popover" class="sel-popover" hidden>
+    <button id="sel-add-comment" type="button">加批注</button>
+    <button id="sel-ask-ai" type="button">问 AI</button>
+  </div>
+
+  <!-- lightbox (required by markdown.js) -->
+  <div id="lightbox-overlay" class="lightbox-overlay" aria-hidden="true">
+    <img id="lightbox-image" alt="">
+    <div id="lightbox-caption"></div>
+  </div>
+
+  <!-- file-mention dummies (markdown.js binds listeners at setup; unused in doc mode) -->
+  <div id="file-mention-dd" hidden>
+    <div id="fm-tabs"></div>
+    <div id="fm-results"></div>
+  </div>
+  <input id="new-project" type="hidden">
+
+  <!-- AI panel -->
+  <div id="ai-modal" class="ai-modal" hidden>
+    <div class="ai-box">
+      <div class="ai-box-head"><strong>问 AI</strong><button id="ai-close" type="button">×</button></div>
+      <div class="ai-tool-row">
+        <label class="ai-tool-opt"><input type="radio" name="ai-tool" value="claude" checked> claude</label>
+        <label class="ai-tool-opt"><input type="radio" name="ai-tool" value="codex"> codex</label>
+        <span class="ai-tool-note">codex 走 --sandbox read-only（安全默认，禁 --yolo）</span>
+      </div>
+      <div id="ai-selection" class="ai-selection"></div>
+      <textarea id="ai-prompt" placeholder="例如：把这段改写得更简洁"></textarea>
+      <button id="ai-send" type="button">发送</button>
+      <div id="ai-output" class="ai-output"></div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
