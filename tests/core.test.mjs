@@ -12,6 +12,7 @@ import { previewCommentBatch } from '../src/core/comment-batch.js';
 import { revisionOf } from '../src/core/revision.js';
 import {
   normalizeFinding,
+  normalizeConversationSession,
   normalizeReviewSession,
   normalizeWritebackReceipt,
 } from '../src/core/models.js';
@@ -20,6 +21,23 @@ import { assertDocumentAdapter, resolveAdapterCapabilities } from '../src/core/a
 test('revision is deterministic and content-sensitive', async () => {
   assert.equal(await revisionOf('alpha'), await revisionOf('alpha'));
   assert.notEqual(await revisionOf('alpha'), await revisionOf('beta'));
+});
+
+test('conversation models preserve quote scope, branch lineage, notes, and writeback identity', () => {
+  const session = normalizeConversationSession({
+    id: 'conversation-1', doc_path: 'paper.md', base_rev: 'r1',
+    source_quote: { quote_text: 'Exact passage.', source_locator: { text_index: 14 } },
+    messages: [{
+      id: 'm2', role: 'assistant', content: 'Scoped answer', parent_id: 'm1',
+      branch_id: 'branch-a', branch_from_message_id: 'm0', writeback_comment_id: 'c-1',
+    }, { id: 'n1', role: 'note', content: 'PI note', note_for_message_id: 'm2' }],
+  });
+  assert.equal(session.documentId, 'paper.md');
+  assert.equal(session.sourceQuote.quoteText, 'Exact passage.');
+  assert.equal(session.messages[0].parentId, 'm1');
+  assert.equal(session.messages[0].branchFromMessageId, 'm0');
+  assert.equal(session.messages[0].writebackCommentId, 'c-1');
+  assert.equal(session.messages[1].noteForMessageId, 'm2');
 });
 
 test('block segmentation reconstructs source byte-for-byte', () => {
@@ -44,6 +62,17 @@ test('anchors resolve unique, contextual, ambiguous, and missing quotes', () => 
   assert.equal(resolveQuote(body, 'Middle', {}, 'new').state, 'unique');
   assert.equal(resolveQuote(body, 'absent', {}, 'new').state, 'missing');
   assert.equal(normalizeQuoteText(' a\n  b '), 'a b');
+});
+
+test('selection locators disambiguate repeated quotes through the selected source block', () => {
+  const body = 'Repeated phrase.\n\nMiddle.\n\nRepeated phrase.';
+  const secondStart = body.lastIndexOf('Repeated phrase.');
+  const locator = createSourceLocator(body, 'Repeated phrase.', {
+    rev: 'same', blockIndex: 2, blockStart: secondStart, blockEnd: body.length,
+  });
+  assert.equal(locator.textIndex, secondStart);
+  assert.equal(locator.occurrenceIndex, 1);
+  assert.equal(resolveQuote(body, 'Repeated phrase.', locator, 'same').index, secondStart);
 });
 
 test('comment batch preview separates ready, ambiguous, missing, and invalid proposals', () => {

@@ -70,6 +70,25 @@ The component dispatches host-level events instead of binding to a particular AI
 - `comma-comment-batch-preview`
 - `comma-comment-batch-create`
 - `comma-ai-request`
+- `comma-selection-action`
+
+Hosts can replace the default one-shot selection action without putting a
+provider inside the component:
+
+```js
+editor.selectionActions = [
+  { id: 'quick-explain', label: '快速解释' },
+  { id: 'discuss', label: '深入讨论' },
+];
+
+editor.addEventListener('comma-selection-action', (event) => {
+  // actionId + quoteText + sourceLocator + revision-locked document snapshot
+  routeSelectionAction(event.detail);
+});
+```
+
+The native `Add note` action remains editor-owned. Host actions receive the
+same quote snapshot and stable locator but cannot silently mutate Markdown.
 
 ## Structured AI comments
 
@@ -135,6 +154,13 @@ authority; the component never opens a local path directly.
 and block editing, comments, anchors, and AI comment batches. The host retains
 review history, multi-turn finding decisions, provider selection, and
 idempotent writeback. It no longer ships copied `markdown.js` or `anchor.js`.
+
+Review Studio also composes a separate quote-scoped conversation surface. A
+selection can receive a transient quick explanation or start a persistent
+Codex/Claude discussion with reply comments and branch lineage. Each assistant
+message offers an explicit, editable `write back as comment` gate. Conversation
+history is not document history and stays in the host under
+`data/conversations/`; editor-core only emits the selected quote contract.
 
 ## Chrome extension
 

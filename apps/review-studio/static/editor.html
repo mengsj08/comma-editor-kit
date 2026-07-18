@@ -15,6 +15,7 @@
       <span id="doc-meta" class="doc-meta"></span>
     </div>
     <div class="doc-actions">
+      <button id="btn-conversations" type="button">选区讨论 <span id="conversation-count">0</span></button>
       <button id="btn-review-history" type="button">评审记录</button>
     </div>
   </header>
@@ -84,20 +85,59 @@
   </aside>
   <div id="review-scrim" class="review-scrim" hidden></div>
 
-  <div id="ai-modal" class="ai-modal" hidden>
-    <div class="ai-box">
-      <div class="ai-box-head"><strong>问 AI</strong><button id="ai-close" type="button">×</button></div>
-      <div class="ai-tool-row">
-        <label class="ai-tool-opt"><input type="radio" name="ai-tool" value="claude" checked> claude</label>
-        <label class="ai-tool-opt"><input type="radio" name="ai-tool" value="codex"> codex</label>
-        <span class="ai-tool-note">Codex 使用 read-only sandbox</span>
+  <aside id="conversation-dock" class="conversation-dock" hidden aria-label="选区讨论工作台">
+    <header class="conversation-head">
+      <div class="conversation-identity">
+        <div class="eyebrow">QUOTE-SCOPED REVIEW</div>
+        <div><strong>选区讨论</strong><span id="conversation-status">围绕原文展开，不直接改稿</span></div>
       </div>
-      <div id="ai-selection" class="ai-selection"></div>
-      <textarea id="ai-prompt" placeholder="例如：解释这段的证据边界"></textarea>
-      <button id="ai-send" type="button">发送</button>
-      <div id="ai-output" class="ai-output"></div>
+      <div class="conversation-head-actions">
+        <button id="conversation-collapse" type="button" aria-label="收起讨论">⌄</button>
+        <button id="conversation-close" type="button" aria-label="关闭讨论">×</button>
+      </div>
+    </header>
+    <div class="conversation-body">
+      <button id="conversation-source" class="conversation-source" type="button" hidden>
+        <span>原文引用</span><q id="conversation-quote"></q><small>点击回到正文</small>
+      </button>
+      <div class="conversation-toolbar">
+        <div class="tool-switch conversation-tool-switch" aria-label="讨论所用 AI">
+          <label><input type="radio" name="conversation-tool" value="claude"><span>Claude</span></label>
+          <label><input type="radio" name="conversation-tool" value="codex" checked><span>Codex</span></label>
+        </div>
+        <div id="conversation-history" class="conversation-history"></div>
+      </div>
+      <div id="conversation-empty" class="conversation-empty">
+        <strong>先在正文选中一段内容</strong>
+        <p>选择“深入讨论”后，这里会保留引用、多轮追问和分支；只有明确点击“写回批注”才会进入文档。</p>
+      </div>
+      <div id="conversation-tree" class="conversation-tree" hidden></div>
+      <section id="conversation-writeback-editor" class="conversation-writeback-editor" hidden>
+        <div><span>写回为原文批注</span><small>可在确认前编辑内容</small></div>
+        <textarea id="conversation-writeback-content" rows="4"></textarea>
+        <div class="conversation-inline-actions">
+          <button id="conversation-writeback-cancel" type="button">取消</button>
+          <button id="conversation-writeback-confirm" class="primary" type="button">确认写回</button>
+        </div>
+      </section>
+      <footer id="conversation-composer" class="conversation-composer" hidden>
+        <div id="conversation-context" class="conversation-context">开始一段引用式讨论</div>
+        <textarea id="conversation-message" rows="3" placeholder="这段的证据边界是什么？"></textarea>
+        <div class="conversation-compose-actions">
+          <button id="conversation-context-cancel" type="button" hidden>取消定位</button>
+          <span>⌘/Ctrl + Enter 发送</span>
+          <button id="conversation-send" class="primary" type="button">开始讨论</button>
+        </div>
+      </footer>
     </div>
-  </div>
+  </aside>
+
+  <section id="quick-explain" class="quick-explain" hidden aria-live="polite">
+    <header><div><span>QUICK EXPLAIN</span><strong>快速解释</strong></div><button id="quick-close" type="button">×</button></header>
+    <q id="quick-quote"></q>
+    <div id="quick-output" class="quick-output"></div>
+    <footer><button id="quick-deepen" type="button">转入深入讨论 →</button></footer>
+  </section>
 
   <script type="module" src="/static/app.js"></script>
 </body>

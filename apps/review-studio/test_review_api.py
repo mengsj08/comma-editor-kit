@@ -158,6 +158,85 @@ class ReviewApiTests(unittest.TestCase):
                     httpd.server_close()
                     thread.join(timeout=2)
 
+    def test_quote_conversation_branch_note_and_explicit_writeback(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            body = "# Results\n\nThis tiny cohort suggests a preliminary response.\n"
+            with open(os.path.join(tmp, "paper.md"), "w", encoding="utf-8") as fh:
+                fh.write(body)
+            responses = [
+                {"tool": "codex", "returncode": 0, "elapsed_ms": 6,
+                 "output": "这句话只支持探索性信号，不能外推疗效。"},
+                {"tool": "codex", "returncode": 0, "elapsed_ms": 7,
+                 "output": "在该分支假设下，还需要独立队列和预设终点。"},
+            ]
+            conversation_root = os.path.join(tmp, "conversations")
+            events = os.path.join(tmp, "events.jsonl")
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "CONVERSATION_ROOT", conversation_root), \
+                    mock.patch.object(server, "EVENTS_PATH", events), \
+                    mock.patch.object(server, "_invoke_ai", side_effect=responses):
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    document = self._request(base + "/api/doc?path=paper.md")
+                    started = self._request(base + "/api/conversations", "POST", {
+                        "path": "paper.md", "base_rev": document["rev"], "tool": "codex",
+                        "source_quote": {
+                            "quote_text": "This tiny cohort suggests a preliminary response.",
+                            "source_locator": {"text_index": body.index("This tiny cohort")},
+                        },
+                        "message": "这句话能支持什么结论？",
+                    })
+                    session_id = started["session"]["id"]
+                    assistant_id = started["session"]["messages"][-1]["id"]
+                    noted = self._request(base + f"/api/conversations/{session_id}/notes", "POST", {
+                        "parent_message_id": assistant_id, "content": "这个边界判断保留。",
+                    })
+                    self.assertEqual(noted["note"]["role"], "note")
+
+                    forked = self._request(base + f"/api/conversations/{session_id}/messages", "POST", {
+                        "parent_message_id": assistant_id, "mode": "fork",
+                        "message": "如果把它作为探索性终点呢？",
+                    })
+                    self.assertTrue(forked["branch_created"])
+                    branch_messages = [m for m in forked["session"]["messages"] if m.get("branch_id") != "main"]
+                    self.assertEqual(len(branch_messages), 2)
+                    self.assertEqual(branch_messages[0]["branch_from_message_id"], assistant_id)
+
+                    written = self._request(base + f"/api/conversations/{session_id}/writeback", "POST", {
+                        "message_id": assistant_id,
+                        "content": "证据边界：仅支持探索性信号，不能直接外推疗效。",
+                    })
+                    self.assertEqual(written["action"], "created")
+                    repeated = self._request(base + f"/api/conversations/{session_id}/writeback", "POST", {
+                        "message_id": assistant_id,
+                        "content": "证据边界：仅支持探索性信号，不能直接外推疗效。",
+                    })
+                    self.assertEqual(repeated["action"], "skipped")
+                    comments = self._request(base + "/api/comments?path=paper.md")["comments"]
+                    self.assertEqual(len(comments), 1)
+                    self.assertEqual(comments[0]["conversation_session_id"], session_id)
+
+                    sessions = self._request(base + "/api/conversations?path=paper.md")["sessions"]
+                    self.assertEqual(sessions[0]["branch_count"], 1)
+                    self.assertEqual(sessions[0]["message_count"], 5)
+
+                    with open(os.path.join(tmp, "paper.md"), "a", encoding="utf-8") as fh:
+                        fh.write("\nChanged.\n")
+                    conflict = self._request_error(
+                        base + f"/api/conversations/{session_id}/writeback", "POST",
+                        {"message_id": branch_messages[-1]["id"]},
+                    )
+                    self.assertEqual(conflict[0], 409)
+                    self.assertTrue(conflict[1]["conflict"])
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
     @staticmethod
     def _request(url, method="GET", payload=None):
         data = None if payload is None else json.dumps(payload).encode("utf-8")

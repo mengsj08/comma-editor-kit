@@ -37,6 +37,9 @@ The component consumes a document contract. It does not know where a document li
 - `capabilities`: host-declared load/save/comment/event surface plus
   `explicit | immediate` save policy.
 - `comma-ai-request`: host decides whether Codex, Claude, another model, or no AI handles a request.
+- `selectionActions` + `comma-selection-action`: the component renders a
+  host-declared selection command and emits a revision-scoped quote snapshot;
+  provider execution and conversation state stay outside editor-core.
 - `previewCommentBatch`: validates a structured response and opens a human confirmation queue; it never writes by itself.
 - CSS custom properties: host-level visual tuning without DOM coupling.
 - `resolveAsset`: optional adapter capability for turning document-relative
@@ -60,3 +63,21 @@ Before `1.0`:
 | Comma Review Studio | immediate | full + atomic batch | provider execution, review sessions, finding decisions, multi-turn writeback |
 | ResearchLab Markdown Studio | explicit | full + atomic batch | RLP directory confinement, SHA-256 guard, 2 MB limit, project-local state |
 | kanban-personal controlled Adapter | immediate | deliberately disabled | frontmatter, acceptance criteria, AI thread/queue, handoff, task state and three-way merge |
+
+## Conversation boundary
+
+Review findings and quote-scoped conversations are separate native objects:
+
+```text
+selected Markdown quote
+        -> host ConversationSession
+              -> linear turns + branch lineage + reply notes
+                    -> explicit writeback receipt
+                          -> anchored Comment
+```
+
+`ConversationSession` records a quote snapshot, source locator, document
+revision, provider, parent-linked messages, branch identity, reply notes, and
+writeback receipts. It never duplicates the whole Markdown document. A branch
+is dialogue lineage, not a fork of the Markdown source. A host may implement the
+same contract with Codex, Claude, or no provider at all.

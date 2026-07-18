@@ -46,8 +46,52 @@ def main() -> None:
             title = page.locator("comma-editor").evaluate("el => el.shadowRoot.querySelector('[data-el=title]').textContent")
             blocks = page.locator("comma-editor").evaluate("el => el.shadowRoot.querySelectorAll('.ce-block').length")
 
+            page.locator("comma-editor").evaluate(
+                """el => {
+                  el.selectionActions = [
+                    { id: 'quick-explain', label: 'Quick explain' },
+                    { id: 'discuss', label: 'Discuss' }
+                  ];
+                  window.__selectionAction = null;
+                  el.addEventListener('comma-selection-action', event => {
+                    window.__selectionAction = {
+                      actionId: event.detail.actionId,
+                      quoteText: event.detail.quoteText,
+                      rev: event.detail.document.rev
+                    };
+                  });
+                }"""
+            )
+
             # Select a whole rendered paragraph that crosses ** markers in the
             # raw source. The component must use rendered-block fallback.
+            page.locator("comma-editor").evaluate(
+                """el => {
+                  const paragraph = el.shadowRoot.querySelector('.ce-block p');
+                  const range = document.createRange();
+                  range.selectNodeContents(paragraph);
+                  const selection = getSelection();
+                  selection.removeAllRanges();
+                  selection.addRange(range);
+                  paragraph.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                }"""
+            )
+            page.wait_for_function("!document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=selection-bar]').hidden")
+            selection_actions = page.locator("comma-editor").evaluate(
+                "el => Array.from(el.shadowRoot.querySelectorAll('[data-selection-action]')).map(button => button.textContent)"
+            )
+            page.locator("comma-editor").evaluate(
+                "el => el.shadowRoot.querySelector('[data-selection-action=quick-explain]').click()"
+            )
+            page.wait_for_function("window.__selectionAction?.actionId === 'quick-explain'")
+            selection_event = page.evaluate("window.__selectionAction")
+            assert selection_actions == ["Quick explain", "Discuss"]
+            assert selection_event["actionId"] == "quick-explain"
+            assert selection_event["quoteText"]
+            assert selection_event["rev"]
+
+            # Re-select after the host action consumes the quote, then create a
+            # native comment through the editor-owned action.
             page.locator("comma-editor").evaluate(
                 """el => {
                   const paragraph = el.shadowRoot.querySelector('.ce-block p');
@@ -132,6 +176,8 @@ def main() -> None:
                 "ok": True,
                 "title": title,
                 "blocks": blocks,
+                "selection_actions": selection_actions,
+                "selection_event": selection_event,
                 "anchor_state": anchor_state,
                 "batch_ready": batch_preview["counts"]["ready"],
                 "batch_missing": batch_preview["counts"]["missing"],

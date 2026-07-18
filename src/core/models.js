@@ -8,6 +8,7 @@ export const COMMA_SCHEMAS = Object.freeze({
   comment: 'comma-comment/v1',
   finding: 'comma-finding/v1',
   reviewSession: 'comma-review-session/v1',
+  conversationSession: 'comma-conversation-session/v1',
   writebackReceipt: 'comma-writeback-receipt/v1',
   editEvent: 'comma-edit-event/v1',
 });
@@ -53,6 +54,8 @@ export function normalizeComment(input = {}) {
     sourceKey: String(first(input, 'sourceKey', 'source_key') || ''),
     findingId: String(first(input, 'findingId', 'finding_id') || ''),
     reviewSessionId: String(first(input, 'reviewSessionId', 'review_session_id') || ''),
+    conversationSessionId: String(first(input, 'conversationSessionId', 'conversation_session_id') || ''),
+    conversationMessageId: String(first(input, 'conversationMessageId', 'conversation_message_id') || ''),
     reviewState: String(first(input, 'reviewState', 'review_state') || 'active'),
     createdAt: String(first(input, 'createdAt', 'created_at') || new Date().toISOString()),
     updatedAt: String(first(input, 'updatedAt', 'updated_at') || new Date().toISOString()),
@@ -107,6 +110,49 @@ export function normalizeReviewSession(input = {}) {
     messages: clone(Array.isArray(input.messages) ? input.messages : []),
     writebackReceipts: (Array.isArray(first(input, 'writebackReceipts', 'writeback_receipts'))
       ? first(input, 'writebackReceipts', 'writeback_receipts') : []).map(normalizeWritebackReceipt),
+    createdAt: String(first(input, 'createdAt', 'created_at') || ''),
+    updatedAt: String(first(input, 'updatedAt', 'updated_at') || ''),
+  };
+}
+
+export function normalizeSourceQuote(input = {}) {
+  return {
+    quoteText: String(first(input, 'quoteText', 'quote_text') || '').trim(),
+    section: String(input.section || '').trim(),
+    sourceLocator: first(input, 'sourceLocator', 'source_locator') || null,
+  };
+}
+
+export function normalizeConversationMessage(input = {}) {
+  const role = String(input.role || 'assistant').toLowerCase();
+  return {
+    id: String(input.id || randomId('message')),
+    role: ['user', 'assistant', 'note'].includes(role) ? role : 'assistant',
+    content: String(input.content || '').trim(),
+    author: String(input.author || ''),
+    parentId: String(first(input, 'parentId', 'parent_id') || ''),
+    branchId: String(first(input, 'branchId', 'branch_id') || 'main'),
+    branchFromMessageId: String(first(input, 'branchFromMessageId', 'branch_from_message_id') || ''),
+    noteForMessageId: String(first(input, 'noteForMessageId', 'note_for_message_id') || ''),
+    writebackCommentId: String(first(input, 'writebackCommentId', 'writeback_comment_id') || ''),
+    mode: String(input.mode || ''),
+    at: String(input.at || first(input, 'createdAt', 'created_at') || ''),
+  };
+}
+
+export function normalizeConversationSession(input = {}) {
+  return {
+    schemaVersion: String(first(input, 'schemaVersion', 'schema_version') || COMMA_SCHEMAS.conversationSession),
+    id: String(input.id || randomId('conversation')),
+    documentId: String(first(input, 'documentId', 'document_id', 'docPath', 'doc_path') || ''),
+    baseRev: String(first(input, 'baseRev', 'base_rev') || ''),
+    documentRev: String(first(input, 'documentRev', 'document_rev') || first(input, 'baseRev', 'base_rev') || ''),
+    tool: String(input.tool || ''),
+    status: String(input.status || 'ready'),
+    sourceQuote: normalizeSourceQuote(first(input, 'sourceQuote', 'source_quote') || {}),
+    messages: (Array.isArray(input.messages) ? input.messages : []).map(normalizeConversationMessage),
+    writebackReceipts: clone(Array.isArray(first(input, 'writebackReceipts', 'writeback_receipts'))
+      ? first(input, 'writebackReceipts', 'writeback_receipts') : []),
     createdAt: String(first(input, 'createdAt', 'created_at') || ''),
     updatedAt: String(first(input, 'updatedAt', 'updated_at') || ''),
   };

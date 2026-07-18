@@ -78,6 +78,7 @@ export class CommaEditorElement extends HTMLElement {
     this._blocks = [];
     this._activeBlock = null;
     this._selection = null;
+    this._selectionActions = [{ id: 'ask-ai', label: 'Ask AI' }];
     this._sourceMode = false;
     this._commentBatchPreview = null;
     this._loading = false;
@@ -124,6 +125,20 @@ export class CommaEditorElement extends HTMLElement {
 
   get capabilities() {
     return structuredClone(this._capabilities);
+  }
+
+  set selectionActions(value) {
+    const rows = Array.isArray(value) ? value : [];
+    this._selectionActions = rows.slice(0, 6).map((action) => ({
+      id: String(action?.id || '').trim(),
+      label: String(action?.label || action?.id || '').trim(),
+      title: String(action?.title || '').trim(),
+    })).filter((action) => action.id && action.label);
+    if (this._connected) this._renderSelectionActions();
+  }
+
+  get selectionActions() {
+    return structuredClone(this._selectionActions);
   }
 
   get documentState() {
@@ -296,7 +311,8 @@ export class CommaEditorElement extends HTMLElement {
       </section>
       <div class="ce-selection-bar" data-el="selection-bar" hidden>
         <button type="button" data-action="selection-comment">Add note</button>
-        <button type="button" data-action="selection-ai">Ask AI</button>
+        <span class="ce-selection-divider" data-el="selection-divider"></span>
+        <span class="ce-selection-host-actions" data-el="selection-host-actions"></span>
       </div>
       <section class="ce-composer" data-el="composer" hidden aria-label="New comment">
         <div class="ce-composer-label" data-el="composer-label">New margin note</div>
@@ -330,6 +346,7 @@ export class CommaEditorElement extends HTMLElement {
         <img data-el="lightbox-image" alt="">
         <div class="ce-lightbox-caption" data-el="lightbox-caption"></div>
       </section>`;
+    this._renderSelectionActions();
   }
 
   _el(name) {
@@ -375,7 +392,7 @@ export class CommaEditorElement extends HTMLElement {
       if (action === 'comments') this._el('sidebar').toggleAttribute('hidden');
       if (action === 'overall-comment') this._openCommentComposer(null);
       if (action === 'selection-comment') this._openCommentComposer(this._selection);
-      if (action === 'selection-ai') this._askAi();
+      if (action === 'selection-action') this._runSelectionAction(event.target.closest('[data-selection-action]')?.dataset.selectionAction);
       if (action === 'cancel-comment') this._closeCommentComposer();
       if (action === 'save-comment') await this._saveComment();
       if (action === 'delete-comment') await this._deleteComment(event.target.dataset.commentId);
@@ -660,15 +677,20 @@ export class CommaEditorElement extends HTMLElement {
     }
     const blockElement = captured.ancestor.closest('.ce-block');
     const blockIndex = Number(blockElement?.dataset.blockIndex ?? -1);
+    const sourceBlock = this._blocks.find((block) => block.index === blockIndex);
     const locator = createSourceLocator(this._document.body, captured.text, {
       rev: this._document.rev,
       blockIndex,
+      blockStart: sourceBlock?.start,
+      blockEnd: sourceBlock?.end,
     });
     this._selection = { quoteText: captured.text, sourceLocator: locator };
     this.shadowRoot.querySelector('[data-action="selection-comment"]').hidden = !this._capabilities.comments.create || this._dirty;
-    this.shadowRoot.querySelector('[data-action="selection-ai"]').hidden = this.hasAttribute('hide-ai-review') || this._dirty;
+    this._el('selection-host-actions').hidden = this.hasAttribute('hide-ai-review') || this._dirty || !this._selectionActions.length;
+    this._el('selection-divider').hidden = this._el('selection-host-actions').hidden
+      || this.shadowRoot.querySelector('[data-action="selection-comment"]').hidden;
     const rect = captured.range.getBoundingClientRect();
-    bar.style.left = `${rect.left + rect.width / 2}px`;
+    bar.style.left = `${Math.min(globalThis.innerWidth - 24, Math.max(24, rect.left + rect.width / 2))}px`;
     bar.style.top = `${Math.max(44, rect.top)}px`;
     bar.hidden = false;
   }
@@ -932,18 +954,39 @@ export class CommaEditorElement extends HTMLElement {
     }
   }
 
-  _askAi() {
+  _renderSelectionActions() {
+    if (!this._connected) return;
+    const root = this._el('selection-host-actions');
+    root.replaceChildren(...this._selectionActions.map((action) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.action = 'selection-action';
+      button.dataset.selectionAction = action.id;
+      button.textContent = action.label;
+      if (action.title) button.title = action.title;
+      return button;
+    }));
+    root.hidden = !this._selectionActions.length;
+  }
+
+  _runSelectionAction(actionId) {
     if (!this._selection) return;
     if (this._dirty) {
       this._setStatus('error', 'Save the draft before asking AI');
       return;
     }
     this._el('selection-bar').hidden = true;
-    this._emit('comma-ai-request', {
+    const action = this._selectionActions.find((candidate) => candidate.id === actionId);
+    if (!action) return;
+    const detail = {
+      actionId: action.id,
+      action: structuredClone(action),
       ...structuredClone(this._selection),
       document: this.documentState,
       actor: this.actor,
-    });
+    };
+    this._emit('comma-selection-action', detail);
+    if (action.id === 'ask-ai') this._emit('comma-ai-request', { ...detail, mode: 'selection' });
     this._selection = null;
   }
 

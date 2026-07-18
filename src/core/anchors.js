@@ -26,11 +26,16 @@ function scoreMatch(body, quote, index, locator = {}) {
   return score;
 }
 
-export function createSourceLocator(body, quote, { rev = '', blockIndex = -1 } = {}) {
+export function createSourceLocator(body, quote, { rev = '', blockIndex = -1, blockStart = -1, blockEnd = -1 } = {}) {
   const source = String(body || '');
   const quoteText = String(quote || '').trim();
   const matches = findQuoteMatches(source, quoteText);
-  const textIndex = matches.length === 1 ? matches[0] : source.indexOf(quoteText);
+  const scopedMatches = Number.isInteger(blockStart) && blockStart >= 0
+    ? matches.filter((index) => index >= blockStart && (!Number.isInteger(blockEnd) || blockEnd < 0 || index < blockEnd))
+    : [];
+  const textIndex = scopedMatches.length === 1
+    ? scopedMatches[0]
+    : matches.length === 1 ? matches[0] : source.indexOf(quoteText);
   return {
     bodyRev: String(rev || ''),
     textIndex,

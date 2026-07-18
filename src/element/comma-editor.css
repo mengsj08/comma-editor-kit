@@ -335,8 +335,11 @@ button { color: inherit; }
   animation: ce-pop 140ms ease-out;
 }
 .ce-selection-bar[hidden] { display: none; }
-.ce-selection-bar button { padding: 7px 11px; border: 0; border-radius: 999px; color: inherit; background: transparent; cursor: pointer; font: 10px/1 ui-monospace, monospace; }
+.ce-selection-bar button { padding: 7px 11px; border: 0; border-radius: 999px; color: inherit; background: transparent; cursor: pointer; font: 10px/1 ui-monospace, monospace; white-space: nowrap; }
 .ce-selection-bar button:hover { background: rgba(255,255,255,.12); }
+.ce-selection-host-actions { display: contents; }
+.ce-selection-divider { width: 1px; margin: 4px 1px; background: rgba(255,255,255,.18); }
+.ce-selection-divider[hidden], .ce-selection-host-actions[hidden] { display: none; }
 @keyframes ce-pop { from { opacity: 0; transform: translate(-50%, -85%) scale(.96); } }
 
 .ce-composer {
