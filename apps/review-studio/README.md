@@ -81,14 +81,27 @@ From the repository root:
 
 ```bash
 npm run test:review
+CI=true /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python -m pytest apps/review-studio/ -q
 ```
 
-The browser regressions require a running server and the kanban Playwright environment:
+`pytest apps/review-studio/` collects the API, orchestrator, and Slice A
+contract tests. It does not run `test_headless.py`: that file is an
+executable Playwright acceptance script with a `main()` entrypoint, not a pytest
+test function.
+
+The Review Studio browser regressions require a running server and the kanban
+Playwright environment. Start the server from the repository root in one
+terminal:
 
 ```bash
-COMMA_REVIEW_PORT=8891 python3 server.py
-/Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python test_headless.py
-/Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python test_blocks.py
+COMMA_REVIEW_PORT=8891 /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python apps/review-studio/server.py
+```
+
+Then run both executable browser acceptance scripts from a second terminal:
+
+```bash
+CI=true COMMA_REVIEW_PORT=8891 /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python apps/review-studio/test_headless.py
+CI=true COMMA_REVIEW_PORT=8891 /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python apps/review-studio/test_blocks.py
 ```
 
 See `REVIEW_WORKFLOW.md` for the API and writeback contract. `SPIKE_REPORT.md` is retained only as migration provenance.

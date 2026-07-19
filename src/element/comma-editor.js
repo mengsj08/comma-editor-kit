@@ -1249,6 +1249,7 @@ export class CommaEditorElement extends HTMLElement {
         })).length;
         const badge = document.createElement('span');
         badge.className = 'ce-count';
+        badge.dataset.el = 'comment-count';
         badge.dataset.commentCount = '';
         badge.textContent = String(count);
         button.append(' ', badge);
