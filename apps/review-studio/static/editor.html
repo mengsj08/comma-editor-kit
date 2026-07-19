@@ -49,12 +49,32 @@
       <code id="overview-rev">—</code>
       <small id="overview-stats"></small>
     </section>
-    <section class="overview-empty-state">
+    <section id="overview-state" class="overview-empty-state">
       <div class="overview-mark" aria-hidden="true">§</div>
       <div>
-        <h3>此版本尚无结构化总览</h3>
-        <p>这里将承载与当前 revision 绑定的研究问题、核心论点、证据范围、主要结论和限制。生成服务尚未启用，因此打开总览不会调用 CLI，也不会改动 Markdown 或批注。</p>
+        <h3 id="overview-state-title">正在核对此版本的结构化总览</h3>
+        <p id="overview-state-copy">打开总览只读取本地台账，不会自动调用 CLI，也不会改动 Markdown 或批注。</p>
+        <div class="overview-generate-row">
+          <label>生成工具
+            <select id="overview-tool" aria-label="文章总览生成工具">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+            </select>
+          </label>
+          <button id="overview-generate" type="button">生成此版本总览</button>
+        </div>
       </div>
+    </section>
+    <section id="overview-content" class="overview-content" hidden>
+      <div class="overview-status-row"><span id="overview-status">READY</span><time id="overview-created-at"></time></div>
+      <h3>3–6 句速览</h3>
+      <ol id="overview-summary-list"></ol>
+      <article><h3>核心论点</h3><p id="overview-thesis"></p></article>
+      <article><h3>证据范围</h3><ul id="overview-evidence-scope"></ul></article>
+      <article><h3>主要结论</h3><ul id="overview-conclusions"></ul></article>
+      <article><h3>限制</h3><ul id="overview-limitations"></ul></article>
+      <article><h3>待核查来源</h3><ul id="overview-source-targets"></ul></article>
+      <button id="overview-regenerate" type="button">重新生成当前版本</button>
     </section>
     <section class="capability-boundary-card">
       <div class="eyebrow">READING BOUNDARY</div>

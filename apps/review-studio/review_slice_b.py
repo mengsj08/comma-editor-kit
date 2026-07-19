@@ -22,11 +22,16 @@ _TABLE_SEPARATOR_RE = re.compile(
 _PROTECTED_SECTIONS = (
     ("abstract", re.compile(r"(?:^|\b)abstract(?:\b|$)|摘要", re.I)),
     ("methods", re.compile(
-        r"(?:^|\b)(?:methods?|methodology|materials?\s+and\s+methods?)(?:\b|$)|"
-        r"材料与方法|研究方法|实验方法|方法学|方法",
+        r"(?:^|\b)(?:methods?|methodology|materials?\s+and\s+methods?|"
+        r"statistical\s+analysis|statistics?|participants?|study\s+design|"
+        r"sample\s+size|outcome\s+measures?|outcomes?|cohorts?|eligibility|"
+        r"inclusion\s+and\s+exclusion|inclusion\s+criteria|exclusion\s+criteria)(?:\b|$)|"
+        r"材料与方法|研究方法|实验方法|方法学|方法|统计学分析|统计分析|统计|"
+        r"研究对象|受试者|参与者|研究设计|样本量|结局指标|结局|队列|"
+        r"纳入与排除标准|纳入排除|纳入标准|排除标准",
         re.I,
     )),
-    ("results", re.compile(r"(?:^|\b)results?(?:\b|$)|研究结果|结果", re.I)),
+    ("results", re.compile(r"(?:^|\b)(?:results?|findings?)(?:\b|$)|研究结果|结果|研究发现|发现", re.I)),
     ("conclusion", re.compile(r"(?:^|\b)conclusions?(?:\b|$)|结论", re.I)),
     ("references", re.compile(
         r"(?:^|\b)(?:references?|bibliography|works\s+cited)(?:\b|$)|参考文献|引用文献",
@@ -36,6 +41,15 @@ _PROTECTED_SECTIONS = (
         r"(?:^|\b)(?:figures?|figs?\.?|tables?)(?:\b|$)|图表|图例|表格|附图|附表",
         re.I,
     )),
+)
+_LOW_RISK_SECTIONS = re.compile(
+    r"(?:^|\b)(?:discussion|acknowledg(?:e)?ments?)(?:\b|$)|讨论|致谢",
+    re.I,
+)
+_WORDING_LEVEL_SECTIONS = re.compile(
+    r"(?:^|\b)(?:introduction|background|discussion|acknowledg(?:e)?ments?)(?:\b|$)|"
+    r"引言|背景|讨论|致谢",
+    re.I,
 )
 _FIGURE_TABLE_BODY_RE = re.compile(
     r"!\[[^\]]*\]\([^\n)]+\)|<\s*(?:img|figure|table)\b|"
@@ -88,7 +102,7 @@ def segment_markdown(source: str, *, body_rev: str, task_path: str) -> list[dict
         offsets.append(cursor)
         cursor += len(line)
     blocks = []
-    section = ""
+    heading_stack = []
     index = 0
     line_index = 0
     while line_index < len(lines):
@@ -102,7 +116,9 @@ def segment_markdown(source: str, *, body_rev: str, task_path: str) -> list[dict
         heading = _heading_title(line)
         if heading:
             block_type = "heading"
-            section = heading
+            level = len(_HEADING_RE.match(stripped).group(1))
+            heading_stack = heading_stack[:level - 1]
+            heading_stack.append(heading)
             line_index += 1
         elif _FENCE_RE.match(stripped):
             block_type = "code"
@@ -160,7 +176,8 @@ def segment_markdown(source: str, *, body_rev: str, task_path: str) -> list[dict
             "start": start,
             "end": end,
             "type": block_type,
-            "section": section,
+            "section": heading_stack[-1] if heading_stack else "",
+            "section_path": list(heading_stack),
             "raw": raw,
             "hash": _digest(raw),
             "source_locator": {
@@ -177,12 +194,15 @@ def segment_markdown(source: str, *, body_rev: str, task_path: str) -> list[dict
     return blocks
 
 
-def _public_change(block: dict, change: str, *, baseline_hash: str = "") -> dict:
+def _public_change(block: dict, change: str, *, baseline_hash: str = "",
+                   wording_only: bool = False) -> dict:
     return {
         "id": block["id"],
         "change": change,
         "section": block.get("section") or "",
+        "section_path": list(block.get("section_path") or []),
         "type": block.get("type") or "unknown",
+        "wording_only": bool(wording_only),
         "hash": block.get("hash") or "",
         "baseline_hash": baseline_hash,
         "source_locator": dict(block.get("source_locator") or {}),
@@ -201,9 +221,20 @@ def compare_blocks(baseline_blocks: list[dict], current_blocks: list[dict]) -> l
         if tag == "replace":
             paired = min(a1 - a0, b1 - b0)
             for offset in range(paired):
+                baseline_block = baseline_blocks[a0 + offset]
+                current_block = current_blocks[b0 + offset]
+                wording_only = (
+                    baseline_block.get("type") == current_block.get("type") == "paragraph"
+                    and difflib.SequenceMatcher(
+                        a=baseline_block.get("raw") or "",
+                        b=current_block.get("raw") or "",
+                        autojunk=False,
+                    ).ratio() >= 0.8
+                )
                 changed.append(_public_change(
-                    current_blocks[b0 + offset], "modified",
-                    baseline_hash=baseline_blocks[a0 + offset]["hash"],
+                    current_block, "modified",
+                    baseline_hash=baseline_block["hash"],
+                    wording_only=wording_only,
                 ))
             for offset in range(paired, b1 - b0):
                 changed.append(_public_change(current_blocks[b0 + offset], "added"))
@@ -225,12 +256,25 @@ def protected_sections(changed_blocks: list[dict], block_lookup: dict[str, dict]
     touched = []
     for change in changed_blocks:
         block = block_lookup.get(change["id"], {})
+        section_path = list(change.get("section_path") or block.get("section_path") or [])
         section = str(change.get("section") or block.get("section") or "")
+        if not section_path and section:
+            section_path = [section]
         raw = str(block.get("raw") or "")
         block_type = str(change.get("type") or block.get("type") or "")
-        categories = [name for name, pattern in _PROTECTED_SECTIONS if pattern.search(section)]
+        categories = [
+            name for name, pattern in _PROTECTED_SECTIONS
+            if any(pattern.search(title) for title in section_path)
+        ]
         if block_type == "table" or _FIGURE_TABLE_BODY_RE.search(raw):
             categories.append("figures-tables")
+        explicitly_low_risk = any(_LOW_RISK_SECTIONS.search(title) for title in section_path)
+        recognized_wording_change = bool(
+            change.get("wording_only")
+            and any(_WORDING_LEVEL_SECTIONS.search(title) for title in section_path)
+        )
+        if not categories and not (explicitly_low_risk or recognized_wording_change):
+            categories.append("unclassified")
         for category in categories:
             if category not in touched:
                 touched.append(category)

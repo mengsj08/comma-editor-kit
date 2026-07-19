@@ -122,6 +122,7 @@ test('comment lifecycle and finding state normalize as orthogonal dimensions', (
   const legacyFinding = normalizeComment({
     id: 'c-legacy', kind: null, quote_text: 'Exact quote.', source_locator: { text_index: 4 },
     review_state: 'withdrawn', comment_version: 7, human_edited: true,
+    review_run_id: 'run-1', applied_signature: 'sig-1', applied_operation_id: 'op-1',
     replies: [{ id: 'reply-1', author: 'June', content: 'Follow-up.', state: 'active' }],
   });
   assert.equal(legacyFinding.kind, 'anchored');
@@ -129,8 +130,19 @@ test('comment lifecycle and finding state normalize as orthogonal dimensions', (
   assert.equal(legacyFinding.findingState, 'withdrawn');
   assert.equal(legacyFinding.commentVersion, 7);
   assert.equal(legacyFinding.humanEdited, true);
+  assert.equal(legacyFinding.reviewRunId, 'run-1');
+  assert.equal(legacyFinding.appliedSignature, 'sig-1');
+  assert.equal(legacyFinding.appliedOperationId, 'op-1');
   assert.equal(legacyFinding.replies[0].actor, 'June');
   assert.equal(isCommentVisible(legacyFinding), false);
+
+  const camelMarkers = normalizeComment({
+    content: 'Camel aliases.', reviewRunId: 'run-2',
+    appliedSignature: 'sig-2', appliedOperationId: 'op-2',
+  });
+  assert.equal(camelMarkers.reviewRunId, 'run-2');
+  assert.equal(camelMarkers.appliedSignature, 'sig-2');
+  assert.equal(camelMarkers.appliedOperationId, 'op-2');
 
   const userWithdrawn = normalizeComment({
     content: 'Manual note.', lifecycle_state: 'withdrawn', finding_state: 'accepted',

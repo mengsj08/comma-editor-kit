@@ -33,6 +33,8 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
   GET      /api/review-runs/<id>
   POST     /api/review-runs/<id>/writeback
                                -> deterministic Slice B routing and immutable runs
+  GET/POST /api/document-summary
+                               -> revision-bound structured manuscript overview ledger
   GET/POST /api/conversations
   GET      /api/conversations/<id>
   POST     /api/conversations/<id>/messages|notes|writeback
@@ -54,6 +56,8 @@ Data model:
   edits.events.jsonl          -> append-only event ledger (actor+time+summary)
   .comma-review/versions/     -> content-addressed Markdown snapshot history
   .comma-review/drafts/       -> recoverable stale-save bodies
+  .comma-review/document-summaries/<doc-key>/index.json
+                              -> append-only version-bound overview records
 """
 import hashlib
 import html
@@ -118,6 +122,7 @@ _CONVERSATION_ID_RE = re.compile(r"^conversation-[a-f0-9]{12}$")
 _VERSION_ID_RE = re.compile(r"^version-[a-f0-9]{16}$")
 _DRAFT_ID_RE = re.compile(r"^draft-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
+_ACTIVE_REVIEW_RUNS = {}
 _PRIORITIES = {"P0", "P1", "P2", "P3"}
 _DECISIONS = {"accepted", "proposed", "rejected"}
 _LIFECYCLE_STATES = {"active", "withdrawn"}
@@ -310,6 +315,24 @@ _RUN_REVIEW_SCHEMA = {
     },
     "required": ["summary", "assistant_text", "operations"],
 }
+_DOCUMENT_SUMMARY_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "summary_3_6": {
+            "type": "array", "minItems": 3, "maxItems": 6,
+            "items": {"type": "string"},
+        },
+        "thesis": {"type": "string"},
+        "evidence_scope": {"type": "array", "items": {"type": "string"}},
+        "major_conclusions": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "array", "items": {"type": "string"}},
+        "source_check_targets": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "summary_3_6", "thesis", "evidence_scope", "major_conclusions",
+        "limitations", "source_check_targets",
+    ],
+}
 
 
 def _assert_no_dangerous_flags(argv):
@@ -416,6 +439,134 @@ def _review_meta_root() -> str:
 
 def _doc_store_key(doc: str) -> str:
     return hashlib.sha256(_doc_rel(doc).encode("utf-8")).hexdigest()[:16]
+
+
+def _summary_ledger_path(doc: str) -> str:
+    return os.path.join(
+        _review_meta_root(), "document-summaries", _doc_store_key(doc), "index.json")
+
+
+def _load_summary_ledger(doc: str):
+    data = _read_json_file(_summary_ledger_path(doc), {})
+    if not isinstance(data, dict) or not isinstance(data.get("summaries"), list):
+        return {
+            "schema_version": "comma-document-summary-ledger/v1",
+            "doc_path": _doc_rel(doc),
+            "summaries": [],
+        }
+    return data
+
+
+def _save_summary_record(doc: str, record):
+    ledger = _load_summary_ledger(doc)
+    ledger["summaries"].append(record)
+    _atomic_write_json(_summary_ledger_path(doc), ledger)
+    return record
+
+
+def _document_summary_state(doc: str):
+    current_rev = _rev(_read_doc(doc))
+    records = _load_summary_ledger(doc).get("summaries") or []
+    matching = [item for item in records if item.get("base_rev") == current_rev]
+    source = (matching or records)[-1] if (matching or records) else None
+    if not source:
+        return None, current_rev
+    summary = json.loads(json.dumps(source, ensure_ascii=False))
+    if summary.get("base_rev") != current_rev:
+        summary["status"] = "stale"
+    return summary, current_rev
+
+
+def _summary_text_list(value, *, minimum=0, maximum=24):
+    if not isinstance(value, list):
+        raise ValueError("document summary list field is invalid")
+    rows = [_clean_text(item, 1600) for item in value]
+    rows = [item for item in rows if item]
+    if len(rows) < minimum or len(rows) > maximum:
+        raise ValueError("document summary list field has invalid length")
+    return rows
+
+
+def _document_summary_prompt(body: str, doc_rel: str, body_rev: str) -> str:
+    return f"""You are preparing a version-bound scientific manuscript overview for the author. Read the complete authorized Markdown below and return exactly one JSON object, with no Markdown fence.
+Return 3-6 concise Chinese overview bullets plus a thesis, evidence scope, major conclusions, limitations, and source-check targets. Separate what the manuscript states from what still needs verification. Do not rewrite the manuscript and do not claim external verification.
+Required JSON keys: summary_3_6 (array of 3-6 strings), thesis (string), evidence_scope (array), major_conclusions (array), limitations (array), source_check_targets (array).
+Reading boundary: image/figure pixels are not available; cited literature was not fetched or verified in full text; statistics were not recomputed.
+Document: {doc_rel}; revision: {body_rev}
+<DOCUMENT>
+{body}
+</DOCUMENT>"""
+
+
+def _generate_document_summary(doc: str, *, base_rev: str, tool: str,
+                               regenerate: bool = False):
+    body = _read_doc(doc)
+    current_rev = _rev(body)
+    if base_rev != current_rev:
+        raise ReviewWritebackConflictError(
+            "document changed before summary generation",
+            code="document_rev_conflict", rev=current_rev,
+        )
+    if tool not in AI_TOOLS:
+        raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+    with _MUTATION_LOCK:
+        existing = [
+            item for item in _load_summary_ledger(doc).get("summaries") or []
+            if item.get("base_rev") == current_rev and item.get("status") == "ready"
+        ]
+        if existing and not regenerate:
+            return existing[-1], True
+    created_at = _now()
+    record = {
+        "schema_version": "comma-document-summary/v1",
+        "id": _new_id("summary-", 16),
+        "doc_path": _doc_rel(doc),
+        "base_rev": current_rev,
+        "status": "failed",
+        "reading_scope": "full-document",
+        "summary_3_6": [],
+        "thesis": "",
+        "evidence_scope": [],
+        "major_conclusions": [],
+        "limitations": [],
+        "source_check_targets": [],
+        "tool": tool,
+        "model_meta": {},
+        "created_at": created_at,
+    }
+    try:
+        result = _invoke_ai(
+            tool, _document_summary_prompt(body, _doc_rel(doc), current_rev),
+            schema=_DOCUMENT_SUMMARY_SCHEMA,
+        )
+        parsed = _extract_json(result.get("output") or "")
+        record.update({
+            "status": "ready",
+            "summary_3_6": _summary_text_list(parsed.get("summary_3_6"), minimum=3, maximum=6),
+            "thesis": _clean_text(parsed.get("thesis"), 4000),
+            "evidence_scope": _summary_text_list(parsed.get("evidence_scope")),
+            "major_conclusions": _summary_text_list(parsed.get("major_conclusions")),
+            "limitations": _summary_text_list(parsed.get("limitations")),
+            "source_check_targets": _summary_text_list(parsed.get("source_check_targets")),
+            "model_meta": {
+                "tool": result.get("tool") or tool,
+                "elapsed_ms": result.get("elapsed_ms"),
+                "returncode": result.get("returncode"),
+            },
+        })
+        if not record["thesis"]:
+            raise ValueError("document summary thesis required")
+    except Exception as exc:
+        record["status"] = "failed"
+        record["model_meta"] = {"tool": tool, "error": str(exc)[:240]}
+        with _MUTATION_LOCK:
+            _save_summary_record(doc, record)
+        raise
+    with _MUTATION_LOCK:
+        if _rev(_read_doc(doc)) != current_rev:
+            record["status"] = "stale"
+        _save_summary_record(doc, record)
+    return record, False
 
 
 def _version_paths(doc: str):
@@ -564,21 +715,55 @@ def _safe_download_name(name: str) -> str:
 
 
 def _reviewed_markdown(body: str, comments) -> str:
-    out = [body.rstrip(), "", "---", "", "## Review comments", ""]
-    if not comments:
-        out.append("_No review comments._")
-    for index, item in enumerate(comments, 1):
-        priority = str(item.get("priority") or "").strip()
-        title = f"### {index}. {priority + ' · ' if priority else ''}{item.get('author') or 'Reviewer'}"
-        out.extend([title, ""])
-        quote = str(item.get("quote_text") or "").strip()
-        if quote:
-            out.extend(["\n".join(f"> {line}" for line in quote.splitlines()), ""])
-        out.extend([str(item.get("content") or "").strip(), ""])
-        metadata = [str(item.get("section") or "").strip(), str(item.get("created_at") or "").strip()]
-        metadata = [value for value in metadata if value]
-        if metadata:
-            out.extend([f"_Context: {' · '.join(metadata)}_", ""])
+    confirmed, provisional, withdrawn = [], [], []
+    for item in comments:
+        if (item.get("lifecycle_state") == "withdrawn"
+                or item.get("finding_state") == "withdrawn"):
+            withdrawn.append(item)
+        elif item.get("finding_state") in {"provisional", "pending"}:
+            provisional.append(item)
+        else:
+            confirmed.append(item)
+    out = [
+        body.rstrip(), "", "---", "", "## Review comments", "",
+        f"> 状态统计：已确认 {len(confirmed)} · AI 暂定/待议 {len(provisional)} · 已撤回 {len(withdrawn)}",
+        "",
+    ]
+
+    def append_group(title, rows, *, state_label="", withdrawn_group=False):
+        out.extend([f"### {title}", ""])
+        if not rows:
+            out.extend(["_无。_", ""])
+            return
+        for index, item in enumerate(rows, 1):
+            priority = str(item.get("priority") or "").strip()
+            label = state_label
+            if item.get("finding_state") == "pending":
+                label = "待议 · 未经人工确认"
+            item_title = f"#### {index}. {priority + ' · ' if priority else ''}{item.get('author') or 'Reviewer'}"
+            out.extend([item_title, ""])
+            if label:
+                out.extend([f"**{label}**", ""])
+            quote = str(item.get("quote_text") or "").strip()
+            if quote:
+                out.extend(["\n".join(f"> {line}" for line in quote.splitlines()), ""])
+            out.extend([str(item.get("content") or "").strip(), ""])
+            metadata = [
+                str(item.get("section") or "").strip(),
+                str(item.get("created_at") or "").strip(),
+            ]
+            metadata = [value for value in metadata if value]
+            if metadata:
+                out.extend([f"_Context: {' · '.join(metadata)}_", ""])
+            if withdrawn_group:
+                reason = str(item.get("withdraw_reason") or "").strip()
+                if not reason and item.get("finding_state") == "withdrawn":
+                    reason = "后续评审已撤回该 finding"
+                out.extend([f"_撤回原因：{reason or '未记录'}_", ""])
+
+    append_group("已确认批注", confirmed)
+    append_group("AI 暂定批注", provisional, state_label="AI 暂定 · 未经人工确认")
+    append_group("已撤回记录（不作为当前评审意见）", withdrawn, withdrawn_group=True)
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -614,6 +799,7 @@ def _review_package(doc: str, body: str, version_entry=None) -> bytes:
     comments = _load_comments(doc)
     comment_events = _load_comment_events(doc)
     index = _load_version_index(doc)
+    summary_ledger = _load_summary_ledger(doc)
     manifest = {
         "schema_version": "comma-review-package/v1",
         "created_at": _now(),
@@ -624,6 +810,7 @@ def _review_package(doc: str, body: str, version_entry=None) -> bytes:
             "review_sessions": len(_matching_json_records(os.path.join(DATA_ROOT, "review-sessions"), doc_rel)),
             "conversations": len(_matching_json_records(os.path.join(DATA_ROOT, "conversations"), doc_rel)),
             "versions": len(index.get("versions", [])),
+            "document_summaries": len(summary_ledger.get("summaries", [])),
         },
         "privacy": "Raw AI traces and the global event ledger are intentionally excluded.",
     }
@@ -641,6 +828,10 @@ def _review_package(doc: str, body: str, version_entry=None) -> bytes:
             archive.writestr(f"review/review-sessions/{name}", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         for name, data in _matching_json_records(os.path.join(DATA_ROOT, "conversations"), doc_rel):
             archive.writestr(f"review/conversations/{name}", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        archive.writestr(
+            "review/document-summaries.json",
+            json.dumps(summary_ledger, ensure_ascii=False, indent=2) + "\n",
+        )
         archive.writestr("history/versions.json", json.dumps(index, ensure_ascii=False, indent=2) + "\n")
         written_revs = set()
         for entry in index.get("versions", []):
@@ -1338,6 +1529,38 @@ def _latest_completed_session(doc_rel: str):
     return rows[0] if rows else None
 
 
+def _fail_stale_running_reviews():
+    report = {"runs_failed": 0, "sessions_failed": 0}
+    if not os.path.isdir(REVIEW_ROOT):
+        return report
+    with _MUTATION_LOCK:
+        for name in os.listdir(REVIEW_ROOT):
+            if not name.endswith(".json"):
+                continue
+            session = _read_json_file(os.path.join(REVIEW_ROOT, name), None)
+            if not isinstance(session, dict) or not _SESSION_ID_RE.fullmatch(str(session.get("id") or "")):
+                continue
+            changed = False
+            candidates = [session.get("run"), *(session.get("runs") or [])]
+            for run in candidates:
+                if not isinstance(run, dict) or run.get("status") != "running":
+                    continue
+                run["status"] = "failed"
+                run["error"] = "host restarted while model invocation was running"
+                run["failed_at"] = _now()
+                run["updated_at"] = run["failed_at"]
+                report["runs_failed"] += 1
+                changed = True
+            if session.get("status") == "running":
+                session["status"] = "failed"
+                session["error"] = "host restarted while model invocation was running"
+                report["sessions_failed"] += 1
+                changed = True
+            if changed:
+                _save_session(session)
+    return report
+
+
 def _load_review_run(run_id: str):
     if not _RUN_ID_RE.fullmatch(str(run_id or "")):
         raise ValueError("invalid review run id")
@@ -1352,17 +1575,23 @@ def _load_review_run(run_id: str):
 
 
 def _inflight_review_run(doc_rel: str, base_rev: str, comments_rev: str, mode: str):
-    for session in _session_records(doc_rel):
-        candidates = [session.get("run"), *(session.get("runs") or [])]
-        for run in candidates:
-            if not isinstance(run, dict) or run.get("status") != "running":
-                continue
-            inputs = run.get("input") or {}
-            if (inputs.get("document_rev") == base_rev
-                    and inputs.get("comments_rev") == comments_rev
-                    and run.get("mode") == mode):
-                return session, run
-    return None, None
+    key = (doc_rel, base_rev, comments_rev, mode)
+    run_id = _ACTIVE_REVIEW_RUNS.get(key)
+    if not run_id:
+        return None, None
+    try:
+        session, run = _load_review_run(run_id)
+    except ValueError:
+        _ACTIVE_REVIEW_RUNS.pop(key, None)
+        return None, None
+    inputs = run.get("input") or {}
+    if (session.get("doc_path") != doc_rel or run.get("status") != "running"
+            or inputs.get("document_rev") != base_rev
+            or inputs.get("comments_rev") != comments_rev
+            or run.get("mode") != mode):
+        _ACTIVE_REVIEW_RUNS.pop(key, None)
+        return None, None
+    return session, run
 
 
 def _version_body_for_rev(doc: str, rev: str):
@@ -1828,6 +2057,13 @@ def _writeback_session(session, doc_path: str, finding_ids=None, actor="AI Revie
             finding_state = "withdrawn" if decision == "rejected" else "pending"
             if existing and (existing.get("finding_state") != finding_state
                              or finding.get("applied_signature") != signature):
+                if existing.get("human_edited"):
+                    blocked.append({
+                        "finding_id": fid,
+                        "comment_id": existing["id"],
+                        "reason": "human-edited comment blocks automatic finding-state downgrade",
+                    })
+                    continue
                 from_version = int(existing.get("comment_version") or 1)
                 existing["finding_state"] = finding_state
                 existing["updated_at"] = now
@@ -2465,6 +2701,7 @@ def _receipt_for_journal_entry(entry, comments_rev_after, *, recovered=False):
         "not_accepted": list(entry.get("not_accepted") or []),
     }
     if recovered:
+        receipt["recovered"] = True
         receipt["recovered_from_journal"] = True
     return receipt
 
@@ -2556,11 +2793,12 @@ def _reconcile_operation_journal():
                     report["finalized"] += 1
                     continue
                 doc = _safe_doc_path(session.get("doc_path"))
-                if _rev(_read_doc(doc)) != entry.get("base_rev"):
-                    raise ValueError("document revision differs from pending journal")
+                current_document_rev = _rev(_read_doc(doc))
                 store = _load_comment_store(doc)
                 comments = store["comments"]
                 if store["comments_rev"] == entry.get("comments_rev"):
+                    if current_document_rev != entry.get("base_rev"):
+                        raise ValueError("document revision differs before pending comment mutations landed")
                     selected = _canonical_accepted_operations(
                         run, entry.get("accepted_operation_ids"))
                     comments, plans, results = _build_operation_application(
@@ -2577,6 +2815,10 @@ def _reconcile_operation_journal():
                         doc, run["id"], plans, session.get("tool") or "AI Reviewer")
                     report["resumed"] += 1
                 elif _operation_plans_landed(comments, entry):
+                    # The comments may have landed before a separate document
+                    # save and before the receipt was finalized. Operation
+                    # markers are the recovery truth in this branch; a later
+                    # document revision must not create a false inconsistency.
                     comments_rev_after = store["comments_rev"]
                     _append_operation_events(
                         doc, run["id"], entry.get("plans") or [],
@@ -2960,6 +3202,15 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/drafts":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 return self._send_json({"ok": True, "drafts": [_draft_summary(item) for item in _drafts_for_doc(doc)]})
+            if route == "/api/document-summary":
+                doc = _safe_doc_path((qs.get("path") or [""])[0])
+                if not os.path.exists(doc):
+                    return self._send_json({"ok": False, "error": "doc not found"}, 404)
+                summary, current_rev = _document_summary_state(doc)
+                return self._send_json({
+                    "ok": True, "summary": summary, "current_rev": current_rev,
+                    "stale": bool(summary and summary.get("status") == "stale"),
+                })
             draft_diff_match = re.match(r"^/api/drafts/(draft-[a-f0-9]{16})/diff$", route)
             if draft_diff_match:
                 draft = _load_draft(draft_diff_match.group(1))
@@ -3097,6 +3348,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._delete_comment(payload)
             if route == "/api/comments/batch" and method == "POST":
                 return self._create_comment_batch(payload)
+            if route == "/api/comments/accept-provisional" and method == "POST":
+                return self._accept_all_provisional(payload)
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})$", route)
             if match and method in ("PATCH", "DELETE"):
                 if method == "PATCH":
@@ -3105,6 +3358,9 @@ class Handler(BaseHTTPRequestHandler):
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/restore$", route)
             if match and method == "POST":
                 return self._restore_comment_item(match.group(1), payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/accept$", route)
+            if match and method == "POST":
+                return self._accept_comment_item(match.group(1), payload)
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/replies$", route)
             if match and method == "POST":
                 return self._create_comment_reply(match.group(1), payload)
@@ -3115,6 +3371,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._withdraw_comment_reply(match.group(1), match.group(2), payload)
             if route == "/api/ai-run" and method == "POST":
                 return self._ai_run(payload)
+            if route == "/api/document-summary" and method == "POST":
+                return self._create_document_summary(payload)
             if route == "/api/review-sessions" and method == "POST":
                 return self._start_review(payload)
             if route == "/api/review-runs" and method == "POST":
@@ -3138,7 +3396,14 @@ class Handler(BaseHTTPRequestHandler):
             if match and method == "POST":
                 if match.group(2) == "messages":
                     return self._continue_review(match.group(1), payload)
-                return self._writeback_review(match.group(1), payload)
+                return self._send_json({
+                    "ok": False,
+                    "conflict": True,
+                    "code": "legacy_writeback_closed",
+                    "message": "legacy session writeback is closed; run preflight and confirm a journaled review run",
+                    "preflight_url": "/api/review-preflight",
+                    "review_runs_url": "/api/review-runs",
+                }, 409)
             match = re.match(r"^/api/review-sessions/(review-[a-f0-9]{12})/findings$", route)
             if match and method == "PUT":
                 return self._decide_finding(match.group(1), payload)
@@ -3298,9 +3563,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _create_comment(self, payload):
         doc = _safe_doc_path(payload.get("path"))
+        actor = str(_first(payload, "actor", "author") or "June")
         with _MUTATION_LOCK:
             comments = _load_comments(doc)
-            rec = _comment_record(payload)
+            rec = _comment_record({
+                "kind": payload.get("kind"),
+                "content": payload.get("content"),
+                "quote_text": _first(payload, "quote_text", "quoteText"),
+                "source_locator": _first(payload, "source_locator", "sourceLocator"),
+                "anchor_state": _first(payload, "anchor_state", "anchorState"),
+                "section": payload.get("section"),
+                "priority": payload.get("priority"),
+                "author": actor,
+                # Source is ordinary provenance; the host derives any default
+                # finding state from it instead of trusting finding_state.
+                "source": str(payload.get("source") or "manual"),
+            })
             comments.append(rec)
             comments_rev = _save_comments(doc, comments)
             event = _append_comment_event(
@@ -3313,6 +3591,26 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True, "comment": rec, "comments": comments,
             "comment_version": rec["comment_version"],
             "comments_rev": comments_rev, "event": event,
+        })
+
+    def _create_document_summary(self, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        if not os.path.exists(doc):
+            raise ValueError("doc not found")
+        base_rev = payload.get("base_rev")
+        if not isinstance(base_rev, str) or not base_rev:
+            raise ValueError("base_rev required")
+        tool = str(payload.get("tool") or "codex").strip().lower()
+        regenerate = _as_bool(payload.get("regenerate"))
+        summary, reused = _generate_document_summary(
+            doc, base_rev=base_rev, tool=tool, regenerate=regenerate)
+        _append_event(
+            tool, "document-summary", doc,
+            f"{summary['id']}: status={summary['status']} reused={reused}",
+        )
+        return self._send_json({
+            "ok": True, "summary": summary,
+            "current_rev": _rev(_read_doc(doc)), "reused": reused,
         })
 
     def _create_comment_batch(self, payload):
@@ -3439,6 +3737,72 @@ class Handler(BaseHTTPRequestHandler):
         _append_event(actor, "restore-comment", doc, comment_id)
         return self._send_comment_mutation(comment, comments_rev, event)
 
+    def _accept_comment_item(self, comment_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            if comment.get("lifecycle_state") == "withdrawn":
+                raise ValueError("cannot accept a withdrawn comment")
+            if comment.get("finding_state") != "provisional":
+                raise ValueError("only provisional findings can be accepted")
+            from_version = int(comment.get("comment_version") or 1)
+            comment["finding_state"] = "accepted"
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="finding-update", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before=comment.get("content"), content_after=comment.get("content"),
+            )
+        _append_event(actor, "accept-provisional-comment", doc, comment_id)
+        return self._send_comment_mutation(comment, comments_rev, event)
+
+    def _accept_all_provisional(self, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        expected_comments_rev = str(payload.get("comments_rev") or "")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            if not expected_comments_rev or expected_comments_rev != store["comments_rev"]:
+                raise ReviewWritebackConflictError(
+                    "comments changed before provisional acceptance",
+                    code="comments_rev_conflict", comments_rev=store["comments_rev"],
+                )
+            comments = store["comments"]
+            accepted = []
+            pending_events = []
+            for comment in comments:
+                if (comment.get("lifecycle_state") != "active"
+                        or comment.get("finding_state") != "provisional"):
+                    continue
+                from_version = int(comment.get("comment_version") or 1)
+                comment["finding_state"] = "accepted"
+                comment["updated_at"] = _now()
+                comment["comment_version"] = from_version + 1
+                accepted.append(comment["id"])
+                pending_events.append((comment, from_version))
+            comments_rev = store["comments_rev"]
+            events = []
+            if accepted:
+                comments_rev = _save_comments(doc, comments)
+                for comment, from_version in pending_events:
+                    events.append(_append_comment_event(
+                        doc, comment_id=comment["id"], action="finding-update", actor=actor,
+                        from_version=from_version, to_version=comment["comment_version"],
+                        content_before=comment.get("content"), content_after=comment.get("content"),
+                    ))
+        if accepted:
+            _append_event(actor, "accept-all-provisional-comments", doc, f"{len(accepted)} comments")
+        return self._send_json({
+            "ok": True, "accepted_comment_ids": accepted,
+            "comments": comments, "comments_rev": comments_rev, "events": events,
+        })
+
     def _create_comment_reply(self, comment_id, payload):
         doc = _safe_doc_path(payload.get("path"))
         actor = str(payload.get("actor") or "June")
@@ -3530,6 +3894,17 @@ class Handler(BaseHTTPRequestHandler):
         doc = _safe_doc_path(payload.get("path"))
         if not os.path.exists(doc):
             raise ValueError("doc not found")
+        completed = _latest_completed_session(_doc_rel(doc))
+        if completed:
+            return self._send_json({
+                "ok": False,
+                "conflict": True,
+                "code": "review_preflight_required",
+                "message": "a completed review already exists; use review preflight and review-runs",
+                "baseline_session_id": completed.get("id") or "",
+                "preflight_url": f"/api/review-preflight?path={urllib.parse.quote(_doc_rel(doc))}",
+                "review_runs_url": "/api/review-runs",
+            }, 409)
         with open(doc, encoding="utf-8") as fh:
             body = fh.read()
         if len(body) > 300000:
@@ -3665,6 +4040,7 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in preflight["allowed_modes"]:
             raise ValueError(f"mode {mode} is not allowed by current preflight")
         doc_rel = _doc_rel(doc)
+        active_key = (doc_rel, requested_rev, requested_comments_rev, mode)
         with _MUTATION_LOCK:
             existing_session, existing_run = _inflight_review_run(
                 doc_rel, requested_rev, requested_comments_rev, mode)
@@ -3729,6 +4105,7 @@ class Handler(BaseHTTPRequestHandler):
                 "updated_at": now,
             }
             _save_session(session)
+            _ACTIVE_REVIEW_RUNS[active_key] = run["id"]
         try:
             if mode == "initial":
                 prompt = _initial_review_prompt(locked_body, doc_rel, requested_rev, rubric, instruction)
@@ -3805,6 +4182,10 @@ class Handler(BaseHTTPRequestHandler):
                 session["error"] = str(exc)[:500]
                 _save_session(session)
             raise
+        finally:
+            with _MUTATION_LOCK:
+                if _ACTIVE_REVIEW_RUNS.get(active_key) == run["id"]:
+                    _ACTIVE_REVIEW_RUNS.pop(active_key, None)
 
     def _continue_review(self, session_id, payload):
         message = _clean_text(payload.get("message"), 6000)
@@ -4150,6 +4531,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DATA_ROOT, exist_ok=True)
+    stale = _fail_stale_running_reviews()
     reconciliation = _reconcile_operation_journal()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     detected = {item["id"]: item for item in runtime_capability_manifest()["tools"]}
@@ -4157,7 +4539,8 @@ def main():
           f"(claude={'ready' if detected['claude']['ready'] else detected['claude']['auth_state']} "
           f"codex={'ready' if detected['codex']['ready'] else detected['codex']['auth_state']})  "
           f"journal={reconciliation['pending']}/{reconciliation['finalized']}/"
-          f"{reconciliation['inconsistent']}")
+          f"{reconciliation['inconsistent']} "
+          f"stale-runs={stale['runs_failed']}/{stale['sessions_failed']}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

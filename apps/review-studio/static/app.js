@@ -12,9 +12,10 @@ const $ = (id) => document.getElementById(id);
 const editor = $('comma-editor');
 const reviewState = {
   active: null, activeRun: null, sessions: [], running: false, preflight: null,
-  acceptedOperationIds: new Set(),
+  acceptedOperationIds: new Set(), commentsById: new Map(),
 };
 const archiveState = { versions: [], drafts: [], currentRev: '', exportCapabilities: null, loading: false };
+const overviewState = { summary: null, currentRev: '', loading: false };
 const conversationState = {
   active: null, sessions: [], sourceQuote: null, running: false,
   composerMode: 'root', parentMessageId: '', writebackMessageId: '', quickSource: null,
@@ -98,6 +99,19 @@ function syncRuntimeControls() {
   $('review-writeback').disabled = reviewState.running
     || (Boolean(reviewState.activeRun) && (!runAwaitingWriteback || reviewState.acceptedOperationIds.size === 0));
   $('review-accept-all').disabled = reviewState.running || !runAwaitingWriteback;
+  const summaryTool = $('overview-tool');
+  if (summaryTool) {
+    [...summaryTool.options].forEach((option) => {
+      option.disabled = !runtimeToolReady(option.value, 'structured_review');
+    });
+    if (!runtimeToolReady(summaryTool.value, 'structured_review')) {
+      const readyOption = [...summaryTool.options].find((option) => !option.disabled);
+      if (readyOption) summaryTool.value = readyOption.value;
+    }
+    const summaryReady = runtimeToolReady(summaryTool.value, 'structured_review');
+    $('overview-generate').disabled = overviewState.loading || !summaryReady;
+    $('overview-regenerate').disabled = overviewState.loading || !summaryReady;
+  }
   const conversationTool = conversationState.active?.tool || selectedConversationTool();
   const noteOnly = conversationState.composerMode === 'note';
   $('conversation-send').disabled = conversationState.running || (!noteOnly && !runtimeToolReady(conversationTool, 'conversation'));
@@ -176,10 +190,12 @@ function configureEditorActions() {
     { id: 'overall-comment', label: '全文批注', slot: 'primary', appliesTo: 'comments.create' },
     { id: 'comments', label: '批注', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
     { id: 'source-edit', label: '源码编辑', slot: 'overflow', appliesTo: { capability: 'document.save', requiresWritable: true } },
+    { id: 'accept-provisional', label: '接受全部暂定', slot: 'overflow', appliesTo: 'comments.update' },
     { id: 'show-withdrawn', label: editor.showWithdrawnComments ? '隐藏已撤回' : '显示已撤回', slot: 'overflow', appliesTo: 'comments.list' },
   ];
   editor.commentActions = [
     { id: 'reply', label: '回复', appliesTo: { capability: 'reply', target: 'comment', lifecycleStates: ['active'] } },
+    { id: 'accept-finding', label: '确认接受', appliesTo: { capability: 'update', target: 'comment', lifecycleStates: ['active'], findingStates: ['provisional'] } },
     { id: 'edit', label: '编辑', appliesTo: { capability: 'update', target: 'comment', lifecycleStates: ['active'] } },
     { id: 'withdraw', label: '撤回', appliesTo: { capability: 'delete', target: 'comment', lifecycleStates: ['active'] } },
     { id: 'restore', label: '恢复', appliesTo: { capability: 'restore', target: 'comment', lifecycleStates: ['withdrawn'] } },
@@ -198,7 +214,98 @@ function syncDocumentMeta(documentState) {
   $('doc-meta').textContent = `${body.split('\n').length} 行 · rev ${String(documentState?.rev || '').slice(0, 16)}`;
 }
 
-function openOverview() {
+function summaryListHtml(rows, empty = '未提供') {
+  const values = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  return values.length ? values.map((item) => `<li>${esc(item)}</li>`).join('') : `<li>${esc(empty)}</li>`;
+}
+
+function renderDocumentSummary(summary) {
+  overviewState.summary = summary || null;
+  const state = $('overview-state');
+  const content = $('overview-content');
+  const title = $('overview-state-title');
+  const copy = $('overview-state-copy');
+  const generate = $('overview-generate');
+  if (!summary) {
+    state.hidden = false;
+    content.hidden = true;
+    title.textContent = '此版本尚无结构化总览';
+    copy.textContent = '点击后将完整阅读当前 Markdown，生成 3–6 句速览、核心论点、证据范围、主要结论、限制与待核查来源。不会改动正文或批注。';
+    generate.textContent = '生成此版本总览';
+    syncRuntimeControls();
+    return;
+  }
+  const stale = summary.status === 'stale';
+  const failed = summary.status === 'failed';
+  state.hidden = !(stale || failed);
+  content.hidden = failed;
+  if (stale) {
+    title.textContent = '此总览已过期';
+    copy.textContent = '下方内容绑定旧 revision，仅供回看；必须显式生成为当前版本，不能视为当前稿件总览。';
+    generate.textContent = '生成当前版本总览';
+  } else if (failed) {
+    title.textContent = '此版本的总览生成失败';
+    copy.textContent = '失败记录已进入 summary 台账；可在 CLI 就绪后显式重试。';
+    generate.textContent = '重新生成此版本';
+  }
+  if (!failed) {
+    $('overview-status').textContent = stale ? 'STALE · 已过期' : 'READY · 当前版本';
+    $('overview-status').classList.toggle('stale', stale);
+    $('overview-created-at').textContent = summary.created_at || '';
+    $('overview-summary-list').innerHTML = summaryListHtml(summary.summary_3_6);
+    $('overview-thesis').textContent = summary.thesis || '未提供';
+    $('overview-evidence-scope').innerHTML = summaryListHtml(summary.evidence_scope);
+    $('overview-conclusions').innerHTML = summaryListHtml(summary.major_conclusions);
+    $('overview-limitations').innerHTML = summaryListHtml(summary.limitations);
+    $('overview-source-targets').innerHTML = summaryListHtml(summary.source_check_targets, '未列出');
+    $('overview-regenerate').textContent = stale ? '生成当前版本总览' : '重新生成当前版本';
+  }
+  syncRuntimeControls();
+}
+
+async function loadDocumentSummary() {
+  const { response, json } = await apiJson(`/api/document-summary?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
+  if (!response.ok || !json.ok) {
+    $('overview-state').hidden = false;
+    $('overview-content').hidden = true;
+    $('overview-state-title').textContent = '总览台账读取失败';
+    $('overview-state-copy').textContent = json.error || `HTTP ${response.status}`;
+    return;
+  }
+  overviewState.currentRev = json.current_rev || editor.documentState.rev || '';
+  renderDocumentSummary(json.summary || null);
+}
+
+async function generateDocumentSummary(regenerate = false) {
+  if (overviewState.loading) return;
+  const tool = $('overview-tool').value || 'codex';
+  if (!await requireRuntimeTool(tool, 'structured_review')) return;
+  overviewState.loading = true;
+  $('overview-state').hidden = false;
+  $('overview-state-title').textContent = '正在生成当前版本总览';
+  $('overview-state-copy').textContent = '完整 Markdown 正在通过既有本机 CLI 链路读取；不会修改正文或批注。';
+  syncRuntimeControls();
+  const { response, json } = await apiJson('/api/document-summary', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: DOC_PATH,
+      base_rev: editor.documentState.rev,
+      tool,
+      regenerate,
+    }),
+  });
+  overviewState.loading = false;
+  if (!response.ok || !json.ok) {
+    if (response.status === 409) await editor.load();
+    await loadDocumentSummary();
+    toast(json.message || json.error || '文章总览生成失败', true);
+    return;
+  }
+  overviewState.currentRev = json.current_rev || editor.documentState.rev;
+  renderDocumentSummary(json.summary);
+}
+
+async function openOverview() {
   const documentState = editor.documentState;
   const body = String(documentState?.body || '');
   $('overview-doc-name').textContent = documentState?.title || DOC_PATH;
@@ -207,6 +314,11 @@ function openOverview() {
   $('overview-drawer').classList.add('open');
   $('overview-drawer').setAttribute('aria-hidden', 'false');
   $('overview-scrim').hidden = false;
+  $('overview-state').hidden = false;
+  $('overview-content').hidden = true;
+  $('overview-state-title').textContent = '正在核对此版本的结构化总览';
+  $('overview-state-copy').textContent = '这里只读取本地 summary 台账，不会自动调用 CLI。';
+  await loadDocumentSummary();
 }
 
 function closeOverview() {
@@ -215,10 +327,36 @@ function closeOverview() {
   $('overview-scrim').hidden = true;
 }
 
-editor.addEventListener('comma-ready', (event) => syncDocumentMeta(event.detail.document));
+function setReviewCommentTruth(comments) {
+  reviewState.commentsById = new Map((comments || []).map((comment) => [comment.id, comment]));
+}
+
+async function acceptAllProvisionalComments() {
+  const provisional = [...reviewState.commentsById.values()].filter((comment) => (
+    comment.lifecycleState === 'active' && comment.findingState === 'provisional'
+  ));
+  if (!provisional.length) return toast('当前没有可接受的 provisional 批注。');
+  if (!window.confirm(`确认接受全部 ${provisional.length} 条 AI 暂定批注？此动作会逐条写入 finding-update 审计事件。`)) return;
+  const { response, json } = await apiJson('/api/comments/accept-provisional', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, comments_rev: editor.commentsRev, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) {
+    await refreshEditorComments();
+    return toast(json.message || json.error || '批量接受失败', true);
+  }
+  await refreshEditorComments();
+  toast(`已确认接受 ${json.accepted_comment_ids?.length || 0} 条暂定批注。`);
+}
+
+editor.addEventListener('comma-ready', (event) => {
+  syncDocumentMeta(event.detail.document);
+  setReviewCommentTruth(event.detail.comments || []);
+});
 editor.addEventListener('comma-save', (event) => {
   syncDocumentMeta(event.detail.document);
   loadVersions();
+  if ($('overview-drawer').classList.contains('open')) loadDocumentSummary();
 });
 editor.addEventListener('comma-conflict', async (event) => {
   const draft = event.detail?.error?.draft;
@@ -249,6 +387,7 @@ editor.addEventListener('comma-toolbar-action', (event) => {
   if (action === 'overall-comment') editor.openOverallCommentComposer();
   if (action === 'comments') editor.toggleComments();
   if (action === 'source-edit') editor.openSourceEditor();
+  if (action === 'accept-provisional') acceptAllProvisionalComments();
   if (action === 'show-withdrawn') {
     editor.showWithdrawnComments = !editor.showWithdrawnComments;
     configureEditorActions();
@@ -289,6 +428,22 @@ editor.addEventListener('comma-comment-action', async (event) => {
           baseCommentVersion: detail.baseCommentVersion, actor: 'June',
         });
         await refreshEditorComments();
+      }
+      if (detail.actionId === 'accept-finding') {
+        const { response, json } = await apiJson(`/api/comments/${encodeURIComponent(detail.commentId)}/accept`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path: DOC_PATH,
+            base_comment_version: detail.baseCommentVersion,
+            actor: 'June',
+          }),
+        });
+        if (!response.ok || !json.ok) {
+          await refreshEditorComments();
+          return toast(json.message || json.error || '确认接受失败', true);
+        }
+        await refreshEditorComments();
+        toast('该 finding 已由人工确认接受。');
       }
       if (detail.actionId === 'reply-withdraw') {
         if (!window.confirm('撤回这条回复？审计记录会保留。')) return;
@@ -647,7 +802,32 @@ function setReviewRunning(running, message = '', isError = false) {
 }
 
 async function refreshEditorComments() {
-  try { await editor.refreshComments(); } catch (error) { toast(error.message || '批注刷新失败', true); }
+  try {
+    const comments = await editor.refreshComments();
+    setReviewCommentTruth(comments);
+    if (reviewState.active) renderReviewSession();
+    return comments;
+  } catch (error) {
+    toast(error.message || '批注刷新失败', true);
+    return [];
+  }
+}
+
+function findingComment(finding) {
+  const commentId = finding?.appliedCommentId || finding?.applied_comment_id || '';
+  return commentId ? reviewState.commentsById.get(commentId) || null : null;
+}
+
+function trueFindingState(finding) {
+  return findingComment(finding)?.findingState || '';
+}
+
+function findingStateLabel(state) {
+  if (state === 'accepted') return '已接受';
+  if (state === 'provisional') return 'AI 暂定 · 未经人工确认';
+  if (state === 'pending') return '待议 · 未经人工确认';
+  if (state === 'withdrawn') return '已撤回';
+  return 'AI 建议';
 }
 
 async function loadReviewSessions(loadLatest = false) {
@@ -696,9 +876,9 @@ function renderReviewSession() {
     return;
   }
   const findings = session.findings || [];
-  const accepted = findings.filter((finding) => finding.decision === 'accepted').length;
+  const accepted = findings.filter((finding) => trueFindingState(finding) === 'accepted').length;
   const ready = findings.filter((finding) => finding.anchorState === 'ready').length;
-  const applied = findings.filter((finding) => finding.appliedCommentId).length;
+  const applied = findings.filter((finding) => Boolean(findingComment(finding))).length;
   const blocked = findings.filter((finding) => finding.anchorState !== 'ready').length;
   const status = $('review-status');
   status.className = `review-status ${session.status || ''}`;
@@ -711,7 +891,7 @@ function renderReviewSession() {
   }, {});
   $('review-stats').innerHTML = [
     `<span class="review-stat">${findings.length} 条 findings</span>`,
-    `<span class="review-stat">${accepted} 条已接受</span>`,
+    `<span class="review-stat">${accepted} 条人工确认接受</span>`,
     `<span class="review-stat">${ready} 条锚点可靠</span>`,
     `<span class="review-stat">${applied} 条已写回</span>`,
     blocked ? `<span class="review-stat">${blocked} 条待定位</span>` : '',
@@ -785,6 +965,7 @@ function renderOperationPreview(run) {
     }
     grouped.forEach((operation) => {
       const proposed = operation.proposed_comment || operation.proposedComment || {};
+      const appliedState = trueFindingState(proposed);
       const humanEdited = group.action === 'update'
         && Boolean(operationField(operation, 'humanEditedTarget', 'human_edited_target'));
       const blocked = group.action === 'blocked';
@@ -803,6 +984,7 @@ function renderOperationPreview(run) {
       card.innerHTML = `<div class="operation-card-head">
           <span class="operation-id">${esc(operation.id)}</span>
           <span class="operation-finding">${esc(findingId || '无 finding id')}</span>
+          <span class="finding-state ${esc(appliedState || 'suggested')}">${esc(findingStateLabel(appliedState))}</span>
           ${targetId ? `<span class="operation-target">target ${esc(targetId)}</span>` : ''}
         </div>
         <div class="operation-copy">
@@ -850,32 +1032,28 @@ function renderFindings(findings) {
     return;
   }
   findings.forEach((finding) => {
+    const state = trueFindingState(finding);
     const card = document.createElement('article');
-    card.className = `finding-card priority-${esc(finding.priority || 'P2')}${finding.decision === 'rejected' ? ' rejected' : ''}`;
+    card.className = `finding-card priority-${esc(finding.priority || 'P2')}${state === 'withdrawn' ? ' rejected' : ''}`;
     const anchorText = finding.anchorState === 'ready' ? '锚点可靠' : finding.anchorState === 'ambiguous' ? '锚点重复' : '锚点缺失';
     card.innerHTML = `<div class="finding-head">
         <span class="finding-id">${esc(finding.id)}</span>
         <span class="finding-priority">${esc(finding.priority)}</span>
         <span class="finding-section">${esc(finding.section || '未标章节')}</span>
         <span class="anchor-chip ${esc(finding.anchorState)}">${anchorText}</span>
+        <span class="finding-state ${esc(state || 'suggested')}">${esc(findingStateLabel(state))}</span>
       </div>
       <button type="button" class="finding-quote">「${esc(finding.quoteText.slice(0, 220))}」</button>
       <p class="finding-issue"><span class="finding-label">问题</span>${esc(finding.issue)}</p>
       <p class="finding-action"><span class="finding-label">建议</span>${esc(finding.action)}</p>
       ${finding.evidenceRequirement ? `<p class="finding-action"><span class="finding-label">证据</span>${esc(finding.evidenceRequirement)}</p>` : ''}
       <div class="finding-actions">
-        <button type="button" data-decision="accepted" class="${finding.decision === 'accepted' ? 'active' : ''}">接受</button>
-        <button type="button" data-decision="proposed" class="${finding.decision === 'proposed' ? 'active' : ''}">待议</button>
-        <button type="button" data-decision="rejected" class="${finding.decision === 'rejected' ? 'active' : ''}">驳回</button>
-        ${finding.appliedCommentId ? '<span class="finding-applied">✓ 已写回批注</span>' : ''}
+        ${findingComment(finding) ? '<span class="finding-applied">✓ 已写回批注</span>' : '<span class="finding-applied">模型建议尚未成为批注</span>'}
       </div>`;
     card.querySelector('.finding-quote').onclick = () => {
       editor.jumpToQuote(finding.quoteText, finding.sourceLocator || {});
       closeReviewDrawer();
     };
-    card.querySelectorAll('[data-decision]').forEach((button) => {
-      button.onclick = () => decideFinding(finding.id, button.dataset.decision);
-    });
     root.appendChild(card);
   });
 }
@@ -1001,22 +1179,8 @@ async function syncReview() {
     await loadReviewSessions(false);
     return;
   }
-  setReviewRunning(true, '正在校验文档版本和锚点，并执行幂等批注写回…');
-  const { json } = await apiJson(`/api/review-sessions/${encodeURIComponent(session.id)}/writeback`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-  });
-  if (!json.ok) {
-    if (json.session) activateReviewSession(json.session);
-    setReviewRunning(false, json.message || json.error || '批注同步失败', true);
-    renderReviewSession();
-    return;
-  }
-  activateReviewSession(json.session);
-  const writeback = json.writeback || {};
-  setReviewRunning(false, `同步完成：新增 ${(writeback.created || []).length}，更新 ${(writeback.updated || []).length}，跳过 ${(writeback.skipped || []).length}。`);
-  renderReviewSession();
-  await refreshEditorComments();
-  await loadReviewSessions(false);
+  toast('旧 session 不能直接写回；请重新预检并通过 review run 操作预览确认。');
+  return startReview();
 }
 
 async function decideFinding(findingId, decision) {
@@ -1335,6 +1499,13 @@ async function writebackConversationMessage() {
 $('btn-review-history').onclick = async () => { openReviewDrawer(); if (!reviewState.active) await loadReviewSessions(true); };
 $('overview-close').onclick = closeOverview;
 $('overview-scrim').onclick = closeOverview;
+$('overview-generate').onclick = () => generateDocumentSummary(false);
+$('overview-regenerate').onclick = () => {
+  const current = overviewState.summary?.base_rev === editor.documentState.rev;
+  if (current && !window.confirm('确认重新生成当前 revision 的文章总览？旧记录会保留在 summary 台账中。')) return;
+  generateDocumentSummary(current);
+};
+$('overview-tool').onchange = syncRuntimeControls;
 $('btn-versions').onclick = () => openArchive('versions');
 $('btn-export').onclick = () => openArchive('exports');
 $('archive-close').onclick = closeArchive;
@@ -1443,6 +1614,7 @@ window.__COMMA_REVIEW__ = {
   loadRuntimeCapabilities, runtimeToolReady, archiveState, loadVersions,
   openArchive, closeArchive, createCheckpoint, restoreVersion, restoreDraft,
   openOverview, closeOverview, renderReviewPreflight, closeReviewPreflight,
+  overviewState, loadDocumentSummary, generateDocumentSummary, acceptAllProvisionalComments,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 

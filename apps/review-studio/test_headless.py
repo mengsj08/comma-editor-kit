@@ -457,7 +457,7 @@ def main():
     assert results["public_component_render"]["textureDisplay"] == "none"
     assert results["image_lightbox_opened"] is True
     assert results["host_actions"]["primary"] == ["文章总览", "AI Review", "全文批注", "批注 0"]
-    assert results["host_actions"]["overflow"] == ["源码编辑", "显示已撤回"]
+    assert results["host_actions"]["overflow"] == ["源码编辑", "接受全部暂定", "显示已撤回"]
     assert results["host_actions"]["panelTitle"] == "批注"
     assert results["overview_shell"]["title"] == "文章总览"
     assert results["overview_shell"]["claims"] == 3
