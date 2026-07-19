@@ -19,6 +19,39 @@ body { margin: 0; font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", 
 .doc-actions #conversation-count { display: inline-grid; min-width: 18px; height: 18px; margin-left: 4px; place-items: center; border-radius: 9px; background: #e8efef; color: var(--ink-blue); font-size: 10px; }
 .doc-actions .primary-action { border-color: var(--accent-dark); background: var(--accent-dark); color: #fffaf1; font-weight: 650; padding: 7px 14px; }
 .doc-actions .primary-action:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cli-status-wrap { position: relative; }
+.doc-actions .cli-status { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; color: #53615d; font-size: 11px; font-weight: 650; }
+.cli-status > i, .cli-tool-row > i { display: block; width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #9aa29f; }
+.doc-actions .cli-status.ready { border-color: #b9cfc4; color: var(--green); }
+.cli-status.ready > i, .cli-tool-row.ready > i { background: var(--green); }
+.doc-actions .cli-status.partial { border-color: #d7c39f; color: #89551f; }
+.cli-status.partial > i, .cli-tool-row.needs-login > i, .cli-tool-row.check-failed > i { background: #b7792e; }
+.doc-actions .cli-status.offline { border-color: #dfbbb7; color: var(--stale); }
+.cli-status.offline > i, .cli-tool-row.missing > i { background: var(--stale); }
+.cli-status.checking > i { animation: cli-pulse .8s ease-in-out infinite alternate; }
+@keyframes cli-pulse { to { opacity: .25; } }
+.cli-popover { position: absolute; z-index: 95; top: calc(100% + 9px); right: 0; width: 330px; overflow: hidden; border: 1px solid #d2cec4; border-radius: 10px; background: #fffefa; box-shadow: 0 18px 54px rgba(42,35,28,.18); color: var(--fg); text-align: left; }
+.cli-popover[hidden] { display: none; }
+.cli-popover header { padding: 13px 15px 10px; border-bottom: 1px solid #e5e1d8; }
+.cli-popover header div { display: grid; gap: 2px; }
+.cli-popover header strong { font: 600 15px Georgia, "Songti SC", serif; color: #342d26; }
+.cli-popover header small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.cli-popover-list { padding: 5px 14px; }
+.cli-popover-list > p { margin: 13px 0; color: var(--muted); font-size: 11px; }
+.cli-tool-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px 1px; border-bottom: 1px solid #ece8df; }
+.cli-tool-row:last-child { border-bottom: 0; }
+.cli-tool-row span { display: grid; gap: 1px; min-width: 0; }
+.cli-tool-row strong { color: #343733; font-size: 12px; }
+.cli-tool-row small { overflow: hidden; color: var(--muted); font: 9px/1.4 "SF Mono", Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.cli-tool-row b { color: var(--muted); font: 700 8px/1 "SF Mono", Menlo, monospace; letter-spacing: .06em; }
+.cli-tool-row.ready b { color: var(--green); }
+.cli-tool-row.needs-login b, .cli-tool-row.check-failed b { color: #a56c27; }
+.cli-tool-row.missing b { color: var(--stale); }
+.cli-popover footer { display: flex; justify-content: flex-end; padding: 8px 13px; border-top: 1px solid #e5e1d8; background: #faf8f3; }
+.doc-actions .cli-popover footer button { border: 0; background: transparent; padding: 3px 1px; color: var(--ink-blue); font-size: 10px; font-weight: 650; }
+.tool-switch label.is-unavailable { cursor: not-allowed; }
+.tool-switch label.is-unavailable span { color: #a9a7a1; text-decoration: line-through; }
+.tool-switch input:disabled + span { opacity: .58; }
 .spark { color: #e5bd82; }
 #header-comment-count { display: inline-flex; min-width: 18px; height: 18px; align-items: center; justify-content: center; margin-left: 4px;
   border-radius: 9px; background: var(--accent-soft); color: var(--accent-dark); font-size: 11px; }

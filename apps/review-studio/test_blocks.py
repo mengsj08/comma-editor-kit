@@ -45,10 +45,10 @@ def main():
               return { index: block.index, start: block.start, end: block.end, raw: block.raw, type: block.type };
             }""")
             block = page.locator("comma-editor").locator(f'.ce-block[data-block-index="{pick["index"]}"]')
-            block.click()
+            block.locator('[data-action="edit-block"]').evaluate("button => button.click()")
             textarea = page.locator("comma-editor").locator(".ce-block-editor")
             textarea.wait_for()
-            results["click_to_edit"] = {"blockIndex": pick["index"], "entered": textarea.is_visible()}
+            results["explicit_edit"] = {"blockIndex": pick["index"], "entered": textarea.is_visible()}
             textarea.fill(textarea.input_value() + " EDITED-BY-PUBLIC-KIT")
             textarea.press("Control+Enter")
             page.wait_for_function("""() => document.querySelector('comma-editor').documentState.body.includes(' EDITED-BY-PUBLIC-KIT')""")
@@ -92,7 +92,7 @@ def main():
             handle.write(original)
         reset_comments()
 
-    assert results["click_to_edit"]["entered"]
+    assert results["explicit_edit"]["entered"]
     assert results["byte_fidelity"]["onlySelectedBlockChanged"]
     assert results["edited_anchor"] == {"before": "unique", "after": "missing"}
     assert not results["console_errors"], results["console_errors"]

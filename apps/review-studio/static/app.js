@@ -15,6 +15,8 @@ const conversationState = {
   active: null, sessions: [], sourceQuote: null, running: false,
   composerMode: 'root', parentMessageId: '', writebackMessageId: '', quickSource: null,
 };
+let runtimeCapabilities = null;
+let runtimeLoading = null;
 let toastTimer = null;
 
 function esc(value) {
@@ -43,6 +45,108 @@ async function apiJson(url, init = {}) {
   let json = null;
   try { json = await response.json(); } catch { json = null; }
   return { response, json: json || { ok: false, error: `HTTP ${response.status}` } };
+}
+
+function runtimeTool(tool) {
+  return runtimeCapabilities?.tools?.find((item) => item.id === tool) || null;
+}
+
+function runtimeToolReady(tool, capability = '') {
+  const item = runtimeTool(tool);
+  return Boolean(item?.ready && (!capability || item.capabilities?.[capability] !== false));
+}
+
+function runtimeToolState(item) {
+  if (item?.ready) return { className: 'ready', label: '已登录，可调用', tag: 'READY' };
+  if (item?.auth_state === 'not_authenticated') return { className: 'needs-login', label: '需要登录', tag: 'SIGN IN' };
+  if (item?.auth_state === 'check_failed') return { className: 'check-failed', label: '状态检测失败', tag: 'CHECK' };
+  return { className: 'missing', label: '未找到命令', tag: 'MISSING' };
+}
+
+function renderRuntimePopover(loadError = false) {
+  const root = $('cli-popover-list');
+  if (loadError || !runtimeCapabilities) {
+    root.innerHTML = '<p>本地 Gateway 未能返回 CLI 状态；请重新检测。</p>';
+    return;
+  }
+  root.innerHTML = runtimeCapabilities.tools.map((item) => {
+    const state = runtimeToolState(item);
+    return `<div class="cli-tool-row ${state.className}"><i aria-hidden="true"></i><span><strong>${esc(item.label || item.id)}</strong><small>${esc(item.detail || state.label)}</small></span><b>${state.tag}</b></div>`;
+  }).join('');
+}
+
+function syncRuntimeControls() {
+  const reviewInputs = [...document.querySelectorAll('input[name="review-tool"]')];
+  const readyReview = reviewInputs.find((input) => runtimeToolReady(input.value, 'structured_review'));
+  const selectedReview = reviewInputs.find((input) => input.checked);
+  if (readyReview && !runtimeToolReady(selectedReview?.value, 'structured_review') && !reviewState.running) readyReview.checked = true;
+  reviewInputs.forEach((input) => {
+    input.disabled = reviewState.running || !runtimeToolReady(input.value, 'structured_review');
+    input.closest('label')?.classList.toggle('is-unavailable', !runtimeToolReady(input.value, 'structured_review'));
+  });
+
+  if (conversationState.active) syncConversationTool(conversationState.active.tool, true);
+  else syncConversationTool(selectedConversationTool(), false);
+
+  $('review-start').disabled = reviewState.running || !runtimeToolReady(selectedReviewTool(), 'structured_review');
+  $('review-send').disabled = reviewState.running || Boolean(reviewState.active && !runtimeToolReady(reviewState.active.tool, 'structured_review'));
+  $('review-writeback').disabled = reviewState.running;
+  const conversationTool = conversationState.active?.tool || selectedConversationTool();
+  const noteOnly = conversationState.composerMode === 'note';
+  $('conversation-send').disabled = conversationState.running || (!noteOnly && !runtimeToolReady(conversationTool, 'conversation'));
+  $('conversation-writeback-confirm').disabled = conversationState.running;
+}
+
+async function loadRuntimeCapabilities() {
+  if (runtimeLoading) return runtimeLoading;
+  const badge = $('cli-status');
+  badge.className = 'cli-status checking';
+  badge.querySelector('span').textContent = 'CLI · 检测中';
+  runtimeLoading = (async () => {
+    try {
+      const { response, json } = await apiJson('/api/runtime/capabilities', { cache: 'no-store' });
+      if (!response.ok || !json.ok || !Array.isArray(json.tools)) throw new Error(json.error || `HTTP ${response.status}`);
+      runtimeCapabilities = json;
+      const readyCount = json.tools.filter((item) => item.ready).length;
+      badge.className = `cli-status ${readyCount === json.tools.length ? 'ready' : readyCount ? 'partial' : 'offline'}`;
+      badge.querySelector('span').textContent = readyCount ? `CLI · ${readyCount} 可用` : 'CLI · 未就绪';
+      badge.title = readyCount ? `${readyCount} 个本机 CLI 已登录` : 'Codex 与 Claude CLI 均未就绪';
+      renderRuntimePopover(false);
+      syncRuntimeControls();
+      return json;
+    } catch (error) {
+      runtimeCapabilities = null;
+      badge.className = 'cli-status offline';
+      badge.querySelector('span').textContent = 'CLI · 未连接';
+      badge.title = error.message || 'CLI 状态检测失败';
+      renderRuntimePopover(true);
+      syncRuntimeControls();
+      return null;
+    } finally {
+      runtimeLoading = null;
+    }
+  })();
+  return runtimeLoading;
+}
+
+function openRuntimePopover() {
+  $('cli-popover').hidden = false;
+  $('cli-status').setAttribute('aria-expanded', 'true');
+}
+
+function closeRuntimePopover() {
+  $('cli-popover').hidden = true;
+  $('cli-status').setAttribute('aria-expanded', 'false');
+}
+
+async function requireRuntimeTool(tool, capability) {
+  if (!runtimeCapabilities) await loadRuntimeCapabilities();
+  if (runtimeToolReady(tool, capability)) return true;
+  const item = runtimeTool(tool);
+  const state = runtimeToolState(item);
+  openRuntimePopover();
+  toast(`${item?.label || tool} ${state.label}；请在右上角 CLI 状态中处理后重新检测。`, true);
+  return false;
 }
 
 const adapter = new HttpDocumentAdapter({
@@ -106,11 +210,11 @@ function selectedReviewTool() {
 
 function setReviewRunning(running, message = '', isError = false) {
   reviewState.running = Boolean(running);
-  for (const id of ['review-start', 'review-send', 'review-writeback']) $(id).disabled = Boolean(running);
   const stateElement = $('review-run-state');
   stateElement.hidden = !message;
   stateElement.textContent = message;
   stateElement.classList.toggle('error', Boolean(isError));
+  syncRuntimeControls();
 }
 
 async function refreshEditorComments() {
@@ -234,6 +338,7 @@ async function startReview() {
   if (editor.dirty) return toast('请先保存正文，再启动评审。', true);
   openReviewDrawer();
   const tool = selectedReviewTool();
+  if (!await requireRuntimeTool(tool, 'structured_review')) return;
   setReviewRunning(true, `${tool.toUpperCase()} 正在读取当前版本、生成 findings 并校验原文锚点。完整评审可能需要几分钟…`);
   const { json } = await apiJson('/api/review-sessions', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -259,6 +364,7 @@ async function continueReview() {
   const session = reviewState.active;
   const message = $('review-message').value.trim();
   if (!session || !message || reviewState.running) return;
+  if (!await requireRuntimeTool(session.tool, 'structured_review')) return;
   setReviewRunning(true, '正在结合你的意见更新 findings，并重新核验当前原文…');
   const { json } = await apiJson(`/api/review-sessions/${encodeURIComponent(session.id)}/messages`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message }),
@@ -336,15 +442,21 @@ function closeConversationDock() {
 
 function setConversationRunning(running, message = '') {
   conversationState.running = Boolean(running);
-  $('conversation-send').disabled = Boolean(running);
-  $('conversation-writeback-confirm').disabled = Boolean(running);
   if (message) $('conversation-status').textContent = message;
+  syncRuntimeControls();
 }
 
 function syncConversationTool(tool, locked = false) {
   const selected = document.querySelector(`input[name="conversation-tool"][value="${tool}"]`);
   if (selected) selected.checked = true;
-  document.querySelectorAll('input[name="conversation-tool"]').forEach((input) => { input.disabled = locked; });
+  const inputs = [...document.querySelectorAll('input[name="conversation-tool"]')];
+  const ready = inputs.find((input) => runtimeToolReady(input.value, 'conversation'));
+  if (!locked && ready && !runtimeToolReady(inputs.find((input) => input.checked)?.value, 'conversation')) ready.checked = true;
+  inputs.forEach((input) => {
+    const unavailable = !runtimeToolReady(input.value, 'conversation');
+    input.disabled = locked || conversationState.running || unavailable;
+    input.closest('label')?.classList.toggle('is-unavailable', unavailable);
+  });
   document.querySelector('.conversation-tool-switch').classList.toggle('is-locked', locked);
 }
 
@@ -414,6 +526,10 @@ async function quickExplain(sourceQuote) {
   $('quick-output').textContent = '正在生成临时解释…';
   $('quick-explain').hidden = false;
   const tool = selectedConversationTool();
+  if (!await requireRuntimeTool(tool, 'quick_explain')) {
+    $('quick-output').textContent = '当前 CLI 未就绪。请在右上角 CLI 状态中检查安装或登录状态，然后点击“重新检测”。';
+    return;
+  }
   const { json } = await apiJson('/api/ai-run', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -422,8 +538,9 @@ async function quickExplain(sourceQuote) {
     }),
   });
   $('quick-output').textContent = json.ok
-    ? `${json.stub ? '[stub] ' : ''}${json.output || '（没有返回内容）'}`
+    ? (json.output || '（没有返回内容）')
     : `解释失败：${json.error || '未知错误'}`;
+  if (!json.ok && json.code === 'cli_unavailable') await loadRuntimeCapabilities();
 }
 
 function configureConversationComposer(mode = 'followup', parentMessageId = '') {
@@ -441,6 +558,7 @@ function configureConversationComposer(mode = 'followup', parentMessageId = '') 
   $('conversation-send').textContent = mode === 'root' ? '开始讨论' : mode === 'note' ? '添加评论' : mode === 'fork' ? '创建分支' : '发送';
   $('conversation-message').value = '';
   $('conversation-message').focus();
+  syncRuntimeControls();
 }
 
 function assistantMessageElement(message, notes) {
@@ -531,6 +649,8 @@ async function sendConversationMessage() {
   const content = $('conversation-message').value.trim();
   if (!content || conversationState.running) return;
   const mode = conversationState.composerMode;
+  const tool = conversationState.active?.tool || selectedConversationTool();
+  if (mode !== 'note' && !await requireRuntimeTool(tool, 'conversation')) return;
   setConversationRunning(true, mode === 'note' ? '正在记录评论…' : mode === 'fork' ? '正在生成分支回复…' : 'AI 正在围绕引用回复…');
   let url = '/api/conversations';
   let body;
@@ -633,13 +753,29 @@ $('quick-close').onclick = () => { $('quick-explain').hidden = true; };
 $('quick-deepen').onclick = () => {
   if (conversationState.quickSource) openConversationForQuote(conversationState.quickSource);
 };
+$('cli-status').onclick = () => {
+  if ($('cli-popover').hidden) openRuntimePopover();
+  else closeRuntimePopover();
+};
+$('cli-redetect').onclick = async () => {
+  await loadRuntimeCapabilities();
+  openRuntimePopover();
+};
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.cli-status-wrap')) closeRuntimePopover();
+});
+document.querySelectorAll('input[name="review-tool"], input[name="conversation-tool"]').forEach((input) => {
+  input.addEventListener('change', syncRuntimeControls);
+});
 
 window.__COMMA_REVIEW__ = {
   editor, adapter, reviewState, startReview, continueReview, syncReview,
   loadReviewSession, loadReviewSessions, conversationState, loadConversationSession,
   loadConversationSessions, openConversationForQuote, sendConversationMessage,
+  loadRuntimeCapabilities, runtimeToolReady,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 
+loadRuntimeCapabilities();
 loadReviewSessions(false);
 loadConversationSessions(false);

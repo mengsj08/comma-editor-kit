@@ -15,6 +15,16 @@
       <span id="doc-meta" class="doc-meta"></span>
     </div>
     <div class="doc-actions">
+      <div class="cli-status-wrap">
+        <button id="cli-status" class="cli-status checking" type="button" aria-label="查看本机 CLI 状态" aria-haspopup="dialog" aria-expanded="false">
+          <i aria-hidden="true"></i><span>CLI · 检测中</span>
+        </button>
+        <aside id="cli-popover" class="cli-popover" aria-label="本机 CLI 状态" hidden>
+          <header><div><strong>本机 AI CLI</strong><small>状态与快速解释、讨论和完整评审共用</small></div></header>
+          <div id="cli-popover-list" class="cli-popover-list"><p>正在检测 Codex 与 Claude…</p></div>
+          <footer><button id="cli-redetect" type="button">重新检测</button></footer>
+        </aside>
+      </div>
       <button id="btn-conversations" type="button" title="查看已建立的选区讨论">讨论记录 <span id="conversation-count">0</span></button>
       <button id="btn-review-history" type="button">评审记录</button>
     </div>

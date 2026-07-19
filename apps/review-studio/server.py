@@ -64,8 +64,6 @@ REVIEW_ROOT = os.path.join(DATA_ROOT, "review-sessions")
 CONVERSATION_ROOT = os.path.join(DATA_ROOT, "conversations")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("COMMA_REVIEW_PORT", os.environ.get("SPIKE_PORT", "8891")))
-CLAUDE_BIN = shutil.which("claude")
-CODEX_BIN = shutil.which("codex")
 
 # Conservative safety default for a *distribution* embed (NOT June's personal
 # kanban, which trusts the local machine with `codex exec --yolo` /
@@ -73,9 +71,15 @@ CODEX_BIN = shutil.which("codex")
 # rewrite workbench we never bypass the sandbox: codex runs `--sandbox
 # read-only`, and any `--yolo` / `--dangerously-*` style flag is forbidden here.
 AI_TOOLS = {
-    "claude": {"bin": CLAUDE_BIN},
-    "codex": {"bin": CODEX_BIN},
+    "claude": {"label": "Claude CLI", "auth_args": ("auth", "status")},
+    "codex": {"label": "Codex CLI", "auth_args": ("login", "status")},
 }
+_CLI_FALLBACK_DIRS = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    os.path.expanduser("~/.local/bin"),
+    "/Applications/ChatGPT.app/Contents/Resources",
+)
 _FORBIDDEN_FLAG_SUBSTR = ("--yolo", "--dangerously", "danger-full-access",
                           "--sandbox=danger", "bypass-approvals")
 _SESSION_ID_RE = re.compile(r"^review-[a-f0-9]{12}$")
@@ -87,6 +91,105 @@ _ASSET_MIME_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml",
 }
 _MAX_ASSET_BYTES = 40 * 1024 * 1024
+
+
+class CliUnavailableError(ValueError):
+    """The selected local CLI is absent, unauthenticated, or not executable."""
+
+
+def _cli_search_path(extra_dir=""):
+    """Return a deterministic CLI PATH that also works in a minimal launchd job."""
+    parts = []
+    for item in (extra_dir, *(os.environ.get("PATH") or "").split(os.pathsep), *_CLI_FALLBACK_DIRS):
+        normalized = os.path.realpath(os.path.expanduser(item)) if item else ""
+        if normalized and normalized not in parts:
+            parts.append(normalized)
+    return os.pathsep.join(parts)
+
+
+def _resolve_cli_path(tool):
+    if tool not in AI_TOOLS:
+        return None
+    override = (os.environ.get(f"COMMA_REVIEW_{tool.upper()}_BIN") or "").strip()
+    if override:
+        override = os.path.realpath(os.path.expanduser(override))
+        if os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
+        return None
+    return shutil.which(tool, path=_cli_search_path())
+
+
+def _cli_env(binpath=""):
+    env = os.environ.copy()
+    env["PATH"] = _cli_search_path(os.path.dirname(binpath) if binpath else "")
+    return env
+
+
+def _cli_status(tool):
+    config = AI_TOOLS[tool]
+    executable = _resolve_cli_path(tool)
+    if not executable:
+        return {
+            "id": tool, "label": config["label"], "available": False,
+            "ready": False, "auth_state": "not_installed", "version": "",
+            "detail": f"未找到 {tool} 命令",
+        }
+    version = ""
+    try:
+        completed = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, timeout=8,
+            check=False, env=_cli_env(executable), stdin=subprocess.DEVNULL,
+        )
+        version = ((completed.stdout or completed.stderr) or "").strip().splitlines()[0]
+    except Exception:
+        version = "已安装，版本读取失败"
+    try:
+        auth = subprocess.run(
+            [executable, *config["auth_args"]], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=8, check=False,
+            env=_cli_env(executable), stdin=subprocess.DEVNULL,
+        )
+        auth_state = "ready" if auth.returncode == 0 else "not_authenticated"
+    except Exception:
+        auth_state = "check_failed"
+    return {
+        "id": tool, "label": config["label"], "available": True,
+        "ready": auth_state == "ready", "auth_state": auth_state,
+        "version": version, "detail": version or "已安装",
+    }
+
+
+def runtime_capability_manifest():
+    tools = [_cli_status(tool) for tool in ("codex", "claude")]
+    return {
+        "ok": True,
+        "schema_version": "comma-review-runtime-capabilities/v1",
+        "gateway": {"ok": True, "host": HOST},
+        "tools": [
+            {
+                **item,
+                "capabilities": {
+                    "quick_explain": item["ready"],
+                    "conversation": item["ready"],
+                    "structured_review": item["ready"],
+                },
+            }
+            for item in tools
+        ],
+    }
+
+
+def _require_cli(tool):
+    status = _cli_status(tool)
+    if status["ready"]:
+        return _resolve_cli_path(tool)
+    if status["auth_state"] == "not_authenticated":
+        reason = "已安装但尚未登录"
+    elif status["auth_state"] == "check_failed":
+        reason = "登录状态检测失败"
+    else:
+        reason = "未安装或不在可检测路径中"
+    raise CliUnavailableError(f"{status['label']} {reason}；请从右上角 CLI 状态重新检测。")
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
@@ -763,9 +866,7 @@ def _apply_finding_ops(session, ops):
 def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None):
     if tool not in AI_TOOLS:
         raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
-    binpath = AI_TOOLS[tool]["bin"]
-    if not binpath:
-        raise ValueError(f"{tool} CLI not found on PATH")
+    binpath = _require_cli(tool)
     last_msg_file = None
     schema_file = None
     if tool == "claude":
@@ -799,8 +900,10 @@ def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None):
     _assert_no_dangerous_flags(argv)
     t0 = time.time()
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, env=_cli_env(binpath),
+        )
         elapsed_ms = round((time.time() - t0) * 1000)
         output = proc.stdout.strip()
         if tool == "codex" and last_msg_file and os.path.exists(last_msg_file):
@@ -808,6 +911,11 @@ def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None):
                 clean = fh.read().strip()
             if clean:
                 output = clean
+        if proc.returncode != 0:
+            raise CliUnavailableError(
+                f"{AI_TOOLS[tool]['label']} 执行失败（exit {proc.returncode}）；"
+                "请从右上角 CLI 状态检查登录后重试。"
+            )
         output = output or proc.stderr.strip()
         return {"tool": tool, "output": output, "returncode": proc.returncode,
                 "elapsed_ms": elapsed_ms}
@@ -918,6 +1026,8 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True, "path": os.path.relpath(doc, DATA_ROOT),
                     "body": body, "rev": _rev(body),
                 })
+            if route == "/api/runtime/capabilities":
+                return self._send_json(runtime_capability_manifest())
             if route == "/api/comments":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 return self._send_json({"ok": True, "comments": _load_comments(doc)})
@@ -938,6 +1048,8 @@ class Handler(BaseHTTPRequestHandler):
                 session = _load_conversation(match.group(1))
                 return self._send_json({"ok": True, "session": session})
             return self._send_json({"ok": False, "error": "unknown route"}, 404)
+        except CliUnavailableError as e:
+            return self._send_json({"ok": False, "error": str(e), "code": "cli_unavailable"}, 503)
         except ValueError as e:
             return self._send_json({"ok": False, "error": str(e)}, 400)
         except Exception as e:  # noqa
@@ -996,6 +1108,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._comment_on_conversation(match.group(1), payload)
                 return self._writeback_conversation(match.group(1), payload)
             return self._send_json({"ok": False, "error": "unknown route"}, 404)
+        except CliUnavailableError as e:
+            return self._send_json({"ok": False, "error": str(e), "code": "cli_unavailable"}, 503)
         except ValueError as e:
             return self._send_json({"ok": False, "error": str(e)}, 400)
         except Exception as e:  # noqa
@@ -1275,11 +1389,6 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("prompt required")
         if tool not in AI_TOOLS:
             raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
-        if not AI_TOOLS[tool]["bin"]:
-            return self._send_json({
-                "ok": True, "stub": True, "tool": tool,
-                "output": f"[AI stub] {tool} CLI not found on PATH; wired but not invoked.",
-            })
         full = prompt
         if selection:
             full = f"Selected passage:\n{selection}\n\nInstruction:\n{prompt}"
@@ -1287,7 +1396,7 @@ class Handler(BaseHTTPRequestHandler):
         result = _invoke_ai(tool, full, timeout=180)
         _append_event(tool, "ai-run", "",
                       f"[{tool} rc={result['returncode']} {result['elapsed_ms']}ms] {prompt[:50]}")
-        return self._send_json({"ok": True, "stub": False, **result})
+        return self._send_json({"ok": True, **result})
 
     def _start_conversation(self, payload):
         doc = _safe_doc_path(payload.get("path"))
@@ -1513,9 +1622,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     os.makedirs(DATA_ROOT, exist_ok=True)
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    detected = {item["id"]: item for item in runtime_capability_manifest()["tools"]}
     print(f"[comma-review] serving http://{HOST}:{PORT}  "
-          f"(claude={'yes' if CLAUDE_BIN else 'stub'} "
-          f"codex={'yes' if CODEX_BIN else 'stub'})")
+          f"(claude={'ready' if detected['claude']['ready'] else detected['claude']['auth_state']} "
+          f"codex={'ready' if detected['codex']['ready'] else detected['codex']['auth_state']})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

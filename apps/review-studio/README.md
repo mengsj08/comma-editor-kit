@@ -20,6 +20,28 @@ COMMA_REVIEW_DATA_ROOT=/absolute/private/directory COMMA_REVIEW_PORT=8891 python
 
 The server binds only to `127.0.0.1`. It accepts Markdown files only and confines document access to the selected data root. Private documents, comment sidecars, review sessions, quote conversation ledgers, event ledgers, logs, screenshots, and raw model traces must not be committed.
 
+## Local CLI capability
+
+`GET /api/runtime/capabilities` reports Codex and Claude installation, version,
+and login readiness. The header badge uses the same resolver as quick explain,
+quote-scoped discussions, and structured review, so a missing provider is
+disabled before invocation instead of returning a successful stub.
+
+The resolver augments a minimal launchd `PATH` with conventional macOS CLI
+locations and passes that path to child processes (important for the Node-based
+Codex launcher). Explicit installations can be pinned without changing global
+shell state:
+
+```bash
+COMMA_REVIEW_CODEX_BIN=/absolute/path/to/codex \
+COMMA_REVIEW_CLAUDE_BIN=/absolute/path/to/claude \
+python3 server.py
+```
+
+Capability detection runs only `--version` and read-only login-status commands;
+their authentication output is discarded and page load never starts a model
+task.
+
 ## Verify
 
 From the repository root:

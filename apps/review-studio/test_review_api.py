@@ -13,6 +13,82 @@ import server
 
 
 class ReviewApiTests(unittest.TestCase):
+    def test_frontend_exposes_cli_status_and_preflight_contract(self):
+        with open(os.path.join(server.STATIC_ROOT, "editor.html"), encoding="utf-8") as fh:
+            html = fh.read()
+        with open(os.path.join(server.STATIC_ROOT, "app.js"), encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('id="cli-status"', html)
+        self.assertIn('id="cli-redetect"', html)
+        self.assertIn("/api/runtime/capabilities", script)
+        self.assertIn("requireRuntimeTool(tool, 'quick_explain')", script)
+        self.assertNotIn("json.stub", script)
+
+    def test_runtime_capabilities_report_provider_readiness(self):
+        statuses = {
+            "codex": {
+                "id": "codex", "label": "Codex CLI", "available": True,
+                "ready": True, "auth_state": "ready", "version": "codex-cli fixture",
+                "detail": "codex-cli fixture",
+            },
+            "claude": {
+                "id": "claude", "label": "Claude CLI", "available": True,
+                "ready": False, "auth_state": "not_authenticated", "version": "claude fixture",
+                "detail": "claude fixture",
+            },
+        }
+        with mock.patch.object(server, "_cli_status", side_effect=lambda tool: statuses[tool]):
+            httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                result = self._request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runtime/capabilities"
+                )
+                self.assertEqual(result["schema_version"], "comma-review-runtime-capabilities/v1")
+                tools = {item["id"]: item for item in result["tools"]}
+                self.assertTrue(tools["codex"]["capabilities"]["conversation"])
+                self.assertFalse(tools["claude"]["capabilities"]["quick_explain"])
+                self.assertEqual(tools["claude"]["auth_state"], "not_authenticated")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+
+    def test_cli_resolution_and_child_path_survive_minimal_launchd_environment(self):
+        executable = os.path.realpath(server.sys.executable)
+        with mock.patch.dict(server.os.environ, {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "COMMA_REVIEW_CODEX_BIN": executable,
+        }, clear=False):
+            self.assertEqual(server._resolve_cli_path("codex"), executable)
+            child_path = server._cli_env(executable)["PATH"].split(os.pathsep)
+            self.assertIn(os.path.dirname(executable), child_path)
+            self.assertIn("/opt/homebrew/bin", child_path)
+
+    def test_unavailable_cli_is_a_service_error_not_a_successful_stub(self):
+        unavailable = {
+            "id": "codex", "label": "Codex CLI", "available": False,
+            "ready": False, "auth_state": "not_installed", "version": "",
+            "detail": "未找到 codex 命令",
+        }
+        with mock.patch.object(server, "_cli_status", return_value=unavailable):
+            httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                status, result = self._request_error(base + "/api/ai-run", "POST", {
+                    "tool": "codex", "prompt": "Explain this synthetic sentence.",
+                })
+                self.assertEqual(status, 503)
+                self.assertEqual(result["code"], "cli_unavailable")
+                self.assertNotIn("stub", result)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+
     def test_document_relative_assets_are_served_and_confined(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = os.path.realpath(raw_tmp)
