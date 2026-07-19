@@ -31,6 +31,7 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
   GET      /api/review-preflight
   POST     /api/review-runs
   GET      /api/review-runs/<id>
+  POST     /api/review-runs/<id>/writeback
                                -> deterministic Slice B routing and immutable runs
   GET/POST /api/conversations
   GET      /api/conversations/<id>
@@ -139,6 +140,14 @@ class CommentVersionConflictError(ValueError):
         super().__init__("comment changed before this action")
         self.current_comment = current_comment
         self.comments_rev = comments_rev
+
+
+class ReviewWritebackConflictError(ValueError):
+    """A confirmed operation preview drifted before its atomic writeback."""
+
+    def __init__(self, message, **details):
+        super().__init__(message)
+        self.details = details
 
 
 def _cli_search_path(extra_dir=""):
@@ -940,9 +949,11 @@ def _comment_record(payload, *, default_author="June", strict=True):
         "source_key": "sourceKey",
         "finding_id": "findingId",
         "review_session_id": "reviewSessionId",
+        "review_run_id": "reviewRunId",
         "conversation_session_id": "conversationSessionId",
         "conversation_message_id": "conversationMessageId",
         "applied_signature": "appliedSignature",
+        "applied_operation_id": "appliedOperationId",
     }
     for key in ("priority", "source", *aliases):
         value = payload.get(key)
@@ -991,7 +1002,10 @@ def _save_comments(doc_path: str, comments) -> str:
 
 def _append_comment_event(doc_path: str, *, comment_id: str, action: str,
                           actor: str, from_version: int, to_version: int,
-                          content_before="", content_after=""):
+                          content_before="", content_after="",
+                          content_before_hash="", content_after_hash="",
+                          operation_id="", review_run_id="",
+                          applied_signature=""):
     record = {
         "event_id": _new_id("ce-", 16),
         "comment_id": str(comment_id),
@@ -999,10 +1013,17 @@ def _append_comment_event(doc_path: str, *, comment_id: str, action: str,
         "actor": str(actor or "unspecified"),
         "from_version": int(from_version),
         "to_version": int(to_version),
-        "content_before_hash": _comment_content_hash(content_before),
-        "content_after_hash": _comment_content_hash(content_after),
+        "content_before_hash": content_before_hash or _comment_content_hash(content_before),
+        "content_after_hash": content_after_hash or _comment_content_hash(content_after),
         "at": _now(),
     }
+    for key, value in (
+        ("operation_id", operation_id),
+        ("review_run_id", review_run_id),
+        ("applied_signature", applied_signature),
+    ):
+        if value:
+            record[key] = str(value)
     path = _comment_events_path(doc_path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
@@ -2100,6 +2121,593 @@ def _initial_run_operations(findings):
     return operations
 
 
+def _operation_journal_path():
+    return os.path.join(DATA_ROOT, ".comma-review", "operation-journal.json")
+
+
+def _load_operation_journal():
+    path = _operation_journal_path()
+    if not os.path.exists(path):
+        return {"schema_version": "comma-operation-journal/v1", "entries": []}
+    data = _read_json_file(path, None)
+    if (not isinstance(data, dict)
+            or not isinstance(data.get("entries"), list)):
+        raise ValueError("invalid operation journal")
+    return {
+        "schema_version": "comma-operation-journal/v1",
+        "entries": [entry for entry in data["entries"] if isinstance(entry, dict)],
+    }
+
+
+def _save_operation_journal(journal):
+    path = _operation_journal_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _atomic_write_json(path, {
+        "schema_version": "comma-operation-journal/v1",
+        "entries": journal.get("entries") or [],
+    })
+
+
+def _replace_operation_journal_entry(entry):
+    journal = _load_operation_journal()
+    journal["entries"] = [
+        existing for existing in journal["entries"]
+        if existing.get("run_id") != entry.get("run_id")
+    ]
+    journal["entries"].append(entry)
+    _save_operation_journal(journal)
+
+
+def _clear_operation_journal_entry(run_id):
+    journal = _load_operation_journal()
+    journal["entries"] = [
+        entry for entry in journal["entries"] if entry.get("run_id") != run_id
+    ]
+    _save_operation_journal(journal)
+
+
+def _canonical_accepted_operations(run, accepted_operation_ids):
+    if not isinstance(accepted_operation_ids, list) or not accepted_operation_ids:
+        raise ReviewWritebackConflictError(
+            "accepted_operation_ids must be a non-empty array",
+            code="operation_ids_conflict",
+        )
+    if (any(not isinstance(item, str) or not item for item in accepted_operation_ids)
+            or len(set(accepted_operation_ids)) != len(accepted_operation_ids)):
+        raise ReviewWritebackConflictError(
+            "accepted operation ids are invalid or duplicated",
+            code="operation_ids_conflict",
+        )
+    operations = run.get("operations") or []
+    operation_ids = [operation.get("id") for operation in operations if isinstance(operation, dict)]
+    if len(operation_ids) != len(set(operation_ids)):
+        raise ReviewWritebackConflictError(
+            "review run operation ids are ambiguous",
+            code="operation_ids_conflict",
+        )
+    requested = set(accepted_operation_ids)
+    if not requested.issubset(set(operation_ids)):
+        raise ReviewWritebackConflictError(
+            "review run operations changed since preview",
+            code="operation_ids_conflict",
+            operation_ids=operation_ids,
+        )
+    selected = [operation for operation in operations if operation.get("id") in requested]
+    blocked = [operation for operation in selected if operation.get("action") == "blocked"]
+    if blocked:
+        raise ReviewWritebackConflictError(
+            "blocked operations cannot be accepted",
+            code="blocked_operation",
+            blocked_operation_ids=[operation.get("id") for operation in blocked],
+        )
+    return selected
+
+
+def _operation_source_key(session, operation, target):
+    if target and target.get("source_key"):
+        return str(target["source_key"])
+    return f"{session['id']}:{operation.get('finding_id') or operation.get('id')}"
+
+
+def _operation_signature(operation, source_key):
+    proposed = operation.get("proposed_comment")
+    if isinstance(proposed, dict) and operation.get("action") in {"create", "update"}:
+        # Keep the legacy finding signature so source_key + applied_signature
+        # remains a valid dedupe pair across the v1.0/v1.1 boundary.
+        return _comment_signature(proposed)
+    canonical = json.dumps({
+        "action": operation.get("action"),
+        "finding_id": operation.get("finding_id"),
+        "source_key": source_key,
+        "target_comment_id": operation.get("target_comment_id"),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _same_applied_operation(comment, *, run_id, operation_id, source_key, signature):
+    marker_match = (
+        comment.get("review_run_id") == run_id
+        and comment.get("applied_operation_id") == operation_id
+    )
+    legacy_match = (
+        comment.get("source_key") == source_key
+        and comment.get("applied_signature") == signature
+    )
+    return marker_match or legacy_match
+
+
+def _build_operation_application(session, run, selected_operations, comments, preplanned=None,
+                                 mutation_at=""):
+    working = json.loads(json.dumps(comments, ensure_ascii=False))
+    by_id = {comment.get("id"): comment for comment in working if comment.get("id")}
+    by_source = {comment.get("source_key"): comment for comment in working if comment.get("source_key")}
+    preplanned_by_id = {
+        item.get("operation_id"): item for item in (preplanned or []) if isinstance(item, dict)
+    }
+    results = {"created": [], "updated": [], "withdrawn": [], "kept": [], "skipped": []}
+    plans = []
+    now = mutation_at or _now()
+
+    for operation in selected_operations:
+        operation_id = operation["id"]
+        action = operation.get("action")
+        target = by_id.get(operation.get("target_comment_id"))
+        source_key = _operation_source_key(session, operation, target)
+        signature = _operation_signature(operation, source_key)
+        planned = preplanned_by_id.get(operation_id) or {}
+        result = {
+            "operation_id": operation_id,
+            "finding_id": operation.get("finding_id") or "",
+        }
+        plan = {
+            **result,
+            "action": action,
+            "source_key": source_key,
+            "applied_signature": signature,
+            "comment_id": (target or {}).get("id") or planned.get("comment_id") or "",
+            "mutates": False,
+            "event_action": "",
+            "from_version": 0,
+            "to_version": 0,
+            "content_before_hash": _comment_content_hash(""),
+            "content_after_hash": _comment_content_hash(""),
+            "expected_finding_state": "",
+        }
+
+        if action == "create":
+            proposed = operation.get("proposed_comment") or {}
+            content = _comment_content(proposed)
+            existing = by_source.get(source_key)
+            if existing:
+                if not _same_applied_operation(
+                        existing, run_id=run["id"], operation_id=operation_id,
+                        source_key=source_key, signature=signature):
+                    raise ReviewWritebackConflictError(
+                        "operation source_key now maps to different content",
+                        code="operation_ids_conflict", operation_id=operation_id,
+                    )
+                result["comment_id"] = existing.get("id")
+                result["reason"] = "already applied by source_key and signature"
+                results["skipped"].append(result)
+                plan["comment_id"] = existing.get("id") or ""
+                plans.append(plan)
+                continue
+            comment_id = plan["comment_id"] or _new_id("c-", 10)
+            comment = _comment_record({
+                "id": comment_id,
+                "kind": "anchored",
+                "author": session.get("tool") or "AI Reviewer",
+                "content": content,
+                "quote_text": proposed.get("quote_text"),
+                "section": proposed.get("section") or "",
+                "source_locator": proposed.get("source_locator") or {},
+                "anchor_state": proposed.get("anchor_state") or "ready",
+                "priority": proposed.get("priority") or "P2",
+                "source": "ai-review",
+                "finding_state": "accepted",
+                "source_key": source_key,
+                "finding_id": operation.get("finding_id") or proposed.get("id"),
+                "review_session_id": session["id"],
+                "review_run_id": run["id"],
+                "applied_operation_id": operation_id,
+                "applied_signature": signature,
+                "origin_signature": _comment_content_hash(content),
+                "created_at": now,
+                "updated_at": now,
+            })
+            working.append(comment)
+            by_id[comment_id] = comment
+            by_source[source_key] = comment
+            result["comment_id"] = comment_id
+            results["created"].append(result)
+            plan.update({
+                "comment_id": comment_id, "mutates": True, "event_action": "create",
+                "from_version": 0, "to_version": comment["comment_version"],
+                "content_after_hash": _comment_content_hash(content),
+                "expected_finding_state": "accepted",
+            })
+
+        elif action == "update":
+            if not target:
+                raise ReviewWritebackConflictError(
+                    "operation target no longer exists",
+                    code="operation_ids_conflict", operation_id=operation_id,
+                )
+            proposed = operation.get("proposed_comment") or {}
+            content = _comment_content(proposed)
+            if _same_applied_operation(
+                    target, run_id=run["id"], operation_id=operation_id,
+                    source_key=source_key, signature=signature):
+                result["comment_id"] = target["id"]
+                result["reason"] = "already applied by operation id"
+                results["skipped"].append(result)
+                plans.append(plan)
+                continue
+            before = target.get("content") or ""
+            from_version = int(target.get("comment_version") or 1)
+            target.update({
+                "content": content,
+                "quote_text": proposed.get("quote_text") or target.get("quote_text") or "",
+                "section": proposed.get("section") or target.get("section") or "",
+                "source_locator": proposed.get("source_locator") or target.get("source_locator") or {},
+                "anchor_state": proposed.get("anchor_state") or "ready",
+                "priority": proposed.get("priority") or target.get("priority") or "P2",
+                "source": target.get("source") or "ai-review",
+                "finding_state": "accepted",
+                "source_key": source_key,
+                "finding_id": operation.get("finding_id") or proposed.get("id") or target.get("finding_id") or "",
+                "review_session_id": session["id"],
+                "review_run_id": run["id"],
+                "applied_operation_id": operation_id,
+                "applied_signature": signature,
+                "comment_version": from_version + 1,
+                "updated_at": now,
+            })
+            result["comment_id"] = target["id"]
+            results["updated"].append(result)
+            plan.update({
+                "comment_id": target["id"], "mutates": True, "event_action": "edit",
+                "from_version": from_version, "to_version": target["comment_version"],
+                "content_before_hash": _comment_content_hash(before),
+                "content_after_hash": _comment_content_hash(content),
+                "expected_finding_state": "accepted",
+            })
+
+        elif action == "withdraw":
+            if not target:
+                raise ReviewWritebackConflictError(
+                    "operation target no longer exists",
+                    code="operation_ids_conflict", operation_id=operation_id,
+                )
+            if (_same_applied_operation(
+                    target, run_id=run["id"], operation_id=operation_id,
+                    source_key=source_key, signature=signature)
+                    and target.get("finding_state") == "withdrawn"):
+                result["comment_id"] = target["id"]
+                result["reason"] = "already withdrawn by operation id"
+                results["skipped"].append(result)
+                plans.append(plan)
+                continue
+            before = target.get("content") or ""
+            from_version = int(target.get("comment_version") or 1)
+            target.update({
+                "finding_state": "withdrawn",
+                "source_key": source_key,
+                "review_run_id": run["id"],
+                "applied_operation_id": operation_id,
+                "applied_signature": signature,
+                "comment_version": from_version + 1,
+                "updated_at": now,
+            })
+            result["comment_id"] = target["id"]
+            results["withdrawn"].append(result)
+            plan.update({
+                "comment_id": target["id"], "mutates": True,
+                "event_action": "finding-update",
+                "from_version": from_version, "to_version": target["comment_version"],
+                "content_before_hash": _comment_content_hash(before),
+                "content_after_hash": _comment_content_hash(before),
+                "expected_finding_state": "withdrawn",
+            })
+
+        elif action == "keep":
+            result["comment_id"] = (target or {}).get("id") or ""
+            results["kept"].append(result)
+        else:
+            raise ReviewWritebackConflictError(
+                "operation is no longer acceptable",
+                code="operation_ids_conflict", operation_id=operation_id,
+            )
+        plans.append(plan)
+
+    return working, plans, results
+
+
+def _operation_event_exists(doc_path, run_id, operation_id):
+    return any(
+        event.get("review_run_id") == run_id
+        and event.get("operation_id") == operation_id
+        for event in _load_comment_events(doc_path)
+    )
+
+
+def _append_operation_events(doc_path, run_id, plans, actor):
+    for plan in plans:
+        if not plan.get("mutates") or _operation_event_exists(
+                doc_path, run_id, plan.get("operation_id")):
+            continue
+        _append_comment_event(
+            doc_path,
+            comment_id=plan["comment_id"],
+            action=plan["event_action"],
+            actor=actor,
+            from_version=plan["from_version"],
+            to_version=plan["to_version"],
+            content_before_hash=plan["content_before_hash"],
+            content_after_hash=plan["content_after_hash"],
+            operation_id=plan["operation_id"],
+            review_run_id=run_id,
+            applied_signature=plan["applied_signature"],
+        )
+
+
+def _receipt_for_journal_entry(entry, comments_rev_after, *, recovered=False):
+    receipt = {
+        "id": entry["receipt_id"],
+        "run_id": entry["run_id"],
+        "at": entry.get("created_at") or _now(),
+        "document_rev": entry["base_rev"],
+        "comments_rev_before": entry["comments_rev"],
+        "comments_rev_after": comments_rev_after,
+        "accepted_operation_ids": list(entry["accepted_operation_ids"]),
+        **json.loads(json.dumps(entry.get("results") or {}, ensure_ascii=False)),
+        "blocked": list(entry.get("blocked") or []),
+        "not_accepted": list(entry.get("not_accepted") or []),
+    }
+    if recovered:
+        receipt["recovered_from_journal"] = True
+    return receipt
+
+
+def _finalize_operation_writeback(session, run, entry, comments, comments_rev_after,
+                                  *, recovered=False):
+    receipt = _receipt_for_journal_entry(
+        entry, comments_rev_after, recovered=recovered)
+    existing = next((
+        item for item in session.get("writeback_receipts") or []
+        if item.get("id") == receipt["id"]
+    ), None)
+    if not existing:
+        session.setdefault("writeback_receipts", []).append(receipt)
+    else:
+        receipt = existing
+    plan_by_id = {item["operation_id"]: item for item in entry.get("plans") or []}
+    accepted_ids = set(entry["accepted_operation_ids"])
+    for operation in run.get("operations") or []:
+        operation_id = operation.get("id")
+        if operation.get("action") == "blocked":
+            operation["writeback_state"] = "blocked"
+        elif operation_id not in accepted_ids:
+            operation["writeback_state"] = "not_accepted"
+        else:
+            plan = plan_by_id.get(operation_id) or {}
+            operation["writeback_state"] = "applied"
+            operation["applied_comment_id"] = plan.get("comment_id") or ""
+            operation["applied_signature"] = plan.get("applied_signature") or ""
+    run["accepted_operation_ids"] = list(entry["accepted_operation_ids"])
+    run["writeback_receipt_id"] = receipt["id"]
+    run["status"] = "completed"
+    run["updated_at"] = _now()
+    session["status"] = "completed"
+    session["completed_at"] = _now()
+    session["comments_rev"] = comments_rev_after
+    session["comments_snapshot"] = comment_snapshot(comments)
+    session.pop("reconciliation_error", None)
+    _save_session(session)
+    return receipt
+
+
+def _operation_plans_landed(comments, entry):
+    by_id = {comment.get("id"): comment for comment in comments}
+    for plan in entry.get("plans") or []:
+        if not plan.get("mutates"):
+            continue
+        comment = by_id.get(plan.get("comment_id"))
+        if not comment:
+            return False
+        if (comment.get("review_run_id") != entry["run_id"]
+                or comment.get("applied_operation_id") != plan["operation_id"]
+                or comment.get("source_key") != plan["source_key"]
+                or comment.get("applied_signature") != plan["applied_signature"]):
+            return False
+        if plan.get("expected_finding_state") and (
+                comment.get("finding_state") != plan["expected_finding_state"]):
+            return False
+        if plan.get("action") in {"create", "update"} and (
+                _comment_content_hash(comment.get("content")) != plan["content_after_hash"]):
+            return False
+    return True
+
+
+def _existing_operation_receipt(session, run):
+    receipt_id = run.get("writeback_receipt_id")
+    if not receipt_id:
+        return None
+    return next((
+        receipt for receipt in session.get("writeback_receipts") or []
+        if receipt.get("id") == receipt_id
+    ), None)
+
+
+def _reconcile_operation_journal():
+    report = {"pending": 0, "finalized": 0, "resumed": 0, "inconsistent": 0}
+    with _MUTATION_LOCK:
+        journal = _load_operation_journal()
+        entries = list(journal.get("entries") or [])
+        report["pending"] = len(entries)
+        remaining = []
+        for raw_entry in entries:
+            entry = dict(raw_entry)
+            session = None
+            try:
+                session, run = _load_review_run(entry.get("run_id"))
+                existing = _existing_operation_receipt(session, run)
+                if existing:
+                    report["finalized"] += 1
+                    continue
+                doc = _safe_doc_path(session.get("doc_path"))
+                if _rev(_read_doc(doc)) != entry.get("base_rev"):
+                    raise ValueError("document revision differs from pending journal")
+                store = _load_comment_store(doc)
+                comments = store["comments"]
+                if store["comments_rev"] == entry.get("comments_rev"):
+                    selected = _canonical_accepted_operations(
+                        run, entry.get("accepted_operation_ids"))
+                    comments, plans, results = _build_operation_application(
+                        session, run, selected, comments,
+                        preplanned=entry.get("plans") or [],
+                        mutation_at=entry.get("mutation_at") or entry.get("created_at") or "",
+                    )
+                    if plans != (entry.get("plans") or []) or results != (entry.get("results") or {}):
+                        raise ValueError("pending operation plan no longer matches run")
+                    comments_rev_after = _save_comments(doc, comments)
+                    if comments_rev_after != entry.get("planned_comments_rev"):
+                        raise ValueError("resumed comments revision differs from journal plan")
+                    _append_operation_events(
+                        doc, run["id"], plans, session.get("tool") or "AI Reviewer")
+                    report["resumed"] += 1
+                elif _operation_plans_landed(comments, entry):
+                    comments_rev_after = store["comments_rev"]
+                    _append_operation_events(
+                        doc, run["id"], entry.get("plans") or [],
+                        session.get("tool") or "AI Reviewer",
+                    )
+                else:
+                    raise ValueError("pending comment mutations are inconsistent")
+                _finalize_operation_writeback(
+                    session, run, entry, comments, comments_rev_after, recovered=True)
+                report["finalized"] += 1
+            except Exception as exc:
+                entry["status"] = "inconsistent"
+                entry["reconciliation_error"] = str(exc)[:240]
+                entry["reconciled_at"] = _now()
+                remaining.append(entry)
+                report["inconsistent"] += 1
+                if session:
+                    session["status"] = "needs_rebase"
+                    session["reconciliation_error"] = entry["reconciliation_error"]
+                    _save_session(session)
+        journal["entries"] = remaining
+        _save_operation_journal(journal)
+    return report
+
+
+def _confirm_review_run_writeback(run_id, payload):
+    with _MUTATION_LOCK:
+        # A previous attempt may have reached comments but not the receipt while
+        # the process remained alive. Reconcile before evaluating a retry.
+        if any(
+            entry.get("run_id") == run_id
+            for entry in _load_operation_journal().get("entries") or []
+        ):
+            _reconcile_operation_journal()
+        session, run = _load_review_run(run_id)
+        selected = _canonical_accepted_operations(
+            run, payload.get("accepted_operation_ids"))
+        accepted_ids = [operation["id"] for operation in selected]
+        existing = _existing_operation_receipt(session, run)
+        if existing:
+            if existing.get("accepted_operation_ids") != accepted_ids:
+                raise ReviewWritebackConflictError(
+                    "accepted operation ids differ from the completed receipt",
+                    code="operation_ids_conflict",
+                )
+            return {
+                "session": session, "run": run,
+                "writeback": existing, "idempotent": True,
+            }
+        if run.get("status") != "preview":
+            raise ReviewWritebackConflictError(
+                "review run is not awaiting confirmation",
+                code="run_state_conflict", status=run.get("status"),
+            )
+        base_rev = payload.get("base_rev")
+        comments_rev = payload.get("comments_rev")
+        run_input = run.get("input") or {}
+        if base_rev != run_input.get("document_rev"):
+            raise ReviewWritebackConflictError(
+                "document revision differs from operation preview",
+                code="document_rev_conflict", rev=run_input.get("document_rev"),
+            )
+        if comments_rev != run_input.get("comments_rev"):
+            raise ReviewWritebackConflictError(
+                "comments revision differs from operation preview",
+                code="comments_rev_conflict", comments_rev=run_input.get("comments_rev"),
+            )
+        doc = _safe_doc_path(session.get("doc_path"))
+        current_rev = _rev(_read_doc(doc))
+        store = _load_comment_store(doc)
+        if current_rev != base_rev:
+            raise ReviewWritebackConflictError(
+                "document changed after operation preview; no comments were written",
+                code="document_rev_conflict", rev=current_rev,
+            )
+        if store["comments_rev"] != comments_rev:
+            raise ReviewWritebackConflictError(
+                "comments changed after operation preview; no comments were written",
+                code="comments_rev_conflict", comments_rev=store["comments_rev"],
+            )
+
+        mutation_at = _now()
+        comments, plans, results = _build_operation_application(
+            session, run, selected, store["comments"], mutation_at=mutation_at)
+        accepted_set = set(accepted_ids)
+        blocked = [
+            {"operation_id": operation.get("id"), "reason": operation.get("reason") or "blocked"}
+            for operation in run.get("operations") or []
+            if operation.get("action") == "blocked"
+        ]
+        not_accepted = [
+            operation.get("id") for operation in run.get("operations") or []
+            if operation.get("action") != "blocked" and operation.get("id") not in accepted_set
+        ]
+        entry = {
+            "schema_version": "comma-operation-journal-entry/v1",
+            "run_id": run["id"],
+            "session_id": session["id"],
+            "doc_path": session["doc_path"],
+            "accepted_operation_ids": accepted_ids,
+            "base_rev": base_rev,
+            "comments_rev": comments_rev,
+            "planned_comments_rev": _comments_rev(comments),
+            "receipt_id": _new_id("write-", 10),
+            "plans": plans,
+            "results": results,
+            "blocked": blocked,
+            "not_accepted": not_accepted,
+            "status": "pending",
+            "created_at": mutation_at,
+            "mutation_at": mutation_at,
+        }
+        _replace_operation_journal_entry(entry)
+        comments_rev_after = _save_comments(doc, comments)
+        if comments_rev_after != entry["planned_comments_rev"]:
+            raise ValueError("comments revision differs from persisted operation plan")
+        _append_operation_events(
+            doc, run["id"], plans, session.get("tool") or "AI Reviewer")
+        receipt = _finalize_operation_writeback(
+            session, run, entry, comments, comments_rev_after)
+        _clear_operation_journal_entry(run["id"])
+        _append_event(
+            session.get("tool") or "AI Reviewer", "review-run-writeback", doc,
+            f"{run['id']}: accepted={len(accepted_ids)} receipt={receipt['id']}",
+        )
+        return {
+            "session": session, "run": run,
+            "writeback": receipt, "idempotent": False,
+        }
+
+
 def _apply_finding_ops(session, ops):
     findings = session.get("findings") or []
     by_id = {f.get("id"): f for f in findings}
@@ -2511,6 +3119,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._start_review(payload)
             if route == "/api/review-runs" and method == "POST":
                 return self._start_review_run(payload)
+            match = re.match(r"^/api/review-runs/(run-[a-f0-9]{12})/writeback$", route)
+            if match and method == "POST":
+                result = _confirm_review_run_writeback(match.group(1), payload)
+                return self._send_json({"ok": True, **result})
             if route == "/api/conversations" and method == "POST":
                 return self._start_conversation(payload)
             match = re.match(r"^/api/versions/(version-[a-f0-9]{16})/restore$", route)
@@ -2546,6 +3158,14 @@ class Handler(BaseHTTPRequestHandler):
                 "message": str(e),
                 "current_comment": e.current_comment,
                 "comments_rev": e.comments_rev,
+            }, 409)
+        except ReviewWritebackConflictError as e:
+            return self._send_json({
+                "ok": False,
+                "conflict": True,
+                "code": e.details.get("code") or "review_writeback_conflict",
+                "message": str(e),
+                **{key: value for key, value in e.details.items() if key != "code"},
             }, 409)
         except CliUnavailableError as e:
             return self._send_json({"ok": False, "error": str(e), "code": "cli_unavailable"}, 503)
@@ -3530,11 +4150,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DATA_ROOT, exist_ok=True)
+    reconciliation = _reconcile_operation_journal()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     detected = {item["id"]: item for item in runtime_capability_manifest()["tools"]}
     print(f"[comma-review] serving http://{HOST}:{PORT}  "
           f"(claude={'ready' if detected['claude']['ready'] else detected['claude']['auth_state']} "
-          f"codex={'ready' if detected['codex']['ready'] else detected['codex']['auth_state']})")
+          f"codex={'ready' if detected['codex']['ready'] else detected['codex']['auth_state']})  "
+          f"journal={reconciliation['pending']}/{reconciliation['finalized']}/"
+          f"{reconciliation['inconsistent']}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

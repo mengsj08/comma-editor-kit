@@ -10,7 +10,10 @@ registerCommaEditor();
 const DOC_PATH = new URLSearchParams(location.search).get('doc') || 'paper.md';
 const $ = (id) => document.getElementById(id);
 const editor = $('comma-editor');
-const reviewState = { active: null, activeRun: null, sessions: [], running: false, preflight: null };
+const reviewState = {
+  active: null, activeRun: null, sessions: [], running: false, preflight: null,
+  acceptedOperationIds: new Set(),
+};
 const archiveState = { versions: [], drafts: [], currentRev: '', exportCapabilities: null, loading: false };
 const conversationState = {
   active: null, sessions: [], sourceQuote: null, running: false,
@@ -91,7 +94,10 @@ function syncRuntimeControls() {
 
   $('review-start').disabled = reviewState.running || !runtimeToolReady(selectedReviewTool(), 'structured_review');
   $('review-send').disabled = reviewState.running || Boolean(reviewState.active && !runtimeToolReady(reviewState.active.tool, 'structured_review'));
-  $('review-writeback').disabled = reviewState.running;
+  const runAwaitingWriteback = reviewState.activeRun?.status === 'preview';
+  $('review-writeback').disabled = reviewState.running
+    || (Boolean(reviewState.activeRun) && (!runAwaitingWriteback || reviewState.acceptedOperationIds.size === 0));
+  $('review-accept-all').disabled = reviewState.running || !runAwaitingWriteback;
   const conversationTool = conversationState.active?.tool || selectedConversationTool();
   const noteOnly = conversationState.composerMode === 'note';
   $('conversation-send').disabled = conversationState.running || (!noteOnly && !runtimeToolReady(conversationTool, 'conversation'));
@@ -344,8 +350,13 @@ function closeReviewDrawer() {
 }
 
 function activateReviewSession(rawSession, rawRun = null) {
+  const previousRunId = reviewState.activeRun?.id || '';
+  const nextRun = rawRun || rawSession?.run || null;
   reviewState.active = rawSession ? normalizeReviewSession(rawSession) : null;
-  reviewState.activeRun = rawRun || rawSession?.run || null;
+  reviewState.activeRun = nextRun;
+  if (!nextRun || nextRun.id !== previousRunId || nextRun.status === 'completed') {
+    reviewState.acceptedOperationIds = new Set(nextRun?.accepted_operation_ids || []);
+  }
 }
 
 function openReviewPreflight() {
@@ -680,7 +691,10 @@ function renderReviewSession() {
   const run = reviewState.activeRun;
   $('review-empty').hidden = Boolean(session);
   $('review-session').hidden = !session;
-  if (!session) return;
+  if (!session) {
+    updateOperationSelectionControls();
+    return;
+  }
   const findings = session.findings || [];
   const accepted = findings.filter((finding) => finding.decision === 'accepted').length;
   const ready = findings.filter((finding) => finding.anchorState === 'ready').length;
@@ -703,14 +717,134 @@ function renderReviewSession() {
     blocked ? `<span class="review-stat">${blocked} 条待定位</span>` : '',
     run ? `<span class="review-stat">操作：新增 ${operationCounts.create || 0} · 修改 ${operationCounts.update || 0} · 撤回 ${operationCounts.withdraw || 0} · 不变 ${operationCounts.keep || 0} · 阻断 ${operationCounts.blocked || 0}</span>` : '',
   ].join('');
-  $('review-writeback').hidden = Boolean(run);
-  renderFindings(findings);
+  $('review-ledger-eyebrow').textContent = run ? 'OPERATION PREVIEW' : 'FINDINGS LEDGER';
+  $('review-ledger-title').textContent = run ? '操作预览' : '评审清单';
+  if (run) renderOperationPreview(run);
+  else renderFindings(findings);
+  updateOperationSelectionControls();
   renderReviewMessages(session.messages || []);
+}
+
+const OPERATION_GROUPS = [
+  { action: 'create', label: '新增', code: 'CREATE' },
+  { action: 'update', label: '修改', code: 'UPDATE' },
+  { action: 'withdraw', label: '撤回', code: 'WITHDRAW' },
+  { action: 'keep', label: '不变', code: 'KEEP' },
+  { action: 'blocked', label: '阻断', code: 'BLOCKED' },
+];
+
+function operationField(operation, camel, snake) {
+  return operation?.[camel] ?? operation?.[snake] ?? '';
+}
+
+function updateOperationSelectionControls() {
+  const run = reviewState.activeRun;
+  const selection = $('review-operation-selection');
+  const confirm = $('review-writeback');
+  const acceptAll = $('review-accept-all');
+  if (!run) {
+    selection.hidden = true;
+    acceptAll.hidden = true;
+    confirm.hidden = false;
+    confirm.textContent = '同步已接受批注';
+    syncRuntimeControls();
+    return;
+  }
+  const operations = run.operations || [];
+  const humanPending = operations.filter((operation) => (
+    operation.action === 'update'
+    && Boolean(operationField(operation, 'humanEditedTarget', 'human_edited_target'))
+    && !reviewState.acceptedOperationIds.has(operation.id)
+  )).length;
+  selection.hidden = false;
+  if (run.status === 'completed') {
+    selection.textContent = `写回已完成 · receipt ${run.writeback_receipt_id || '已记录'} · ${reviewState.acceptedOperationIds.size} 项操作`;
+  } else {
+    selection.textContent = `已选择 ${reviewState.acceptedOperationIds.size} 项。${humanPending ? `${humanPending} 条人工编辑目标未纳入批量接受，必须逐条显式勾选。` : '提交时再次校验 document rev、comments_rev 与 operation ids。'}`;
+  }
+  acceptAll.hidden = run.status !== 'preview';
+  confirm.hidden = run.status !== 'preview';
+  confirm.textContent = '确认写回已选操作';
+  syncRuntimeControls();
+}
+
+function renderOperationPreview(run) {
+  const root = $('review-findings');
+  root.textContent = '';
+  root.className = 'review-findings operation-preview';
+  const operations = run.operations || [];
+  OPERATION_GROUPS.forEach((group) => {
+    const section = document.createElement('section');
+    section.className = `operation-group operation-group-${group.action}`;
+    section.dataset.operationGroup = group.action;
+    const grouped = operations.filter((operation) => operation.action === group.action);
+    section.innerHTML = `<header><span>${group.code}</span><h4>${group.label}</h4><b>${grouped.length}</b></header><div class="operation-group-list"></div>`;
+    const list = section.querySelector('.operation-group-list');
+    if (!grouped.length) {
+      list.innerHTML = '<div class="history-empty">本组无操作。</div>';
+    }
+    grouped.forEach((operation) => {
+      const proposed = operation.proposed_comment || operation.proposedComment || {};
+      const humanEdited = group.action === 'update'
+        && Boolean(operationField(operation, 'humanEditedTarget', 'human_edited_target'));
+      const blocked = group.action === 'blocked';
+      const checked = reviewState.acceptedOperationIds.has(operation.id);
+      const card = document.createElement('article');
+      card.className = `operation-card${humanEdited ? ' human-edited' : ''}`;
+      card.dataset.operationId = operation.id;
+      card.dataset.operationAction = group.action;
+      if (humanEdited) card.dataset.humanEdited = 'true';
+      const targetId = operationField(operation, 'targetCommentId', 'target_comment_id');
+      const findingId = operationField(operation, 'findingId', 'finding_id');
+      const quote = proposed.quote_text || proposed.quoteText || '';
+      const issue = proposed.issue || '';
+      const action = proposed.action || '';
+      const reason = operation.reason || (blocked ? '未提供阻断原因' : '');
+      card.innerHTML = `<div class="operation-card-head">
+          <span class="operation-id">${esc(operation.id)}</span>
+          <span class="operation-finding">${esc(findingId || '无 finding id')}</span>
+          ${targetId ? `<span class="operation-target">target ${esc(targetId)}</span>` : ''}
+        </div>
+        <div class="operation-copy">
+          ${quote ? `<p class="operation-quote">「${esc(quote.slice(0, 260))}」</p>` : ''}
+          ${issue ? `<p><span class="finding-label">问题</span>${esc(issue)}</p>` : ''}
+          ${action ? `<p><span class="finding-label">建议</span>${esc(action)}</p>` : ''}
+          ${reason ? `<p class="operation-reason"><span class="finding-label">原因</span>${esc(reason)}</p>` : ''}
+        </div>
+        ${humanEdited ? '<p class="human-edit-warning">该目标批注含人工编辑。批量接受不会选中此项；只有本项复选框的显式确认才允许覆盖。</p>' : ''}
+        <label class="operation-accept${blocked ? ' blocked' : ''}">
+          <input type="checkbox" data-operation-accept="${esc(operation.id)}" ${checked ? 'checked' : ''} ${blocked || run.status !== 'preview' ? 'disabled' : ''}>
+          <span>${blocked ? '保持阻断 · 不可接受' : humanEdited ? '显式接受这次覆盖' : '接受此项'}</span>
+        </label>`;
+      const checkbox = card.querySelector('[data-operation-accept]');
+      if (!blocked && run.status === 'preview') {
+        checkbox.onchange = () => {
+          if (checkbox.checked) reviewState.acceptedOperationIds.add(operation.id);
+          else reviewState.acceptedOperationIds.delete(operation.id);
+          updateOperationSelectionControls();
+        };
+      }
+      list.appendChild(card);
+    });
+    root.appendChild(section);
+  });
+}
+
+function acceptAllNonBlockedOperations() {
+  const operations = reviewState.activeRun?.operations || [];
+  reviewState.acceptedOperationIds = new Set(operations.filter((operation) => (
+    operation.action !== 'blocked'
+    && !(operation.action === 'update'
+      && Boolean(operationField(operation, 'humanEditedTarget', 'human_edited_target')))
+  )).map((operation) => operation.id));
+  renderOperationPreview(reviewState.activeRun);
+  updateOperationSelectionControls();
 }
 
 function renderFindings(findings) {
   const root = $('review-findings');
   root.textContent = '';
+  root.className = 'review-findings';
   if (!findings.length) {
     root.innerHTML = '<div class="history-empty">这一轮没有生成可锚定的 findings。</div>';
     return;
@@ -839,7 +973,34 @@ async function continueReview() {
 async function syncReview() {
   const session = reviewState.active;
   if (!session || reviewState.running) return;
-  if (reviewState.activeRun) return toast('ReviewRun 写回确认属于 Slice C；当前操作保持 preview。', true);
+  const run = reviewState.activeRun;
+  if (run) {
+    const acceptedOperationIds = (run.operations || [])
+      .filter((operation) => reviewState.acceptedOperationIds.has(operation.id))
+      .map((operation) => operation.id);
+    if (!acceptedOperationIds.length) return toast('请先选择至少一项非阻断操作。', true);
+    setReviewRunning(true, '正在同一 mutation lock 内校验 document rev、comments_rev 与 operation ids…');
+    const { response, json } = await apiJson(`/api/review-runs/${encodeURIComponent(run.id)}/writeback`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_rev: run.input?.document_rev,
+        comments_rev: run.input?.comments_rev,
+        accepted_operation_ids: acceptedOperationIds,
+      }),
+    });
+    if (!response.ok || !json.ok) {
+      setReviewRunning(false, json.message || json.error || '操作写回失败；未写入任何部分结果。', true);
+      renderReviewSession();
+      return;
+    }
+    activateReviewSession(json.session, json.run);
+    const receipt = json.writeback || {};
+    setReviewRunning(false, `写回完成：新增 ${(receipt.created || []).length}，修改 ${(receipt.updated || []).length}，撤回 ${(receipt.withdrawn || []).length}，不变 ${(receipt.kept || []).length}。`);
+    renderReviewSession();
+    await refreshEditorComments();
+    await loadReviewSessions(false);
+    return;
+  }
   setReviewRunning(true, '正在校验文档版本和锚点，并执行幂等批注写回…');
   const { json } = await apiJson(`/api/review-sessions/${encodeURIComponent(session.id)}/writeback`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
@@ -873,6 +1034,7 @@ async function decideFinding(findingId, decision) {
 function resetReviewComposer() {
   reviewState.active = null;
   reviewState.activeRun = null;
+  reviewState.acceptedOperationIds = new Set();
   $('review-instruction').value = '';
   setReviewRunning(false, '当前视图已清空；点击“重新预检”后再选择评审范围。');
   renderReviewSession();
@@ -1219,6 +1381,7 @@ $('review-preflight-primary').onclick = () => {
   return runReview(mode);
 };
 $('review-new').onclick = resetReviewComposer;
+$('review-accept-all').onclick = acceptAllNonBlockedOperations;
 $('review-writeback').onclick = syncReview;
 $('review-send').onclick = continueReview;
 $('review-message').addEventListener('keydown', (event) => {
@@ -1274,7 +1437,8 @@ document.querySelectorAll('input[name="review-tool"], input[name="conversation-t
 
 window.__COMMA_REVIEW__ = {
   editor, adapter, reviewState, startReview, runReview, continueReview, syncReview,
-  loadReviewSession, loadReviewSessions, conversationState, loadConversationSession,
+  openReviewDrawer, closeReviewDrawer, loadReviewSession, loadReviewSessions,
+  conversationState, loadConversationSession,
   loadConversationSessions, openConversationForQuote, sendConversationMessage,
   loadRuntimeCapabilities, runtimeToolReady, archiveState, loadVersions,
   openArchive, closeArchive, createCheckpoint, restoreVersion, restoreDraft,
