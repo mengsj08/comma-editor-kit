@@ -25,6 +25,8 @@
           <footer><button id="cli-redetect" type="button">重新检测</button></footer>
         </aside>
       </div>
+      <button id="btn-versions" type="button" title="查看自动快照、命名版本和冲突草稿">版本 <span id="version-count">0</span></button>
+      <button id="btn-export" type="button" title="导出正文、评审包、DOCX 或 PDF">导出</button>
       <button id="btn-conversations" type="button" title="查看已建立的选区讨论">讨论记录 <span id="conversation-count">0</span></button>
       <button id="btn-review-history" type="button">评审记录</button>
     </div>
@@ -94,6 +96,49 @@
     </section>
   </aside>
   <div id="review-scrim" class="review-scrim" hidden></div>
+
+  <aside id="archive-drawer" class="archive-drawer" aria-hidden="true" aria-label="版本与导出中心">
+    <header class="archive-head">
+      <div><div class="eyebrow">DOCUMENT ARCHIVE</div><h2>版本与导出</h2></div>
+      <button id="archive-close" class="icon-button" type="button" aria-label="关闭版本与导出中心">×</button>
+    </header>
+    <nav class="archive-tabs" aria-label="版本与导出">
+      <button id="archive-tab-versions" class="active" type="button" data-archive-tab="versions">版本历史</button>
+      <button id="archive-tab-exports" type="button" data-archive-tab="exports">导出中心</button>
+    </nav>
+    <section id="archive-versions" class="archive-pane">
+      <div class="archive-current">
+        <div><span>CURRENT REVISION</span><strong id="archive-current-rev">—</strong></div>
+        <small>正文每次成功保存都会生成快照；恢复会新增一条记录，不删除后续历史。</small>
+      </div>
+      <div id="draft-section" class="draft-section" hidden>
+        <div class="archive-section-title"><span>RECOVERY DRAFTS</span><strong>待处理冲突草稿</strong></div>
+        <div id="draft-list" class="draft-list"></div>
+      </div>
+      <div class="checkpoint-box">
+        <label for="checkpoint-label"><span>NAMED CHECKPOINT</span>给当前版本一个容易识别的名字</label>
+        <div><input id="checkpoint-label" type="text" maxlength="120" placeholder="例如：完成引文核查"><button id="checkpoint-create" type="button">保存命名版本</button></div>
+      </div>
+      <div class="archive-section-title"><span>VERSION TIMELINE</span><strong>版本时间线</strong></div>
+      <div id="version-list" class="version-list"><p class="archive-loading">正在读取版本…</p></div>
+      <section id="version-diff" class="version-diff" hidden>
+        <header><div><span>UNIFIED DIFF</span><strong id="diff-title">与当前版本比较</strong></div><button id="diff-close" type="button">×</button></header>
+        <pre id="diff-output"></pre>
+      </section>
+    </section>
+    <section id="archive-exports" class="archive-pane" hidden>
+      <div class="export-intro"><span>PORTABLE OUTPUTS</span><h3>把正文与评审痕迹带出去</h3><p>所有导出都从当前已保存版本生成，不改动原始 Markdown。</p></div>
+      <div id="export-list" class="export-list">
+        <button type="button" data-export-format="markdown"><span>MD</span><strong>当前 Markdown</strong><small>原样导出当前正文</small><b>下载</b></button>
+        <button type="button" data-export-format="reviewed-markdown"><span>MD+</span><strong>带批注 Markdown</strong><small>正文后附结构化 review comments</small><b>下载</b></button>
+        <button type="button" data-export-format="package"><span>ZIP</span><strong>Review Package</strong><small>正文、图片、批注、讨论与版本快照</small><b>下载</b></button>
+        <button type="button" data-export-format="docx"><span>DOCX</span><strong>Word 文档</strong><small data-export-detail="docx">正在检测转换器…</small><b>下载</b></button>
+        <button type="button" data-export-format="pdf"><span>PDF</span><strong>科研白底 PDF</strong><small data-export-detail="pdf">正在检测转换器…</small><b>下载</b></button>
+      </div>
+      <p class="export-note">DOCX/PDF 会尽量保留标题、表格、图片、引用和代码块；复杂数学公式与高度定制的 HTML 仍以 Markdown 原文为准。</p>
+    </section>
+  </aside>
+  <div id="archive-scrim" class="archive-scrim" hidden></div>
 
   <aside id="conversation-dock" class="conversation-dock" hidden aria-label="选区讨论工作台">
     <header class="conversation-head">

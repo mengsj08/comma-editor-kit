@@ -11,6 +11,7 @@ const DOC_PATH = new URLSearchParams(location.search).get('doc') || 'paper.md';
 const $ = (id) => document.getElementById(id);
 const editor = $('comma-editor');
 const reviewState = { active: null, sessions: [], running: false };
+const archiveState = { versions: [], drafts: [], currentRev: '', exportCapabilities: null, loading: false };
 const conversationState = {
   active: null, sessions: [], sourceQuote: null, running: false,
   composerMode: 'root', parentMessageId: '', writebackMessageId: '', quickSource: null,
@@ -169,8 +170,16 @@ function syncDocumentMeta(documentState) {
 }
 
 editor.addEventListener('comma-ready', (event) => syncDocumentMeta(event.detail.document));
-editor.addEventListener('comma-save', (event) => syncDocumentMeta(event.detail.document));
-editor.addEventListener('comma-conflict', () => toast('磁盘版本已变化，公共编辑器已重新载入最新内容。', true));
+editor.addEventListener('comma-save', (event) => {
+  syncDocumentMeta(event.detail.document);
+  loadVersions();
+});
+editor.addEventListener('comma-conflict', async (event) => {
+  const draft = event.detail?.error?.draft;
+  toast(draft ? '磁盘版本已变化；刚才的修改已保留为冲突草稿。' : '磁盘版本已变化，已重新载入最新内容。', true);
+  openArchive('versions');
+  await loadVersions();
+});
 editor.addEventListener('comma-error', (event) => toast(event.detail?.error?.message || '编辑器操作失败', true));
 editor.addEventListener('comma-ai-request', (event) => {
   if (event.detail?.mode === 'comment-batch') {
@@ -202,6 +211,185 @@ function closeReviewDrawer() {
   $('review-drawer').classList.remove('open');
   $('review-drawer').setAttribute('aria-hidden', 'true');
   $('review-scrim').hidden = true;
+}
+
+const VERSION_KIND = {
+  baseline: '初始版本', auto: '自动保存', checkpoint: '命名版本',
+  restore: '历史恢复', recovery: '草稿恢复', external: '外部变更',
+};
+
+function formatArchiveTime(value) {
+  const text = String(value || '');
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? text.replace('T', ' ') : date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function setArchiveTab(tab) {
+  const selected = tab === 'exports' ? 'exports' : 'versions';
+  $('archive-tab-versions').classList.toggle('active', selected === 'versions');
+  $('archive-tab-exports').classList.toggle('active', selected === 'exports');
+  $('archive-versions').hidden = selected !== 'versions';
+  $('archive-exports').hidden = selected !== 'exports';
+  if (selected === 'exports') loadExportCapabilities();
+}
+
+function openArchive(tab = 'versions') {
+  closeRuntimePopover();
+  setArchiveTab(tab);
+  $('archive-drawer').classList.add('open');
+  $('archive-drawer').setAttribute('aria-hidden', 'false');
+  $('archive-scrim').hidden = false;
+  if (tab === 'versions') loadVersions();
+}
+
+function closeArchive() {
+  $('archive-drawer').classList.remove('open');
+  $('archive-drawer').setAttribute('aria-hidden', 'true');
+  $('archive-scrim').hidden = true;
+}
+
+function renderDrafts() {
+  const root = $('draft-list');
+  $('draft-section').hidden = archiveState.drafts.length === 0;
+  root.innerHTML = archiveState.drafts.map((draft) => `
+    <article class="draft-card" data-draft-id="${esc(draft.id)}">
+      <header><strong>${esc(draft.id)}</strong><time>${esc(formatArchiveTime(draft.created_at))}</time></header>
+      <p>编辑冲突时保留 · ${Number(draft.line_count || 0)} 行 · ${Number(draft.char_count || 0)} 字符</p>
+      <div class="draft-actions">
+        <button type="button" data-draft-action="diff">与当前版本比较</button>
+        <button class="primary" type="button" data-draft-action="restore">恢复为新版本</button>
+        <button type="button" data-draft-action="dismiss">忽略草稿</button>
+      </div>
+    </article>`).join('');
+}
+
+function renderVersions() {
+  const root = $('version-list');
+  $('archive-current-rev').textContent = archiveState.currentRev || '—';
+  $('version-count').textContent = String(archiveState.versions.length);
+  renderDrafts();
+  if (!archiveState.versions.length) {
+    root.innerHTML = '<p class="archive-loading">还没有版本记录。</p>';
+    return;
+  }
+  root.innerHTML = archiveState.versions.map((version) => {
+    const current = version.rev === archiveState.currentRev && version === archiveState.versions[0];
+    const label = version.label || VERSION_KIND[version.kind] || version.kind || '版本';
+    return `<article class="version-card ${esc(version.kind || '')} ${current ? 'current' : ''}" data-version-id="${esc(version.id)}">
+      <header><h4>${esc(label)}</h4><time>${esc(formatArchiveTime(version.created_at))}</time></header>
+      <div class="version-meta"><span class="version-kind">${esc(VERSION_KIND[version.kind] || version.kind || 'snapshot')}</span><span>rev ${esc(String(version.rev || '').slice(0, 10))}</span><span>${Number(version.line_count || 0)} lines</span><span>${esc(version.actor || '')}</span></div>
+      <div class="version-actions">
+        <button type="button" data-version-action="diff">与当前比较</button>
+        ${current ? '<button type="button" disabled>当前版本</button>' : '<button class="restore" type="button" data-version-action="restore">恢复为新版本</button>'}
+      </div>
+    </article>`;
+  }).join('');
+}
+
+async function loadVersions(showError = false) {
+  if (archiveState.loading) return;
+  archiveState.loading = true;
+  try {
+    const { response, json } = await apiJson(`/api/versions?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
+    if (!response.ok || !json.ok) throw new Error(json.error || '版本读取失败');
+    archiveState.versions = Array.isArray(json.versions) ? json.versions : [];
+    archiveState.drafts = Array.isArray(json.drafts) ? json.drafts : [];
+    archiveState.currentRev = json.current_rev || editor.documentState.rev || '';
+    renderVersions();
+  } catch (error) {
+    if (showError) toast(error.message || '版本读取失败', true);
+    $('version-list').innerHTML = '<p class="archive-loading">版本服务暂不可用。</p>';
+  } finally {
+    archiveState.loading = false;
+  }
+}
+
+async function createCheckpoint() {
+  const label = $('checkpoint-label').value.trim();
+  if (!label) return toast('请先填写命名版本的名称。', true);
+  const { response, json } = await apiJson('/api/versions/checkpoints', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, label, base_rev: editor.documentState.rev, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.message || json.error || '命名版本保存失败', true);
+  $('checkpoint-label').value = '';
+  toast('命名版本已保存。');
+  await loadVersions(true);
+}
+
+async function showVersionDiff(versionId) {
+  const { response, json } = await apiJson(`/api/versions/diff?path=${encodeURIComponent(DOC_PATH)}&from=${encodeURIComponent(versionId)}&to=current`, { cache: 'no-store' });
+  if (!response.ok || !json.ok) return toast(json.error || '版本比较失败', true);
+  $('diff-title').textContent = `${json.changed_lines || 0} 行变化 · 与当前版本比较`;
+  $('diff-output').textContent = json.diff || '两个版本内容相同。';
+  $('version-diff').hidden = false;
+  $('version-diff').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function showDraftDiff(draftId) {
+  const { response, json } = await apiJson(`/api/drafts/${encodeURIComponent(draftId)}/diff?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
+  if (!response.ok || !json.ok) return toast(json.error || '草稿比较失败', true);
+  $('diff-title').textContent = `${json.changed_lines || 0} 行变化 · 冲突草稿与当前版本`;
+  $('diff-output').textContent = json.diff || '草稿与当前版本内容相同。';
+  $('version-diff').hidden = false;
+  $('version-diff').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function restoreVersion(versionId) {
+  if (!window.confirm('恢复会把该快照写成一个新的当前版本，现有历史不会删除。继续吗？')) return;
+  const { response, json } = await apiJson(`/api/versions/${encodeURIComponent(versionId)}/restore`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, base_rev: editor.documentState.rev, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.message || json.error || '版本恢复失败', true);
+  await editor.load();
+  await loadVersions(true);
+  toast('历史快照已恢复为新的当前版本。');
+}
+
+async function restoreDraft(draftId) {
+  if (!window.confirm('将冲突草稿恢复为新的当前版本？当前版本仍会保留在历史中。')) return;
+  const { response, json } = await apiJson(`/api/drafts/${encodeURIComponent(draftId)}/restore`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, base_rev: editor.documentState.rev, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.message || json.error || '草稿恢复失败', true);
+  await editor.load();
+  await loadVersions(true);
+  toast('冲突草稿已恢复为新的当前版本。');
+}
+
+async function dismissDraft(draftId) {
+  const { response, json } = await apiJson(`/api/drafts/${encodeURIComponent(draftId)}/dismiss`, {
+    method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.error || '草稿处理失败', true);
+  await loadVersions(true);
+}
+
+async function loadExportCapabilities() {
+  const { response, json } = await apiJson('/api/exports/capabilities', { cache: 'no-store' });
+  if (!response.ok || !json.ok) return toast(json.error || '导出能力检测失败', true);
+  archiveState.exportCapabilities = json;
+  ['docx', 'pdf'].forEach((format) => {
+    const capability = json.formats?.[format];
+    const button = document.querySelector(`[data-export-format="${format}"]`);
+    const detail = document.querySelector(`[data-export-detail="${format}"]`);
+    button.disabled = !capability?.ready;
+    detail.textContent = capability?.ready ? `${capability.engine} 已就绪` : (capability?.detail || '本机转换器未就绪');
+  });
+}
+
+function downloadExport(format) {
+  const capability = archiveState.exportCapabilities?.formats?.[format];
+  if (capability && capability.ready === false) return toast(capability.detail || '该导出格式未就绪', true);
+  const anchor = document.createElement('a');
+  anchor.href = `/api/export?path=${encodeURIComponent(DOC_PATH)}&format=${encodeURIComponent(format)}&version=current`;
+  anchor.download = '';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 function selectedReviewTool() {
@@ -711,6 +899,37 @@ async function writebackConversationMessage() {
 }
 
 $('btn-review-history').onclick = async () => { openReviewDrawer(); if (!reviewState.active) await loadReviewSessions(true); };
+$('btn-versions').onclick = () => openArchive('versions');
+$('btn-export').onclick = () => openArchive('exports');
+$('archive-close').onclick = closeArchive;
+$('archive-scrim').onclick = closeArchive;
+document.querySelectorAll('[data-archive-tab]').forEach((button) => {
+  button.onclick = () => setArchiveTab(button.dataset.archiveTab);
+});
+$('checkpoint-create').onclick = createCheckpoint;
+$('checkpoint-label').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); createCheckpoint(); }
+});
+$('version-list').onclick = (event) => {
+  const button = event.target.closest('[data-version-action]');
+  if (!button) return;
+  const versionId = button.closest('[data-version-id]')?.dataset.versionId;
+  if (button.dataset.versionAction === 'diff') showVersionDiff(versionId);
+  if (button.dataset.versionAction === 'restore') restoreVersion(versionId);
+};
+$('draft-list').onclick = (event) => {
+  const button = event.target.closest('[data-draft-action]');
+  if (!button) return;
+  const draftId = button.closest('[data-draft-id]')?.dataset.draftId;
+  if (button.dataset.draftAction === 'diff') showDraftDiff(draftId);
+  if (button.dataset.draftAction === 'restore') restoreDraft(draftId);
+  if (button.dataset.draftAction === 'dismiss') dismissDraft(draftId);
+};
+$('diff-close').onclick = () => { $('version-diff').hidden = true; };
+$('export-list').onclick = (event) => {
+  const button = event.target.closest('[data-export-format]');
+  if (button && !button.disabled) downloadExport(button.dataset.exportFormat);
+};
 $('review-close').onclick = closeReviewDrawer;
 $('review-scrim').onclick = closeReviewDrawer;
 $('review-start').onclick = startReview;
@@ -772,10 +991,12 @@ window.__COMMA_REVIEW__ = {
   editor, adapter, reviewState, startReview, continueReview, syncReview,
   loadReviewSession, loadReviewSessions, conversationState, loadConversationSession,
   loadConversationSessions, openConversationForQuote, sendConversationMessage,
-  loadRuntimeCapabilities, runtimeToolReady,
+  loadRuntimeCapabilities, runtimeToolReady, archiveState, loadVersions,
+  openArchive, closeArchive, createCheckpoint, restoreVersion, restoreDraft,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 
 loadRuntimeCapabilities();
+loadVersions();
 loadReviewSessions(false);
 loadConversationSessions(false);

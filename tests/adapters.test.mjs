@@ -105,3 +105,30 @@ test('HTTP adapter resolves local assets without proxying remote images', () => 
   assert.equal(adapter.resolveAsset({ src: 'https://example.org/plot.png' }), 'https://example.org/plot.png');
   assert.equal(adapter.resolveAsset({ src: 'data:image/png;base64,AA==' }), 'data:image/png;base64,AA==');
 });
+
+test('HTTP adapter preserves a stale save as host draft metadata', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ok: false,
+    conflict: true,
+    expected: 'rev-old',
+    rev: 'rev-current',
+    body: '# Current\n',
+    draft: { id: 'draft-0123456789abcdef', status: 'active' },
+  }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+  try {
+    const adapter = new HttpDocumentAdapter({ documentUrl: '/doc', commentsUrl: '/comments' });
+    await assert.rejects(
+      () => adapter.save({ body: '# Local unsaved\n', baseRev: 'rev-old', actor: 'June' }),
+      (error) => {
+        assert.equal(error.code, 'REVISION_CONFLICT');
+        assert.equal(error.body, '# Current\n');
+        assert.equal(error.draft.id, 'draft-0123456789abcdef');
+        assert.equal(error.draftBody, '# Local unsaved\n');
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

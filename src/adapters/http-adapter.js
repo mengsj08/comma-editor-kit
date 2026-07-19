@@ -9,6 +9,7 @@ async function requestJson(url, init = {}) {
       expected: data.expected || '',
       actual: data.rev || data.actual || '',
       body: data.body || '',
+      draft: data.draft || null,
     });
   }
   if (!response.ok || data.ok === false) {
@@ -55,12 +56,17 @@ export class HttpDocumentAdapter {
   }
 
   async save({ body, baseRev, actor }) {
-    const data = await requestJson(this.documentUrl, this._json('PUT', {
-      body,
-      base_rev: baseRev,
-      actor,
-    }));
-    return { title: data.title || data.path || 'document.md', body: data.body ?? body, rev: data.rev || '' };
+    try {
+      const data = await requestJson(this.documentUrl, this._json('PUT', {
+        body,
+        base_rev: baseRev,
+        actor,
+      }));
+      return { title: data.title || data.path || 'document.md', body: data.body ?? body, rev: data.rev || '' };
+    } catch (error) {
+      if (error instanceof RevisionConflictError) error.draftBody = String(body ?? '');
+      throw error;
+    }
   }
 
   async listComments() {

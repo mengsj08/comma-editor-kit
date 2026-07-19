@@ -11,7 +11,7 @@ The editor is **not** an MCP server and **not** a Skill. It exposes a document a
 - `src/core/`: revision, block mapping, comment-anchor, and model contracts.
 - `src/element/`: the `<comma-editor>` Web Component.
 - `src/adapters/`: memory, browser storage, and HTTP host adapters.
-- `apps/review-studio/`: local Python reference host with multi-turn structured AI review, revision-locked comment writeback, and audit receipts.
+- `apps/review-studio/`: local Python reference host with multi-turn structured AI review, revision-locked comment writeback, recoverable document history, and Markdown/ZIP/DOCX/PDF exports.
 - `standalone/`: a real local demo using browser local storage.
 - `chrome-extension/`: Manifest V3 Side Panel wrapper with explicit current-page capture.
 - `release/chrome-extension/`: generated installable unpacked-extension directory after `npm run build:chrome`.
@@ -155,6 +155,11 @@ and adapter-mediated local asset URLs. Hosts retain filesystem and network
 authority; the component never opens a local path directly.
 
 `save` must reject stale `baseRev` values with `RevisionConflictError`. The component never owns filesystem, Chrome, or AI permissions.
+
+The HTTP adapter preserves host-supplied conflict-draft metadata on
+`RevisionConflictError`; Review Studio uses that generic error field to open
+its recovery center. Snapshot storage, diff/restore, and export remain host
+services and are intentionally not added to editor-core.
 
 `apps/review-studio/` now consumes this public component for rendering, source
 and block editing, comments, anchors, and AI comment batches. The host retains

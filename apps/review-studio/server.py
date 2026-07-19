@@ -28,6 +28,11 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
   GET      /api/conversations/<id>
   POST     /api/conversations/<id>/messages|notes|writeback
                                -> quote-scoped discussion, branches and explicit writeback
+  GET/POST /api/versions       -> content-addressed snapshots, checkpoints and diff
+  POST /api/versions/<id>/restore
+                               -> revision-checked, non-destructive history restore
+  GET/POST/DELETE /api/drafts  -> stale-save preservation, diff, recovery and dismissal
+  GET /api/export              -> Markdown, reviewed Markdown, package, DOCX or PDF
 
 Data model:
   <doc>.md                    -> the document (body is the whole file here)
@@ -37,9 +42,14 @@ Data model:
   conversations/<id>.json    -> quote snapshot, message tree and writeback receipts;
                                  document content is not duplicated here
   edits.events.jsonl          -> append-only event ledger (actor+time+summary)
+  .comma-review/versions/     -> content-addressed Markdown snapshot history
+  .comma-review/drafts/       -> recoverable stale-save bodies
 """
 import hashlib
+import html
+import io
 import json
+import difflib
 import mimetypes
 import os
 import re
@@ -51,6 +61,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +95,8 @@ _FORBIDDEN_FLAG_SUBSTR = ("--yolo", "--dangerously", "danger-full-access",
                           "--sandbox=danger", "bypass-approvals")
 _SESSION_ID_RE = re.compile(r"^review-[a-f0-9]{12}$")
 _CONVERSATION_ID_RE = re.compile(r"^conversation-[a-f0-9]{12}$")
+_VERSION_ID_RE = re.compile(r"^version-[a-f0-9]{16}$")
+_DRAFT_ID_RE = re.compile(r"^draft-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
 _PRIORITIES = {"P0", "P1", "P2", "P3"}
 _DECISIONS = {"accepted", "proposed", "rejected"}
@@ -298,6 +311,455 @@ def _atomic_write(path: str, content: str) -> None:
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _atomic_write_bytes(path: str, content: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _atomic_write_json(path: str, payload) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_json_file(path: str, fallback):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return fallback
+
+
+def _read_doc(doc: str) -> str:
+    with open(doc, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _doc_rel(doc: str) -> str:
+    return os.path.relpath(doc, DATA_ROOT).replace(os.sep, "/")
+
+
+def _review_meta_root() -> str:
+    return os.path.join(DATA_ROOT, ".comma-review")
+
+
+def _doc_store_key(doc: str) -> str:
+    return hashlib.sha256(_doc_rel(doc).encode("utf-8")).hexdigest()[:16]
+
+
+def _version_paths(doc: str):
+    root = os.path.join(_review_meta_root(), "versions", _doc_store_key(doc))
+    return root, os.path.join(root, "index.json"), os.path.join(root, "blobs")
+
+
+def _load_version_index(doc: str):
+    _, index_path, _ = _version_paths(doc)
+    data = _read_json_file(index_path, {})
+    if not isinstance(data, dict) or not isinstance(data.get("versions"), list):
+        return {
+            "schema_version": "comma-review-versions/v1",
+            "doc_path": _doc_rel(doc),
+            "versions": [],
+        }
+    return data
+
+
+def _version_entry_summary(entry):
+    return {key: entry.get(key) for key in (
+        "id", "rev", "parent_rev", "kind", "label", "actor", "created_at",
+        "source_version_id", "char_count", "line_count",
+    ) if entry.get(key) not in (None, "")}
+
+
+def _snapshot_version(doc: str, body: str, *, kind: str, actor: str = "system",
+                      label: str = "", parent_rev: str = "",
+                      source_version_id: str = "", force_entry: bool = False):
+    root, index_path, blobs_root = _version_paths(doc)
+    os.makedirs(blobs_root, exist_ok=True)
+    index = _load_version_index(doc)
+    rev = _rev(body)
+    if not force_entry and any(item.get("rev") == rev for item in index["versions"]):
+        return next(item for item in reversed(index["versions"]) if item.get("rev") == rev)
+    blob_path = os.path.join(blobs_root, f"{rev}.md")
+    if not os.path.exists(blob_path):
+        _atomic_write(blob_path, body)
+    entry = {
+        "id": f"version-{uuid.uuid4().hex[:16]}",
+        "rev": rev,
+        "parent_rev": parent_rev,
+        "kind": kind,
+        "label": (label or "")[:120],
+        "actor": (actor or "system")[:80],
+        "created_at": _now(),
+        "source_version_id": source_version_id,
+        "char_count": len(body),
+        "line_count": body.count("\n") + 1,
+    }
+    index["versions"].append(entry)
+    _atomic_write_json(index_path, index)
+    return entry
+
+
+def _ensure_current_snapshot(doc: str):
+    body = _read_doc(doc)
+    index = _load_version_index(doc)
+    current_rev = _rev(body)
+    if not index["versions"]:
+        entry = _snapshot_version(doc, body, kind="baseline", label="初始版本")
+    elif index["versions"][-1].get("rev") != current_rev:
+        entry = _snapshot_version(
+            doc, body, kind="external", label="磁盘外部变更",
+            parent_rev=index["versions"][-1].get("rev", ""), force_entry=True,
+        )
+    else:
+        entry = index["versions"][-1]
+    return body, current_rev, entry
+
+
+def _version_body(doc: str, version_id: str):
+    index = _load_version_index(doc)
+    entry = next((item for item in index["versions"] if item.get("id") == version_id), None)
+    if not entry:
+        raise ValueError("version not found")
+    _, _, blobs_root = _version_paths(doc)
+    blob = os.path.join(blobs_root, f"{entry['rev']}.md")
+    if not os.path.isfile(blob):
+        raise ValueError("version blob missing")
+    return entry, _read_doc(blob)
+
+
+def _drafts_root() -> str:
+    return os.path.join(_review_meta_root(), "drafts")
+
+
+def _draft_path(draft_id: str) -> str:
+    if not _DRAFT_ID_RE.fullmatch(str(draft_id or "")):
+        raise ValueError("invalid draft id")
+    return os.path.join(_drafts_root(), f"{draft_id}.json")
+
+
+def _draft_summary(draft):
+    return {key: draft.get(key) for key in (
+        "id", "doc_path", "expected_rev", "actual_rev", "actor", "created_at",
+        "status", "char_count", "line_count",
+    ) if draft.get(key) not in (None, "")}
+
+
+def _save_conflict_draft(doc: str, body: str, *, expected_rev: str,
+                         actual_rev: str, actor: str):
+    draft = {
+        "schema_version": "comma-review-conflict-draft/v1",
+        "id": f"draft-{uuid.uuid4().hex[:16]}",
+        "doc_path": _doc_rel(doc),
+        "expected_rev": expected_rev,
+        "actual_rev": actual_rev,
+        "body": body,
+        "actor": actor or "unspecified",
+        "created_at": _now(),
+        "status": "active",
+        "char_count": len(body),
+        "line_count": body.count("\n") + 1,
+    }
+    _atomic_write_json(_draft_path(draft["id"]), draft)
+    return draft
+
+
+def _load_draft(draft_id: str):
+    draft = _read_json_file(_draft_path(draft_id), None)
+    if not isinstance(draft, dict):
+        raise ValueError("draft not found")
+    return draft
+
+
+def _drafts_for_doc(doc: str, include_closed: bool = False):
+    root = _drafts_root()
+    if not os.path.isdir(root):
+        return []
+    rows = []
+    for name in os.listdir(root):
+        if not name.endswith(".json"):
+            continue
+        draft = _read_json_file(os.path.join(root, name), None)
+        if not isinstance(draft, dict) or draft.get("doc_path") != _doc_rel(doc):
+            continue
+        if include_closed or draft.get("status") == "active":
+            rows.append(draft)
+    return sorted(rows, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def _safe_download_name(name: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "export")).strip("-.")
+    return clean or "export"
+
+
+def _reviewed_markdown(body: str, comments) -> str:
+    out = [body.rstrip(), "", "---", "", "## Review comments", ""]
+    if not comments:
+        out.append("_No review comments._")
+    for index, item in enumerate(comments, 1):
+        priority = str(item.get("priority") or "").strip()
+        title = f"### {index}. {priority + ' · ' if priority else ''}{item.get('author') or 'Reviewer'}"
+        out.extend([title, ""])
+        quote = str(item.get("quote_text") or "").strip()
+        if quote:
+            out.extend(["\n".join(f"> {line}" for line in quote.splitlines()), ""])
+        out.extend([str(item.get("content") or "").strip(), ""])
+        metadata = [str(item.get("section") or "").strip(), str(item.get("created_at") or "").strip()]
+        metadata = [value for value in metadata if value]
+        if metadata:
+            out.extend([f"_Context: {' · '.join(metadata)}_", ""])
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _collect_doc_assets(doc: str, body: str):
+    found = []
+    for match in re.finditer(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+['\"][^'\"]*['\"])?\)", body):
+        source = match.group(1).strip("<>")
+        try:
+            asset, content_type = _safe_asset_path(_doc_rel(doc), source)
+        except (ValueError, FileNotFoundError):
+            continue
+        if asset not in [item[0] for item in found]:
+            found.append((asset, content_type, source))
+    return found
+
+
+def _matching_json_records(root: str, doc_rel: str):
+    rows = []
+    if not os.path.isdir(root):
+        return rows
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(root, name)
+        data = _read_json_file(path, None)
+        if isinstance(data, dict) and data.get("doc_path") == doc_rel:
+            rows.append((name, data))
+    return rows
+
+
+def _review_package(doc: str, body: str, version_entry=None) -> bytes:
+    doc_rel = _doc_rel(doc)
+    comments = _load_comments(doc)
+    index = _load_version_index(doc)
+    manifest = {
+        "schema_version": "comma-review-package/v1",
+        "created_at": _now(),
+        "document": {"path": doc_rel, "rev": _rev(body), "version_id": (version_entry or {}).get("id", "")},
+        "contents": {
+            "comments": len(comments),
+            "review_sessions": len(_matching_json_records(os.path.join(DATA_ROOT, "review-sessions"), doc_rel)),
+            "conversations": len(_matching_json_records(os.path.join(DATA_ROOT, "conversations"), doc_rel)),
+            "versions": len(index.get("versions", [])),
+        },
+        "privacy": "Raw AI traces and the global event ledger are intentionally excluded.",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        archive.writestr(f"manuscript/{doc_rel}", body)
+        archive.writestr("review/comments.json", json.dumps({"comments": comments}, ensure_ascii=False, indent=2) + "\n")
+        for name, data in _matching_json_records(os.path.join(DATA_ROOT, "review-sessions"), doc_rel):
+            archive.writestr(f"review/review-sessions/{name}", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        for name, data in _matching_json_records(os.path.join(DATA_ROOT, "conversations"), doc_rel):
+            archive.writestr(f"review/conversations/{name}", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        archive.writestr("history/versions.json", json.dumps(index, ensure_ascii=False, indent=2) + "\n")
+        written_revs = set()
+        for entry in index.get("versions", []):
+            rev = entry.get("rev", "")
+            if not rev or rev in written_revs:
+                continue
+            try:
+                _, snapshot = _version_body(doc, entry["id"])
+            except ValueError:
+                continue
+            archive.writestr(f"history/snapshots/{rev}.md", snapshot)
+            written_revs.add(rev)
+        stored_assets = set()
+        for asset, _, _ in _collect_doc_assets(doc, body):
+            rel_name = os.path.relpath(asset, DATA_ROOT).replace(os.sep, "/")
+            if rel_name in stored_assets:
+                continue
+            with open(asset, "rb") as fh:
+                archive.writestr(f"manuscript/{rel_name}", fh.read())
+            stored_assets.add(rel_name)
+    return buffer.getvalue()
+
+
+def _inline_markdown(text: str, doc: str) -> str:
+    escaped = html.escape(text, quote=True)
+
+    def image_repl(match):
+        alt, source = html.unescape(match.group(1)), html.unescape(match.group(2)).strip("<>")
+        try:
+            asset, _ = _safe_asset_path(_doc_rel(doc), source)
+            src = "file://" + urllib.parse.quote(asset)
+        except (ValueError, FileNotFoundError):
+            return f'<span>[external image omitted: {html.escape(alt)}]</span>'
+        return f'<img src="{src}" alt="{html.escape(alt, quote=True)}">'
+
+    escaped = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[^)]*)?\)", image_repl, escaped)
+    escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def _markdown_html(body: str, doc: str) -> str:
+    lines = body.splitlines()
+    parts = []
+    index = 0
+    in_code = False
+    code_lines = []
+    while index < len(lines):
+        line = lines[index]
+        if line.strip().startswith("```"):
+            if in_code:
+                parts.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
+                code_lines = []
+                in_code = False
+            else:
+                in_code = True
+            index += 1
+            continue
+        if in_code:
+            code_lines.append(line)
+            index += 1
+            continue
+        if not line.strip():
+            index += 1
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            level = len(heading.group(1))
+            parts.append(f"<h{level}>{_inline_markdown(heading.group(2), doc)}</h{level}>")
+            index += 1
+            continue
+        if index + 1 < len(lines) and "|" in line and re.match(r"^\s*\|?\s*:?-{3,}", lines[index + 1]):
+            headers = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            index += 2
+            rows = []
+            while index < len(lines) and "|" in lines[index] and lines[index].strip():
+                rows.append([cell.strip() for cell in lines[index].strip().strip("|").split("|")])
+                index += 1
+            table = ["<table><thead><tr>", *(f"<th>{_inline_markdown(cell, doc)}</th>" for cell in headers), "</tr></thead><tbody>"]
+            for row in rows:
+                table.extend(["<tr>", *(f"<td>{_inline_markdown(cell, doc)}</td>" for cell in row), "</tr>"])
+            table.append("</tbody></table>")
+            parts.append("".join(table))
+            continue
+        if re.match(r"^\s*[-*+]\s+", line):
+            items = []
+            while index < len(lines) and re.match(r"^\s*[-*+]\s+", lines[index]):
+                items.append(re.sub(r"^\s*[-*+]\s+", "", lines[index]))
+                index += 1
+            parts.append("<ul>" + "".join(f"<li>{_inline_markdown(item, doc)}</li>" for item in items) + "</ul>")
+            continue
+        if re.match(r"^\s*\d+[.)]\s+", line):
+            items = []
+            while index < len(lines) and re.match(r"^\s*\d+[.)]\s+", lines[index]):
+                items.append(re.sub(r"^\s*\d+[.)]\s+", "", lines[index]))
+                index += 1
+            parts.append("<ol>" + "".join(f"<li>{_inline_markdown(item, doc)}</li>" for item in items) + "</ol>")
+            continue
+        if line.lstrip().startswith(">"):
+            quoted = []
+            while index < len(lines) and lines[index].lstrip().startswith(">"):
+                quoted.append(lines[index].lstrip()[1:].lstrip())
+                index += 1
+            parts.append("<blockquote>" + "<br>".join(_inline_markdown(item, doc) for item in quoted) + "</blockquote>")
+            continue
+        paragraph = [line.strip()]
+        index += 1
+        while index < len(lines) and lines[index].strip() and not re.match(r"^(#{1,6})\s+|^\s*([-*+]|\d+[.)])\s+|^\s*>", lines[index]):
+            if index + 1 < len(lines) and "|" in lines[index] and re.match(r"^\s*\|?\s*:?-{3,}", lines[index + 1]):
+                break
+            paragraph.append(lines[index].strip())
+            index += 1
+        parts.append("<p>" + " ".join(_inline_markdown(item, doc) for item in paragraph) + "</p>")
+    if in_code:
+        parts.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
+    title = html.escape(os.path.basename(doc))
+    return f'''<!doctype html><html><head><meta charset="utf-8"><title>{title}</title><style>
+@page {{ size: A4; margin: 22mm 20mm; }}
+body {{ max-width: 820px; margin: 0 auto; color: #20211f; background: #fff; font: 11.5pt/1.65 Georgia, "Songti SC", serif; }}
+h1 {{ font-size: 24pt; }} h2 {{ font-size: 18pt; border-bottom: 1px solid #ddd; padding-bottom: 5pt; }} h3 {{ font-size: 14pt; }}
+h1,h2,h3,h4,h5,h6 {{ page-break-after: avoid; color: #27312d; }} p {{ text-align: left; }}
+img {{ display: block; max-width: 100%; height: auto; margin: 12pt auto; page-break-inside: avoid; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 9.5pt; page-break-inside: avoid; }} th,td {{ border: 1px solid #aaa; padding: 5pt; vertical-align: top; }} th {{ background: #f2f4f2; }}
+blockquote {{ margin: 10pt 0; padding: 6pt 12pt; border-left: 3px solid #6d8177; color: #4e5b55; }}
+pre {{ padding: 9pt; background: #f3f4f2; white-space: pre-wrap; }} code {{ font-family: Menlo, monospace; font-size: 9pt; }}
+a {{ color: #315d6f; }}
+</style></head><body>{''.join(parts)}</body></html>'''
+
+
+def _resolve_soffice():
+    override = (os.environ.get("COMMA_REVIEW_SOFFICE_BIN") or "").strip()
+    candidates = [
+        override,
+        shutil.which("soffice"),
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/Applications/LibreOfficeDev.app/Contents/MacOS/soffice",
+        os.path.expanduser("~/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/soffice"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            try:
+                result = subprocess.run([candidate, "--version"], capture_output=True, text=True, timeout=8, check=False)
+                if result.returncode == 0:
+                    return os.path.realpath(candidate), ((result.stdout or result.stderr) or "").strip().splitlines()[0]
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+    return "", ""
+
+
+def export_capability_manifest():
+    soffice, version = _resolve_soffice()
+    return {
+        "ok": True,
+        "schema_version": "comma-review-export-capabilities/v1",
+        "formats": {
+            "markdown": {"ready": True, "engine": "native"},
+            "reviewed-markdown": {"ready": True, "engine": "native"},
+            "package": {"ready": True, "engine": "native-zip"},
+            "docx": {"ready": bool(soffice), "engine": "LibreOffice", "detail": version or "未检测到 LibreOffice"},
+            "pdf": {"ready": bool(soffice), "engine": "LibreOffice", "detail": version or "未检测到 LibreOffice"},
+        },
+    }
+
+
+def _convert_office(doc: str, body: str, format_name: str) -> bytes:
+    soffice, _ = _resolve_soffice()
+    if not soffice:
+        raise ValueError("DOCX/PDF 导出需要本机 LibreOffice；当前未检测到可用转换器")
+    if format_name not in ("docx", "pdf"):
+        raise ValueError("unsupported office export format")
+    with tempfile.TemporaryDirectory(prefix="comma-review-export-") as temp_root:
+        html_path = os.path.join(temp_root, _safe_download_name(os.path.splitext(os.path.basename(doc))[0]) + ".html")
+        _atomic_write(html_path, _markdown_html(body, doc))
+        profile = os.path.join(temp_root, "lo-profile")
+        os.makedirs(profile, exist_ok=True)
+        target_filter = "docx:Office Open XML Text" if format_name == "docx" else "pdf"
+        command = [
+            soffice, f"-env:UserInstallation=file://{urllib.parse.quote(profile)}",
+            "--headless", "--convert-to", target_filter, "--outdir", temp_root, html_path,
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+        output_path = os.path.splitext(html_path)[0] + f".{format_name}"
+        if completed.returncode != 0 or not os.path.isfile(output_path):
+            detail = ((completed.stderr or completed.stdout) or "conversion failed").strip()
+            raise ValueError(f"{format_name.upper()} 导出失败：{detail[:240]}")
+        with open(output_path, "rb") as fh:
+            return fh.read()
 
 
 def _append_event(actor: str, action: str, path: str, summary: str) -> None:
@@ -946,7 +1408,12 @@ class Handler(BaseHTTPRequestHandler):
     def _send_file(self, path, content_type, headers=None):
         with open(path, "rb") as fh:
             body = fh.read()
-        self.send_response(200)
+        return self._send_bytes(body, content_type, headers=headers)
+
+    def _send_bytes(self, body, content_type, headers=None, status=200):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         for key, value in (headers or {}).items():
             self.send_header(key, value)
@@ -1020,14 +1487,120 @@ class Handler(BaseHTTPRequestHandler):
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 if not os.path.exists(doc):
                     return self._send_json({"ok": False, "error": "doc not found"}, 404)
-                with open(doc, encoding="utf-8") as fh:
-                    body = fh.read()
+                with _MUTATION_LOCK:
+                    body, current_rev, _ = _ensure_current_snapshot(doc)
                 return self._send_json({
                     "ok": True, "path": os.path.relpath(doc, DATA_ROOT),
-                    "body": body, "rev": _rev(body),
+                    "body": body, "rev": current_rev,
                 })
             if route == "/api/runtime/capabilities":
                 return self._send_json(runtime_capability_manifest())
+            if route == "/api/exports/capabilities":
+                return self._send_json(export_capability_manifest())
+            if route == "/api/versions":
+                doc = _safe_doc_path((qs.get("path") or [""])[0])
+                with _MUTATION_LOCK:
+                    _, current_rev, _ = _ensure_current_snapshot(doc)
+                    versions = list(reversed(_load_version_index(doc)["versions"]))
+                return self._send_json({
+                    "ok": True, "current_rev": current_rev,
+                    "versions": [_version_entry_summary(item) for item in versions],
+                    "drafts": [_draft_summary(item) for item in _drafts_for_doc(doc)],
+                })
+            if route == "/api/versions/diff":
+                doc = _safe_doc_path((qs.get("path") or [""])[0])
+                from_selector = (qs.get("from") or [""])[0]
+                to_selector = (qs.get("to") or ["current"])[0]
+                if not from_selector:
+                    raise ValueError("from version required")
+                current_body, current_rev, _ = _ensure_current_snapshot(doc)
+
+                def selected(selector):
+                    if selector == "current":
+                        return {"id": "current", "rev": current_rev, "label": "当前版本"}, current_body
+                    if not _VERSION_ID_RE.fullmatch(selector):
+                        raise ValueError("invalid version id")
+                    return _version_body(doc, selector)
+
+                from_entry, from_body = selected(from_selector)
+                to_entry, to_body = selected(to_selector)
+                diff_lines = list(difflib.unified_diff(
+                    from_body.splitlines(), to_body.splitlines(),
+                    fromfile=from_entry.get("label") or from_entry.get("id") or "from",
+                    tofile=to_entry.get("label") or to_entry.get("id") or "to",
+                    lineterm="",
+                ))
+                diff_text = "\n".join(diff_lines)
+                truncated = len(diff_text) > 200000
+                if truncated:
+                    diff_text = diff_text[:200000] + "\n… diff truncated …"
+                return self._send_json({
+                    "ok": True, "from": _version_entry_summary(from_entry),
+                    "to": _version_entry_summary(to_entry), "diff": diff_text,
+                    "changed_lines": sum(1 for line in diff_lines if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))),
+                    "truncated": truncated,
+                })
+            if route == "/api/drafts":
+                doc = _safe_doc_path((qs.get("path") or [""])[0])
+                return self._send_json({"ok": True, "drafts": [_draft_summary(item) for item in _drafts_for_doc(doc)]})
+            draft_diff_match = re.match(r"^/api/drafts/(draft-[a-f0-9]{16})/diff$", route)
+            if draft_diff_match:
+                draft = _load_draft(draft_diff_match.group(1))
+                doc = _safe_doc_path((qs.get("path") or [draft.get("doc_path", "")])[0])
+                if draft.get("doc_path") != _doc_rel(doc):
+                    raise ValueError("draft does not belong to document")
+                current = _read_doc(doc)
+                diff_lines = list(difflib.unified_diff(
+                    current.splitlines(), str(draft.get("body") or "").splitlines(),
+                    fromfile="current", tofile=draft["id"], lineterm="",
+                ))
+                diff_text = "\n".join(diff_lines)
+                truncated = len(diff_text) > 200000
+                if truncated:
+                    diff_text = diff_text[:200000] + "\n… diff truncated …"
+                return self._send_json({
+                    "ok": True, "draft": _draft_summary(draft), "diff": diff_text,
+                    "changed_lines": sum(1 for line in diff_lines if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))),
+                    "truncated": truncated,
+                })
+            draft_match = re.match(r"^/api/drafts/(draft-[a-f0-9]{16})$", route)
+            if draft_match:
+                draft = _load_draft(draft_match.group(1))
+                doc = _safe_doc_path((qs.get("path") or [draft.get("doc_path", "")])[0])
+                if draft.get("doc_path") != _doc_rel(doc):
+                    raise ValueError("draft does not belong to document")
+                return self._send_json({"ok": True, "draft": draft})
+            if route == "/api/export":
+                doc = _safe_doc_path((qs.get("path") or [""])[0])
+                format_name = (qs.get("format") or ["markdown"])[0]
+                selector = (qs.get("version") or ["current"])[0]
+                current_body, _, current_entry = _ensure_current_snapshot(doc)
+                if selector == "current":
+                    body, version_entry = current_body, current_entry
+                else:
+                    if not _VERSION_ID_RE.fullmatch(selector):
+                        raise ValueError("invalid version id")
+                    version_entry, body = _version_body(doc, selector)
+                base = _safe_download_name(os.path.splitext(os.path.basename(doc))[0])
+                if format_name == "markdown":
+                    payload, mime, filename = body.encode("utf-8"), "text/markdown; charset=utf-8", f"{base}.md"
+                elif format_name == "reviewed-markdown":
+                    payload = _reviewed_markdown(body, _load_comments(doc)).encode("utf-8")
+                    mime, filename = "text/markdown; charset=utf-8", f"{base}-reviewed.md"
+                elif format_name == "package":
+                    payload, mime, filename = _review_package(doc, body, version_entry), "application/zip", f"{base}-review-package.zip"
+                elif format_name in ("docx", "pdf"):
+                    payload = _convert_office(doc, body, format_name)
+                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if format_name == "docx" else "application/pdf"
+                    filename = f"{base}.{format_name}"
+                else:
+                    raise ValueError("unsupported export format")
+                quoted = urllib.parse.quote(filename)
+                return self._send_bytes(payload, mime, headers={
+                    "Content-Disposition": f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quoted}",
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                })
             if route == "/api/comments":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 return self._send_json({"ok": True, "comments": _load_comments(doc)})
@@ -1076,6 +1649,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route == "/api/doc" and method == "PUT":
                 return self._save_doc(payload)
+            if route == "/api/versions/checkpoints" and method == "POST":
+                return self._create_checkpoint(payload)
             if route == "/api/comments":
                 if method == "POST":
                     return self._create_comment(payload)
@@ -1091,6 +1666,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._start_review(payload)
             if route == "/api/conversations" and method == "POST":
                 return self._start_conversation(payload)
+            match = re.match(r"^/api/versions/(version-[a-f0-9]{16})/restore$", route)
+            if match and method == "POST":
+                return self._restore_version(match.group(1), payload)
+            match = re.match(r"^/api/drafts/(draft-[a-f0-9]{16})/(restore|dismiss)$", route)
+            if match and method in ("POST", "DELETE"):
+                if match.group(2) == "restore" and method == "POST":
+                    return self._restore_draft(match.group(1), payload)
+                if match.group(2) == "dismiss":
+                    return self._dismiss_draft(match.group(1), payload)
             match = re.match(r"^/api/review-sessions/(review-[a-f0-9]{12})/(messages|writeback)$", route)
             if match and method == "POST":
                 if match.group(2) == "messages":
@@ -1122,21 +1706,120 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body must be a string")
         base_rev = payload.get("base_rev") or ""
         actor = payload.get("actor") or "june"
-        current = ""
-        if os.path.exists(doc):
-            with open(doc, encoding="utf-8") as fh:
-                current = fh.read()
-        cur_rev = _rev(current)
-        if base_rev and base_rev != cur_rev:
-            # optimistic-concurrency conflict; do not clobber
-            return self._send_json({
-                "ok": False, "conflict": True, "rev": cur_rev, "body": current,
-                "message": "document changed on disk since load",
-            }, 409)
-        _atomic_write(doc, new_body)
-        _append_event(actor, "save-doc", doc,
-                      f"{len(new_body)} chars, {new_body.count(chr(10)) + 1} lines")
-        return self._send_json({"ok": True, "rev": _rev(new_body), "body": new_body})
+        with _MUTATION_LOCK:
+            current = _read_doc(doc) if os.path.exists(doc) else ""
+            cur_rev = _rev(current)
+            if os.path.exists(doc):
+                _ensure_current_snapshot(doc)
+            if base_rev and base_rev != cur_rev:
+                draft = _save_conflict_draft(
+                    doc, new_body, expected_rev=base_rev, actual_rev=cur_rev, actor=actor,
+                )
+                _append_event(actor, "preserve-conflict-draft", doc, f"{draft['id']} · {len(new_body)} chars")
+                return self._send_json({
+                    "ok": False, "conflict": True, "expected": base_rev,
+                    "rev": cur_rev, "body": current, "draft": _draft_summary(draft),
+                    "message": "document changed on disk since load; local changes preserved as a draft",
+                }, 409)
+            old_rev = cur_rev
+            os.makedirs(os.path.dirname(doc), exist_ok=True)
+            _atomic_write(doc, new_body)
+            entry = _snapshot_version(
+                doc, new_body, kind="auto", actor=actor, label="自动保存",
+                parent_rev=old_rev, force_entry=True,
+            )
+            _append_event(actor, "save-doc", doc,
+                          f"{len(new_body)} chars, {new_body.count(chr(10)) + 1} lines")
+        return self._send_json({"ok": True, "rev": _rev(new_body), "body": new_body,
+                                "version": _version_entry_summary(entry)})
+
+    def _create_checkpoint(self, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        label = str(payload.get("label") or "").strip()
+        if not label:
+            raise ValueError("checkpoint label required")
+        actor = str(payload.get("actor") or "June")
+        base_rev = str(payload.get("base_rev") or "")
+        with _MUTATION_LOCK:
+            body, current_rev, _ = _ensure_current_snapshot(doc)
+            if base_rev and base_rev != current_rev:
+                return self._send_json({
+                    "ok": False, "conflict": True, "expected": base_rev,
+                    "rev": current_rev, "body": body,
+                    "message": "document changed before checkpoint",
+                }, 409)
+            entry = _snapshot_version(
+                doc, body, kind="checkpoint", actor=actor, label=label,
+                parent_rev=current_rev, force_entry=True,
+            )
+            _append_event(actor, "create-checkpoint", doc, f"{entry['id']} · {label}")
+        return self._send_json({"ok": True, "version": _version_entry_summary(entry), "rev": current_rev})
+
+    def _restore_version(self, version_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        base_rev = str(payload.get("base_rev") or "")
+        with _MUTATION_LOCK:
+            current, current_rev, _ = _ensure_current_snapshot(doc)
+            if not base_rev or base_rev != current_rev:
+                return self._send_json({
+                    "ok": False, "conflict": True, "expected": base_rev,
+                    "rev": current_rev, "body": current,
+                    "message": "document changed before restore",
+                }, 409)
+            source, target = _version_body(doc, version_id)
+            _atomic_write(doc, target)
+            entry = _snapshot_version(
+                doc, target, kind="restore", actor=actor,
+                label=f"恢复：{source.get('label') or source['id']}", parent_rev=current_rev,
+                source_version_id=source["id"], force_entry=True,
+            )
+            _append_event(actor, "restore-version", doc, f"{source['id']} -> {entry['id']}")
+        return self._send_json({"ok": True, "rev": _rev(target), "body": target,
+                                "version": _version_entry_summary(entry)})
+
+    def _restore_draft(self, draft_id, payload):
+        draft = _load_draft(draft_id)
+        doc = _safe_doc_path(payload.get("path") or draft.get("doc_path"))
+        if draft.get("doc_path") != _doc_rel(doc):
+            raise ValueError("draft does not belong to document")
+        if draft.get("status") != "active":
+            raise ValueError("draft is no longer active")
+        actor = str(payload.get("actor") or "June")
+        base_rev = str(payload.get("base_rev") or "")
+        with _MUTATION_LOCK:
+            current, current_rev, _ = _ensure_current_snapshot(doc)
+            if not base_rev or base_rev != current_rev:
+                return self._send_json({
+                    "ok": False, "conflict": True, "expected": base_rev,
+                    "rev": current_rev, "body": current,
+                    "message": "document changed before draft recovery",
+                }, 409)
+            target = str(draft.get("body") or "")
+            _atomic_write(doc, target)
+            entry = _snapshot_version(
+                doc, target, kind="recovery", actor=actor,
+                label=f"恢复冲突草稿 {draft_id[-6:]}", parent_rev=current_rev,
+                source_version_id=draft_id, force_entry=True,
+            )
+            draft["status"] = "recovered"
+            draft["resolved_at"] = _now()
+            draft["recovery_version_id"] = entry["id"]
+            _atomic_write_json(_draft_path(draft_id), draft)
+            _append_event(actor, "recover-conflict-draft", doc, f"{draft_id} -> {entry['id']}")
+        return self._send_json({"ok": True, "rev": _rev(target), "body": target,
+                                "version": _version_entry_summary(entry), "draft": _draft_summary(draft)})
+
+    def _dismiss_draft(self, draft_id, payload):
+        draft = _load_draft(draft_id)
+        doc = _safe_doc_path(payload.get("path") or draft.get("doc_path"))
+        if draft.get("doc_path") != _doc_rel(doc):
+            raise ValueError("draft does not belong to document")
+        draft["status"] = "dismissed"
+        draft["resolved_at"] = _now()
+        _atomic_write_json(_draft_path(draft_id), draft)
+        _append_event(payload.get("actor") or "June", "dismiss-conflict-draft", doc, draft_id)
+        return self._send_json({"ok": True, "draft": _draft_summary(draft)})
 
     def _create_comment(self, payload):
         doc = _safe_doc_path(payload.get("path"))

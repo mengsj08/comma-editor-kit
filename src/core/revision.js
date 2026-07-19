@@ -10,12 +10,14 @@ export async function revisionOf(body) {
 }
 
 export class RevisionConflictError extends Error {
-  constructor({ expected, actual, body }) {
+  constructor({ expected, actual, body, draft = null, draftBody = '' }) {
     super(`Document revision changed: expected ${expected || 'none'}, actual ${actual || 'none'}`);
     this.name = 'RevisionConflictError';
     this.code = 'REVISION_CONFLICT';
     this.expected = expected || '';
     this.actual = actual || '';
     this.body = String(body ?? '');
+    this.draft = draft && typeof draft === 'object' ? { ...draft } : null;
+    this.draftBody = String(draftBody ?? '');
   }
 }

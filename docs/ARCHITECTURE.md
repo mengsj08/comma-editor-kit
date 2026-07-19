@@ -30,6 +30,9 @@ The component consumes a document contract. It does not know where a document li
    adapter or host to opt in.
 10. Capability discovery is truthful. A document-only host does not gain fake
     comments or event history merely because the UI supports them elsewhere.
+11. A stale host save may preserve the attempted body as a recoverable draft,
+    but recovery still carries the current `baseRev` and creates a new history
+    entry. Conflict preservation never weakens the adapter revision boundary.
 
 ## Extension points
 
@@ -67,7 +70,7 @@ Before `1.0`:
 
 | Host | Save policy | Comments | Host-owned behavior |
 |---|---|---|---|
-| Comma Review Studio | immediate | full + atomic batch | provider execution, review sessions, finding decisions, multi-turn writeback |
+| Comma Review Studio | immediate | full + atomic batch | provider execution, review sessions, finding decisions, multi-turn writeback, version/draft service, exports |
 | ResearchLab Markdown Studio | explicit | full + atomic batch | RLP directory confinement, SHA-256 guard, 2 MB limit, project-local state |
 | kanban-personal controlled Adapter | immediate | deliberately disabled | frontmatter, acceptance criteria, AI thread/queue, handoff, task state and three-way merge |
 

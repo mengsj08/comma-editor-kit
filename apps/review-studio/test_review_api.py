@@ -1,18 +1,113 @@
 #!/usr/bin/env python3
 """HTTP-level contract test with a controlled AI response."""
 import json
+import io
 import os
 import tempfile
 import threading
 import unittest
 import urllib.request
 import urllib.error
+import zipfile
 from unittest import mock
 
 import server
 
 
 class ReviewApiTests(unittest.TestCase):
+    def test_versions_conflict_recovery_and_portable_exports(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            first_body = "# Synthetic paper\n\nA controlled baseline sentence.\n\n![Control](figures/control.png)\n"
+            second_body = first_body + "\n## Results\n\nA second revision.\n"
+            draft_body = second_body + "\nLocally typed during a conflict.\n"
+            with open(os.path.join(tmp, "paper.md"), "w", encoding="utf-8") as fh:
+                fh.write(first_body)
+            os.makedirs(os.path.join(tmp, "figures"))
+            with open(os.path.join(tmp, "figures", "control.png"), "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\ncontrolled")
+            events = os.path.join(tmp, "events.jsonl")
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", events):
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    document = self._request(base + "/api/doc?path=paper.md")
+                    initial_rev = document["rev"]
+                    history = self._request(base + "/api/versions?path=paper.md")
+                    self.assertEqual(history["versions"][0]["kind"], "baseline")
+
+                    saved = self._request(base + "/api/doc", "PUT", {
+                        "path": "paper.md", "body": second_body,
+                        "base_rev": initial_rev, "actor": "June",
+                    })
+                    second_rev = saved["rev"]
+                    self.assertEqual(saved["version"]["kind"], "auto")
+
+                    status, conflict = self._request_error(base + "/api/doc", "PUT", {
+                        "path": "paper.md", "body": draft_body,
+                        "base_rev": initial_rev, "actor": "June",
+                    })
+                    self.assertEqual(status, 409)
+                    self.assertEqual(conflict["expected"], initial_rev)
+                    draft_id = conflict["draft"]["id"]
+                    draft = self._request(base + f"/api/drafts/{draft_id}?path=paper.md")["draft"]
+                    self.assertEqual(draft["body"], draft_body)
+                    self.assertEqual(draft["status"], "active")
+                    draft_diff = self._request(base + f"/api/drafts/{draft_id}/diff?path=paper.md")
+                    self.assertIn("Locally typed during a conflict.", draft_diff["diff"])
+
+                    checkpoint = self._request(base + "/api/versions/checkpoints", "POST", {
+                        "path": "paper.md", "base_rev": second_rev,
+                        "label": "Evidence checked", "actor": "June",
+                    })
+                    self.assertEqual(checkpoint["version"]["label"], "Evidence checked")
+                    history = self._request(base + "/api/versions?path=paper.md")
+                    baseline = next(item for item in history["versions"] if item["kind"] == "baseline")
+                    diff = self._request(base + f"/api/versions/diff?path=paper.md&from={baseline['id']}&to=current")
+                    self.assertIn("A second revision.", diff["diff"])
+
+                    restored = self._request(base + f"/api/versions/{baseline['id']}/restore", "POST", {
+                        "path": "paper.md", "base_rev": second_rev, "actor": "June",
+                    })
+                    self.assertEqual(restored["body"], first_body)
+                    self.assertEqual(restored["version"]["kind"], "restore")
+                    recovered = self._request(base + f"/api/drafts/{draft_id}/restore", "POST", {
+                        "path": "paper.md", "base_rev": restored["rev"], "actor": "June",
+                    })
+                    self.assertEqual(recovered["body"], draft_body)
+                    self.assertEqual(recovered["version"]["kind"], "recovery")
+                    self.assertEqual(recovered["draft"]["status"], "recovered")
+
+                    self._request(base + "/api/comments?path=paper.md", "POST", {
+                        "kind": "anchored", "quote_text": "A controlled baseline sentence.",
+                        "content": "Keep this statement evidence-bound.", "priority": "P1", "actor": "Reviewer",
+                    })
+                    _, markdown_headers, markdown = self._request_raw(base + "/api/export?path=paper.md&format=markdown")
+                    self.assertEqual(markdown.decode("utf-8"), draft_body)
+                    self.assertIn("attachment", markdown_headers.get("Content-Disposition", ""))
+                    _, _, reviewed = self._request_raw(base + "/api/export?path=paper.md&format=reviewed-markdown")
+                    self.assertIn("## Review comments", reviewed.decode("utf-8"))
+                    self.assertIn("Keep this statement evidence-bound.", reviewed.decode("utf-8"))
+                    _, _, package = self._request_raw(base + "/api/export?path=paper.md&format=package")
+                    with zipfile.ZipFile(io.BytesIO(package)) as archive:
+                        names = set(archive.namelist())
+                        self.assertIn("manifest.json", names)
+                        self.assertIn("manuscript/paper.md", names)
+                        self.assertIn("manuscript/figures/control.png", names)
+                        self.assertIn("review/comments.json", names)
+                        self.assertIn("history/versions.json", names)
+                        manifest = json.loads(archive.read("manifest.json"))
+                        self.assertEqual(manifest["privacy"], "Raw AI traces and the global event ledger are intentionally excluded.")
+                    with open(os.path.join(tmp, "paper.md"), encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), draft_body)
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
     def test_frontend_exposes_cli_status_and_preflight_contract(self):
         with open(os.path.join(server.STATIC_ROOT, "editor.html"), encoding="utf-8") as fh:
             html = fh.read()
@@ -340,6 +435,15 @@ class ReviewApiTests(unittest.TestCase):
             finally:
                 exc.close()
         raise AssertionError("request unexpectedly succeeded")
+
+    @staticmethod
+    def _request_raw(url, method="GET", payload=None):
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.headers, response.read()
 
 
 if __name__ == "__main__":
