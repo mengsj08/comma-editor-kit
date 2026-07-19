@@ -90,6 +90,12 @@ editor.addEventListener('comma-selection-action', (event) => {
 The native `Add note` action remains editor-owned. Host actions receive the
 same quote snapshot and stable locator but cannot silently mutate Markdown.
 
+Rendered Markdown stays in reading mode during clicks and drag selections.
+Writable hosts expose an explicit per-block `Edit block` affordance instead of
+turning every manuscript click into a textarea; `lang="zh-CN"` localizes that
+control and its edit footer. This keeps selection commands and editing from
+competing for the same pointer gesture.
+
 ## Structured AI comments
 
 `AI review` emits a host-neutral `comma-ai-request` with `mode: "comment-batch"`, the current Markdown revision, an output schema, and an `accept(response)` callback. The host may use Codex, Claude, or another reviewer and return structured proposals without giving the component provider credentials:

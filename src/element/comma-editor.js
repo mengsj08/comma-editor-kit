@@ -393,6 +393,9 @@ export class CommaEditorElement extends HTMLElement {
       if (action === 'overall-comment') this._openCommentComposer(null);
       if (action === 'selection-comment') this._openCommentComposer(this._selection);
       if (action === 'selection-action') this._runSelectionAction(event.target.closest('[data-selection-action]')?.dataset.selectionAction);
+      if (action === 'edit-block') this._enterBlockEdit(Number(event.target.closest('[data-block-index]')?.dataset.blockIndex));
+      if (action === 'cancel-block-edit') await this._commitBlock(true);
+      if (action === 'commit-block-edit') await this._commitBlock(false);
       if (action === 'cancel-comment') this._closeCommentComposer();
       if (action === 'save-comment') await this._saveComment();
       if (action === 'delete-comment') await this._deleteComment(event.target.dataset.commentId);
@@ -414,10 +417,6 @@ export class CommaEditorElement extends HTMLElement {
     if (comment) {
       this._jumpToComment(comment.dataset.commentId);
       return;
-    }
-    const block = event.target.closest('.ce-block');
-    if (block && !this.readonly && !this._selection && !event.target.closest('a, button, input, textarea')) {
-      this._enterBlockEdit(Number(block.dataset.blockIndex));
     }
   }
 
@@ -463,12 +462,24 @@ export class CommaEditorElement extends HTMLElement {
     const resolveAsset = this._capabilities.assets?.resolve && this._adapter?.resolveAsset
       ? (src) => this._adapter.resolveAsset({ src, document: assetDocument })
       : null;
+    const writable = !this.readonly && this._capabilities.document.save;
+    const editLabel = this.lang?.toLowerCase().startsWith('zh') ? '编辑本段' : 'Edit block';
     for (const block of this._blocks) {
       const wrapper = document.createElement('section');
       wrapper.className = 'ce-block';
       wrapper.dataset.blockIndex = String(block.index);
       wrapper.dataset.blockType = block.type;
       wrapper.innerHTML = this._renderer.render(block.raw, { resolveAsset });
+      if (writable) {
+        const editButton = document.createElement('button');
+        editButton.type = 'button';
+        editButton.className = 'ce-block-edit-action';
+        editButton.dataset.action = 'edit-block';
+        editButton.textContent = editLabel;
+        editButton.setAttribute('aria-label', editLabel);
+        editButton.title = editLabel;
+        wrapper.appendChild(editButton);
+      }
       preview.appendChild(wrapper);
     }
     this._applyCommentAnchors();
@@ -555,14 +566,39 @@ export class CommaEditorElement extends HTMLElement {
     textarea.className = 'ce-block-editor';
     textarea.value = block.raw.slice(0, block.raw.length - trailer.length);
     textarea.spellcheck = false;
-    wrapper.replaceChildren(textarea);
-    this._activeBlock = { block, wrapper, textarea, trailer };
+    const zh = this.lang?.toLowerCase().startsWith('zh');
+    textarea.setAttribute('aria-label', zh ? '编辑本段 Markdown' : 'Edit block Markdown');
+    const editing = document.createElement('div');
+    editing.className = 'ce-block-editing';
+    const footer = document.createElement('div');
+    footer.className = 'ce-block-edit-footer';
+    const hint = document.createElement('span');
+    hint.textContent = zh ? 'Esc 取消 · ⌘/Ctrl + Enter 完成' : 'Esc cancel · ⌘/Ctrl + Enter done';
+    const actions = document.createElement('div');
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.dataset.action = 'cancel-block-edit';
+    cancel.textContent = zh ? '取消' : 'Cancel';
+    const done = document.createElement('button');
+    done.type = 'button';
+    done.dataset.action = 'commit-block-edit';
+    done.className = 'primary';
+    done.textContent = zh ? '完成' : 'Done';
+    actions.append(cancel, done);
+    footer.append(hint, actions);
+    editing.append(textarea, footer);
+    wrapper.replaceChildren(editing);
+    this._selection = null;
+    this._el('selection-bar').hidden = true;
+    this._activeBlock = { block, wrapper, textarea, trailer, editing };
     const resize = () => {
       textarea.style.height = 'auto';
       textarea.style.height = `${Math.min(Math.max(90, textarea.scrollHeight + 2), innerHeight * 0.75)}px`;
     };
     textarea.addEventListener('input', resize);
-    textarea.addEventListener('blur', () => this._commitBlock(false));
+    textarea.addEventListener('blur', (event) => {
+      if (!editing.contains(event.relatedTarget)) this._commitBlock(false);
+    });
     textarea.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();

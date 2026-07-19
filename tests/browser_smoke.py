@@ -77,6 +77,16 @@ def main() -> None:
                 }"""
             )
             page.wait_for_function("!document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=selection-bar]').hidden")
+            selection_priority_state = page.locator("comma-editor").evaluate(
+                """el => {
+                  el.shadowRoot.querySelector('.ce-block p').click();
+                  return {
+                    barHidden: el.shadowRoot.querySelector('[data-el=selection-bar]').hidden,
+                    editorActive: Boolean(el.shadowRoot.querySelector('.ce-block-editor'))
+                  };
+                }"""
+            )
+            assert selection_priority_state == {"barHidden": False, "editorActive": False}
             selection_actions = page.locator("comma-editor").evaluate(
                 "el => Array.from(el.shadowRoot.querySelectorAll('[data-selection-action]')).map(button => button.textContent)"
             )
@@ -149,16 +159,30 @@ def main() -> None:
                 "el => el.shadowRoot.querySelector('[data-el=review-queue]').hidden"
             )
 
-            # Exercise in-place block editing before whole-source editing.
+            # Reading and editing are separate modes: clicking manuscript text
+            # must never consume a quote selection or silently open a textarea.
+            passive_click_state = page.locator("comma-editor").evaluate(
+                """el => {
+                  el.shadowRoot.querySelector('[data-block-type=paragraph] p').click();
+                  return {
+                    editorActive: Boolean(el.shadowRoot.querySelector('.ce-block-editor')),
+                    editActions: el.shadowRoot.querySelectorAll('[data-action=edit-block]').length
+                  };
+                }"""
+            )
+            assert passive_click_state["editorActive"] is False
+            assert passive_click_state["editActions"] > 0
+
+            # Exercise the explicit in-place edit affordance before whole-source editing.
             page.locator("comma-editor").evaluate(
-                "el => el.shadowRoot.querySelector('[data-block-type=paragraph]').click()"
+                "el => el.shadowRoot.querySelector('[data-block-type=paragraph] [data-action=edit-block]').click()"
             )
             page.wait_for_function("document.querySelector('comma-editor').shadowRoot.querySelector('.ce-block-editor')")
             page.locator("comma-editor").evaluate(
                 """el => {
                   const ta = el.shadowRoot.querySelector('.ce-block-editor');
                   ta.value += ' Block edit.';
-                  ta.dispatchEvent(new Event('blur'));
+                  el.shadowRoot.querySelector('[data-action=commit-block-edit]').click();
                 }"""
             )
             page.wait_for_function("document.querySelector('comma-editor').documentState.body.includes('Block edit.')")
@@ -178,10 +202,12 @@ def main() -> None:
                 "blocks": blocks,
                 "selection_actions": selection_actions,
                 "selection_event": selection_event,
+                "selection_priority_state": selection_priority_state,
                 "anchor_state": anchor_state,
                 "batch_ready": batch_preview["counts"]["ready"],
                 "batch_missing": batch_preview["counts"]["missing"],
                 "review_queue_closed": review_queue_closed,
+                "passive_click_state": passive_click_state,
                 "review_screenshot": str(review_screenshot),
                 "screenshot": str(screenshot),
             }
