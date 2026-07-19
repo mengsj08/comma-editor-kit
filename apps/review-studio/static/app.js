@@ -163,10 +163,50 @@ editor.selectionActions = [
   { id: 'discuss', label: '深入讨论', title: '围绕这段原文开始可分支的审阅对话' },
 ];
 
+function configureEditorActions() {
+  editor.toolbarActions = [
+    { id: 'article-overview', label: '文章总览', slot: 'primary', appliesTo: 'document.load' },
+    { id: 'ai-review', label: 'AI Review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true } },
+    { id: 'overall-comment', label: '全文批注', slot: 'primary', appliesTo: 'comments.create' },
+    { id: 'comments', label: '批注', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
+    { id: 'source-edit', label: '源码编辑', slot: 'overflow', appliesTo: { capability: 'document.save', requiresWritable: true } },
+    { id: 'show-withdrawn', label: editor.showWithdrawnComments ? '隐藏已撤回' : '显示已撤回', slot: 'overflow', appliesTo: 'comments.list' },
+  ];
+  editor.commentActions = [
+    { id: 'reply', label: '回复', appliesTo: { capability: 'reply', target: 'comment', lifecycleStates: ['active'] } },
+    { id: 'edit', label: '编辑', appliesTo: { capability: 'update', target: 'comment', lifecycleStates: ['active'] } },
+    { id: 'withdraw', label: '撤回', appliesTo: { capability: 'delete', target: 'comment', lifecycleStates: ['active'] } },
+    { id: 'restore', label: '恢复', appliesTo: { capability: 'restore', target: 'comment', lifecycleStates: ['withdrawn'] } },
+    { id: 'history', label: '查看修改记录', appliesTo: { capability: 'history', target: 'comment' } },
+    { id: 'locate', label: '定位原文', appliesTo: { capability: 'list', target: 'comment', kinds: ['anchored'] } },
+    { id: 'reply-edit', label: '编辑回复', appliesTo: { capability: 'reply', target: 'reply', states: ['active'] } },
+    { id: 'reply-withdraw', label: '撤回回复', appliesTo: { capability: 'reply', target: 'reply', states: ['active'] } },
+  ];
+}
+
+configureEditorActions();
+
 function syncDocumentMeta(documentState) {
   const body = String(documentState?.body || '');
   $('doc-name').textContent = documentState?.title || DOC_PATH;
   $('doc-meta').textContent = `${body.split('\n').length} 行 · rev ${String(documentState?.rev || '').slice(0, 16)}`;
+}
+
+function openOverview() {
+  const documentState = editor.documentState;
+  const body = String(documentState?.body || '');
+  $('overview-doc-name').textContent = documentState?.title || DOC_PATH;
+  $('overview-rev').textContent = String(documentState?.rev || '—');
+  $('overview-stats').textContent = `${body ? body.split('\n').length : 0} 行 · ${body.length.toLocaleString('zh-CN')} 字符`;
+  $('overview-drawer').classList.add('open');
+  $('overview-drawer').setAttribute('aria-hidden', 'false');
+  $('overview-scrim').hidden = false;
+}
+
+function closeOverview() {
+  $('overview-drawer').classList.remove('open');
+  $('overview-drawer').setAttribute('aria-hidden', 'true');
+  $('overview-scrim').hidden = true;
 }
 
 editor.addEventListener('comma-ready', (event) => syncDocumentMeta(event.detail.document));
@@ -196,8 +236,98 @@ editor.addEventListener('comma-selection-action', (event) => {
   if (event.detail?.actionId === 'discuss') openConversationForQuote(sourceQuote);
 });
 
+editor.addEventListener('comma-toolbar-action', (event) => {
+  const action = event.detail?.actionId;
+  if (action === 'article-overview') openOverview();
+  if (action === 'ai-review') editor.requestAiReview();
+  if (action === 'overall-comment') editor.openOverallCommentComposer();
+  if (action === 'comments') editor.toggleComments();
+  if (action === 'source-edit') editor.openSourceEditor();
+  if (action === 'show-withdrawn') {
+    editor.showWithdrawnComments = !editor.showWithdrawnComments;
+    configureEditorActions();
+  }
+});
+
+editor.addEventListener('comma-comment-action', async (event) => {
+  const detail = event.detail || {};
+  const comment = detail.comment;
+  try {
+    if (detail.phase === 'activate') {
+      if (detail.actionId === 'edit') {
+        editor.openCommentAction(detail.commentId, {
+          actionId: 'edit', label: '编辑批注', submitLabel: '保存修改', initialValue: comment.content,
+        });
+      }
+      if (detail.actionId === 'reply') {
+        editor.openCommentAction(detail.commentId, {
+          actionId: 'reply', label: '回复批注', submitLabel: '添加回复', initialValue: '',
+          placeholder: '围绕这条批注继续讨论',
+        });
+      }
+      if (detail.actionId === 'reply-edit') {
+        editor.openCommentAction(detail.commentId, {
+          actionId: 'reply-edit', replyId: detail.replyId, label: '编辑回复',
+          submitLabel: '保存回复', initialValue: detail.reply?.content || '',
+        });
+      }
+      if (detail.actionId === 'withdraw') {
+        if (!window.confirm('撤回后默认列表与计数将隐藏这条批注，但记录会保留。继续吗？')) return;
+        await adapter.deleteComment(detail.commentId, {
+          baseCommentVersion: detail.baseCommentVersion, actor: 'June', reason: 'user-withdrawn',
+        });
+        await refreshEditorComments();
+      }
+      if (detail.actionId === 'restore') {
+        await adapter.restoreComment(detail.commentId, {
+          baseCommentVersion: detail.baseCommentVersion, actor: 'June',
+        });
+        await refreshEditorComments();
+      }
+      if (detail.actionId === 'reply-withdraw') {
+        if (!window.confirm('撤回这条回复？审计记录会保留。')) return;
+        await adapter.deleteCommentReply(detail.commentId, detail.replyId, {
+          baseCommentVersion: detail.baseCommentVersion, actor: 'June',
+        });
+        await refreshEditorComments();
+      }
+      if (detail.actionId === 'history') {
+        const events = await adapter.listCommentEvents(detail.commentId);
+        editor.showCommentDetails(detail.commentId, { label: '修改记录', items: events });
+      }
+      if (detail.actionId === 'locate') editor.jumpToComment(detail.commentId);
+      return;
+    }
+    if (detail.phase === 'submit' && detail.actionId === 'edit') {
+      await adapter.updateComment(detail.commentId, {
+        baseCommentVersion: detail.baseCommentVersion, actor: 'June', content: detail.content,
+      });
+      await refreshEditorComments();
+    }
+    if (detail.phase === 'submit' && detail.actionId === 'reply') {
+      await adapter.createCommentReply(detail.commentId, {
+        baseCommentVersion: detail.baseCommentVersion, actor: 'June', content: detail.content,
+      });
+      await refreshEditorComments();
+    }
+    if (detail.phase === 'submit' && detail.actionId === 'reply-edit') {
+      await adapter.updateCommentReply(detail.commentId, detail.replyId, {
+        baseCommentVersion: detail.baseCommentVersion, actor: 'June', content: detail.content,
+      });
+      await refreshEditorComments();
+    }
+  } catch (error) {
+    if (error?.code === 'COMMENT_VERSION_CONFLICT') {
+      await refreshEditorComments();
+      toast('这条批注已在别处更新；已载入当前版本，请重新操作。', true);
+    } else {
+      toast(error.message || '批注操作失败', true);
+    }
+  }
+});
+
 const REVIEW_STATUS = {
-  running: '评审中', ready: '待写回', completed: '已同步',
+  running: '评审中', ready: '待写回', preview: '待写回', completed: '已同步',
   needs_attention: '部分需确认', needs_rebase: '原文已变化', failed: '运行失败',
 };
 
@@ -899,6 +1029,8 @@ async function writebackConversationMessage() {
 }
 
 $('btn-review-history').onclick = async () => { openReviewDrawer(); if (!reviewState.active) await loadReviewSessions(true); };
+$('overview-close').onclick = closeOverview;
+$('overview-scrim').onclick = closeOverview;
 $('btn-versions').onclick = () => openArchive('versions');
 $('btn-export').onclick = () => openArchive('exports');
 $('archive-close').onclick = closeArchive;
@@ -993,6 +1125,7 @@ window.__COMMA_REVIEW__ = {
   loadConversationSessions, openConversationForQuote, sendConversationMessage,
   loadRuntimeCapabilities, runtimeToolReady, archiveState, loadVersions,
   openArchive, closeArchive, createCheckpoint, restoreVersion, restoreDraft,
+  openOverview, closeOverview,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 

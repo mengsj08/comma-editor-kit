@@ -18,6 +18,7 @@ URL = f"{BASE}/?doc=paper.md"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DOC = os.path.join(ROOT, "data", "paper.md")
 COMMENTS = DOC + ".comments.json"
+COMMENT_EVENTS = DOC + ".comment-events.jsonl"
 ASSET = os.path.join(ROOT, "data", "scientific-control.png")
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z9xkAAAAASUVORK5CYII="
@@ -42,8 +43,9 @@ def read_doc():
 
 
 def reset_comments():
-    if os.path.exists(COMMENTS):
-        os.remove(COMMENTS)
+    for path in (COMMENTS, COMMENT_EVENTS):
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def editor_snapshot(page):
@@ -118,6 +120,54 @@ def main():
               return performance.now() - started;
             }"""))
             results["public_component_render"] = first
+            results["host_actions"] = page.evaluate("""() => {
+              const root = document.querySelector('comma-editor').shadowRoot;
+              return {
+                primary: Array.from(root.querySelectorAll('[data-el=toolbar-primary] [data-toolbar-action]')).map(button => button.textContent.trim()),
+                overflow: Array.from(root.querySelectorAll('[data-el=toolbar-overflow-menu] [data-toolbar-action]')).map(button => button.textContent.trim()),
+                panelTitle: root.querySelector('[data-el=comment-panel-title]').textContent,
+              };
+            }""")
+            page.evaluate("document.querySelector('comma-editor').shadowRoot.querySelector('[data-toolbar-action=article-overview]').click()")
+            page.wait_for_function("document.querySelector('#overview-drawer').classList.contains('open')")
+            results["overview_shell"] = {
+                "title": page.locator("#overview-drawer h2").text_content(),
+                "claims": page.locator("#overview-drawer .capability-boundary-card li").count(),
+                "revision": page.locator("#overview-rev").text_content(),
+            }
+            page.locator("#overview-close").click()
+
+            results["document_only_boundary"] = page.evaluate("""async () => {
+              const fixture = document.createElement('comma-editor');
+              fixture.id = 'document-only-fixture';
+              fixture.toolbarActions = [
+                { id: 'document-info', label: 'Info', slot: 'primary', appliesTo: 'document.load' },
+                { id: 'comments', label: 'Forbidden count', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
+              ];
+              fixture.commentActions = [
+                { id: 'edit', label: 'Forbidden edit', appliesTo: { capability: 'update', target: 'comment' } },
+              ];
+              fixture.adapter = {
+                capabilities: {
+                  savePolicy: 'explicit', document: { load: true, save: false, replace: false },
+                  comments: { list: false, create: false, batch: false, update: false, delete: false },
+                  events: { list: false }, assets: { resolve: false },
+                },
+                async load() { return { title: 'document-only.md', body: '# Fixture\\n\\nNo comment service.', rev: 'opaque-revision-token' }; },
+              };
+              const ready = new Promise(resolve => fixture.addEventListener('comma-ready', resolve, { once: true }));
+              document.body.appendChild(fixture);
+              await ready;
+              const root = fixture.shadowRoot;
+              const result = {
+                toolbarActions: Array.from(root.querySelectorAll('[data-toolbar-action]')).map(button => button.dataset.toolbarAction),
+                commentCountNodes: root.querySelectorAll('[data-comment-count]').length,
+                commentActionNodes: root.querySelectorAll('[data-comment-action]').length,
+                sidebarHidden: root.querySelector('[data-el=sidebar]').hidden,
+              };
+              fixture.remove();
+              return result;
+            }""")
             page.locator("comma-editor").locator(".ce-preview img").click()
             page.wait_for_function("!document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=lightbox]').hidden")
             results["image_lightbox_opened"] = True
@@ -230,6 +280,18 @@ def main():
     assert results["public_component_render"]["paperBackground"] == "rgb(255, 255, 255)"
     assert results["public_component_render"]["textureDisplay"] == "none"
     assert results["image_lightbox_opened"] is True
+    assert results["host_actions"]["primary"] == ["文章总览", "AI Review", "全文批注", "批注 0"]
+    assert results["host_actions"]["overflow"] == ["源码编辑", "显示已撤回"]
+    assert results["host_actions"]["panelTitle"] == "批注"
+    assert results["overview_shell"]["title"] == "文章总览"
+    assert results["overview_shell"]["claims"] == 3
+    assert results["overview_shell"]["revision"] == results["public_component_render"]["rev"]
+    assert results["document_only_boundary"] == {
+        "toolbarActions": ["document-info"],
+        "commentCountNodes": 0,
+        "commentActionNodes": 0,
+        "sidebarHidden": True,
+    }
     assert results["scientific_layout"]["commentsScrollWidth"] <= results["scientific_layout"]["commentsWidth"] + 1
     assert results["scientific_layout"]["cardScrollWidth"] <= results["scientific_layout"]["cardWidth"] + 1
     assert results["narrow_layout"]["shellScrollWidth"] <= results["narrow_layout"]["shellWidth"] + 1

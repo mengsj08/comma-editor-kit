@@ -38,6 +38,36 @@
     </section>
   </main>
 
+  <aside id="overview-drawer" class="overview-drawer" aria-hidden="true" aria-label="文章总览">
+    <header class="overview-head">
+      <div><div class="eyebrow">VERSION-BOUND OVERVIEW</div><h2>文章总览</h2></div>
+      <button id="overview-close" class="icon-button" type="button" aria-label="关闭文章总览">×</button>
+    </header>
+    <section class="overview-version-card">
+      <span>当前稿件</span>
+      <strong id="overview-doc-name">paper.md</strong>
+      <code id="overview-rev">—</code>
+      <small id="overview-stats"></small>
+    </section>
+    <section class="overview-empty-state">
+      <div class="overview-mark" aria-hidden="true">§</div>
+      <div>
+        <h3>此版本尚无结构化总览</h3>
+        <p>这里将承载与当前 revision 绑定的研究问题、核心论点、证据范围、主要结论和限制。生成服务尚未启用，因此打开总览不会调用 CLI，也不会改动 Markdown 或批注。</p>
+      </div>
+    </section>
+    <section class="capability-boundary-card">
+      <div class="eyebrow">READING BOUNDARY</div>
+      <h3>本地 AI 阅读边界</h3>
+      <ul>
+        <li>未读取图片或图表像素；只处理正文、图注和交叉引用文本。</li>
+        <li>未获取或全文核验所引用的文献。</li>
+        <li>未重新计算统计结果。</li>
+      </ul>
+    </section>
+  </aside>
+  <div id="overview-scrim" class="overview-scrim" hidden></div>
+
   <aside id="review-drawer" class="review-drawer" aria-hidden="true">
     <div class="review-drawer-head">
       <div><div class="eyebrow">REVIEW SESSION</div><h2>审稿台账</h2></div>
@@ -58,6 +88,7 @@
         <button id="review-start" class="review-run-button" type="button"><span>✦</span> 开始完整评审</button>
       </div>
       <div id="review-run-state" class="review-run-state" hidden></div>
+      <p class="review-capability-note">评审只读取正文、图注和引用文本；不读取图片像素、不全文核验文献、不重新计算统计结果。</p>
     </div>
 
     <div id="review-empty" class="review-empty">

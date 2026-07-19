@@ -74,7 +74,8 @@ class ReviewOrchestratorTests(unittest.TestCase):
                 self.assertEqual(withdrawn["updated"][0]["action"], "withdrawn")
                 with open(doc + ".comments.json", encoding="utf-8") as fh:
                     comments = json.load(fh)["comments"]
-                self.assertEqual(comments[0]["review_state"], "withdrawn")
+                self.assertEqual(comments[0]["finding_state"], "withdrawn")
+                self.assertEqual(comments[0]["lifecycle_state"], "active")
 
                 with open(doc, "a", encoding="utf-8") as fh:
                     fh.write("\nChanged after review.\n")

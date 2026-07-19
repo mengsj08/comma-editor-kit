@@ -43,6 +43,9 @@ The component consumes a document contract. It does not know where a document li
 - `selectionActions` + `comma-selection-action`: the component renders a
   host-declared selection command and emits a revision-scoped quote snapshot;
   provider execution and conversation state stay outside editor-core.
+- `toolbarActions` / `commentActions` + composed action events: hosts declare
+  labels and ordered commands while the component enforces adapter capability
+  boundaries. A document-only host receives no comment count or comment menu.
 - Reading-mode pointer gestures never imply mutation. Block editing starts only
   from the editor-owned explicit affordance, so native text selection remains
   available to comments and host-declared quote actions.

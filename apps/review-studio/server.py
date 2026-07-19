@@ -13,8 +13,12 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
   PUT  /api/doc               -> save document (atomic, optimistic-concurrency)
   GET  /api/comments?path=    -> list sidecar comments
   POST /api/comments          -> create anchored comment
-  PUT  /api/comments          -> edit comment content
-  DELETE /api/comments        -> delete comment
+  PUT  /api/comments          -> compatibility alias for versioned edit
+  DELETE /api/comments        -> compatibility alias for withdraw
+  PATCH/DELETE /api/comments/<id>, POST /restore
+  POST/PATCH/DELETE /api/comments/<id>/replies[/<reply_id>]
+  GET /api/comments/<id>/events
+                               -> versioned lifecycle + append-only audit
   POST /api/ai-run            -> optional: shell `claude`|`codex` (tool param);
                                  codex uses conservative --sandbox read-only;
                                  --yolo/--dangerously-* flags are forbidden here.
@@ -36,7 +40,8 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
 
 Data model:
   <doc>.md                    -> the document (body is the whole file here)
-  <doc>.md.comments.json      -> sidecar comment store
+  <doc>.md.comments.json      -> normalized materialized comment view
+  <doc>.md.comment-events.jsonl -> append-only comment audit ledger (hashes only)
   review-sessions/<id>.json   -> findings, dialogue and writeback receipts;
                                  document content is not duplicated here
   conversations/<id>.json    -> quote snapshot, message tree and writeback receipts;
@@ -100,6 +105,9 @@ _DRAFT_ID_RE = re.compile(r"^draft-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
 _PRIORITIES = {"P0", "P1", "P2", "P3"}
 _DECISIONS = {"accepted", "proposed", "rejected"}
+_LIFECYCLE_STATES = {"active", "withdrawn"}
+_FINDING_STATES = {"provisional", "accepted", "pending", "withdrawn"}
+_COMMENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _ASSET_MIME_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml",
 }
@@ -108,6 +116,15 @@ _MAX_ASSET_BYTES = 40 * 1024 * 1024
 
 class CliUnavailableError(ValueError):
     """The selected local CLI is absent, unauthenticated, or not executable."""
+
+
+class CommentVersionConflictError(ValueError):
+    """A comment mutation used a stale item version."""
+
+    def __init__(self, current_comment, comments_rev):
+        super().__init__("comment changed before this action")
+        self.current_comment = current_comment
+        self.comments_rev = comments_rev
 
 
 def _cli_search_path(extra_dir=""):
@@ -549,6 +566,7 @@ def _matching_json_records(root: str, doc_rel: str):
 def _review_package(doc: str, body: str, version_entry=None) -> bytes:
     doc_rel = _doc_rel(doc)
     comments = _load_comments(doc)
+    comment_events = _load_comment_events(doc)
     index = _load_version_index(doc)
     manifest = {
         "schema_version": "comma-review-package/v1",
@@ -556,6 +574,7 @@ def _review_package(doc: str, body: str, version_entry=None) -> bytes:
         "document": {"path": doc_rel, "rev": _rev(body), "version_id": (version_entry or {}).get("id", "")},
         "contents": {
             "comments": len(comments),
+            "comment_events": len(comment_events),
             "review_sessions": len(_matching_json_records(os.path.join(DATA_ROOT, "review-sessions"), doc_rel)),
             "conversations": len(_matching_json_records(os.path.join(DATA_ROOT, "conversations"), doc_rel)),
             "versions": len(index.get("versions", [])),
@@ -567,6 +586,11 @@ def _review_package(doc: str, body: str, version_entry=None) -> bytes:
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         archive.writestr(f"manuscript/{doc_rel}", body)
         archive.writestr("review/comments.json", json.dumps({"comments": comments}, ensure_ascii=False, indent=2) + "\n")
+        if comment_events:
+            archive.writestr("review/comment-events.jsonl", "".join(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for item in comment_events
+            ))
         for name, data in _matching_json_records(os.path.join(DATA_ROOT, "review-sessions"), doc_rel):
             archive.writestr(f"review/review-sessions/{name}", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         for name, data in _matching_json_records(os.path.join(DATA_ROOT, "conversations"), doc_rel):
@@ -778,61 +802,394 @@ def _comments_path(doc_path: str) -> str:
     return doc_path + ".comments.json"
 
 
-def _load_comments(doc_path: str):
-    p = _comments_path(doc_path)
-    if not os.path.exists(p):
-        return []
-    try:
-        with open(p, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data.get("comments", []) if isinstance(data, dict) else []
-    except Exception:
-        return []
+def _comment_events_path(doc_path: str) -> str:
+    return doc_path + ".comment-events.jsonl"
 
 
-def _save_comments(doc_path: str, comments) -> None:
-    _atomic_write(_comments_path(doc_path), json.dumps(
-        {"comments": comments}, ensure_ascii=False, indent=2))
+def _first(payload, *keys):
+    for key in keys:
+        if payload.get(key) is not None:
+            return payload.get(key)
+    return None
 
 
-def _comment_record(payload, *, default_author="June"):
-    quote = str(payload.get("quote_text") or payload.get("quoteText") or "").strip()
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _comment_content_hash(content) -> str:
+    digest = hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+    return "sha256:" + digest
+
+
+def _normalize_reply(payload, *, strict=False):
+    if not isinstance(payload, dict):
+        if strict:
+            raise ValueError("reply must be an object")
+        payload = {}
+    content = str(payload.get("content") or "").strip()
+    if strict and not content:
+        raise ValueError("reply content required")
+    state = str(payload.get("state") or "active").strip().lower()
+    if state not in _LIFECYCLE_STATES:
+        state = "active"
+    now = _now()
+    return {
+        "id": str(payload.get("id") or _new_id("reply-", 10)),
+        "author": str(_first(payload, "author", "actor") or "June"),
+        "content": content,
+        "created_at": str(_first(payload, "created_at", "createdAt") or now),
+        "updated_at": str(_first(payload, "updated_at", "updatedAt") or now),
+        "state": state,
+    }
+
+
+def _comment_record(payload, *, default_author="June", strict=True):
+    if not isinstance(payload, dict):
+        raise ValueError("comment must be an object")
+    quote = str(_first(payload, "quote_text", "quoteText") or "").strip()
+    locator = _first(payload, "source_locator", "sourceLocator") or None
     kind = str(payload.get("kind") or "").strip().lower()
     if kind not in ("overall", "anchored"):
-        kind = "anchored" if quote else "overall"
-    if kind == "anchored" and not quote:
+        kind = "anchored" if quote or locator else "overall"
+    if strict and kind == "anchored" and not quote:
         raise ValueError("quote_text required for anchored comment")
     content = str(payload.get("content") or "").strip()
-    if not content:
+    if strict and not content:
         raise ValueError("comment content required")
+    lifecycle_state = str(_first(payload, "lifecycle_state", "lifecycleState") or "active").strip().lower()
+    if lifecycle_state not in _LIFECYCLE_STATES:
+        lifecycle_state = "active"
+    source = str(payload.get("source") or "").strip()
+    finding_state = str(_first(payload, "finding_state", "findingState") or "").strip().lower()
+    legacy_review_state = str(_first(payload, "review_state", "reviewState") or "").strip().lower()
+    if finding_state not in _FINDING_STATES:
+        finding_state = {
+            "active": "accepted", "pending": "pending", "withdrawn": "withdrawn",
+        }.get(legacy_review_state, "provisional" if source == "ai-review" else "")
+    try:
+        comment_version = int(_first(payload, "comment_version", "commentVersion") or 1)
+    except (TypeError, ValueError):
+        comment_version = 1
+    comment_version = max(1, comment_version)
     now = _now()
     rec = {
         "id": str(payload.get("id") or _new_id("c-", 10)),
         "kind": kind,
-        "author": str(payload.get("author") or payload.get("actor") or default_author),
+        "author": str(_first(payload, "author", "actor") or default_author),
         "content": content,
         "quote_text": quote,
         "section": str(payload.get("section") or ""),
-        "source_locator": payload.get("source_locator") or payload.get("sourceLocator") or None,
-        "anchor_state": str(payload.get("anchor_state") or payload.get("anchorState") or ("overall" if kind == "overall" else "unresolved")),
-        "created_at": str(payload.get("created_at") or payload.get("createdAt") or now),
-        "updated_at": str(payload.get("updated_at") or payload.get("updatedAt") or now),
+        "source_locator": locator,
+        "anchor_state": str(_first(payload, "anchor_state", "anchorState") or ("overall" if kind == "overall" else "unresolved")),
+        "lifecycle_state": lifecycle_state,
+        "comment_version": comment_version,
+        "human_edited": _as_bool(_first(payload, "human_edited", "humanEdited")),
+        "origin_signature": str(_first(payload, "origin_signature", "originSignature") or ("" if source != "ai-review" else _comment_content_hash(content))),
+        "withdrawn_at": str(_first(payload, "withdrawn_at", "withdrawnAt") or ""),
+        "withdrawn_by": str(_first(payload, "withdrawn_by", "withdrawnBy") or ""),
+        "withdraw_reason": str(_first(payload, "withdraw_reason", "withdrawReason") or ""),
+        "replies": [_normalize_reply(item, strict=False) for item in (payload.get("replies") or []) if isinstance(item, dict)],
+        "created_at": str(_first(payload, "created_at", "createdAt") or now),
+        "updated_at": str(_first(payload, "updated_at", "updatedAt") or now),
     }
+    if finding_state:
+        rec["finding_state"] = finding_state
     aliases = {
         "source_key": "sourceKey",
         "finding_id": "findingId",
         "review_session_id": "reviewSessionId",
-        "review_state": "reviewState",
         "conversation_session_id": "conversationSessionId",
         "conversation_message_id": "conversationMessageId",
+        "applied_signature": "appliedSignature",
     }
     for key in ("priority", "source", *aliases):
         value = payload.get(key)
         if value is None and key in aliases:
             value = payload.get(aliases[key])
-        if value:
+        if value not in (None, ""):
             rec[key] = str(value)
     return rec
+
+
+def _comments_rev(comments) -> str:
+    canonical = json.dumps(comments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "comments-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_comment_store(doc_path: str):
+    data = _read_json_file(_comments_path(doc_path), {"comments": []})
+    rows = data.get("comments", []) if isinstance(data, dict) else []
+    comments = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            comments.append(_comment_record(row, strict=False))
+        except (TypeError, ValueError):
+            # A failed migration never blocks legacy display; retain the raw row.
+            comments.append(dict(row))
+    return {"comments": comments, "comments_rev": _comments_rev(comments)}
+
+
+def _load_comments(doc_path: str):
+    return _load_comment_store(doc_path)["comments"]
+
+
+def _save_comments(doc_path: str, comments) -> str:
+    normalized = [_comment_record(item, strict=False) for item in comments]
+    comments_rev = _comments_rev(normalized)
+    _atomic_write_json(_comments_path(doc_path), {
+        "schema_version": "comma-comments-view/v1.1",
+        "comments_rev": comments_rev,
+        "comments": normalized,
+    })
+    comments[:] = normalized
+    return comments_rev
+
+
+def _append_comment_event(doc_path: str, *, comment_id: str, action: str,
+                          actor: str, from_version: int, to_version: int,
+                          content_before="", content_after=""):
+    record = {
+        "event_id": _new_id("ce-", 16),
+        "comment_id": str(comment_id),
+        "action": str(action),
+        "actor": str(actor or "unspecified"),
+        "from_version": int(from_version),
+        "to_version": int(to_version),
+        "content_before_hash": _comment_content_hash(content_before),
+        "content_after_hash": _comment_content_hash(content_after),
+        "at": _now(),
+    }
+    path = _comment_events_path(doc_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return record
+
+
+def _load_comment_events(doc_path: str, comment_id=""):
+    path = _comment_events_path(doc_path)
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and (not comment_id or item.get("comment_id") == comment_id):
+                rows.append(item)
+    return rows
+
+
+def _comment_by_id(comments, comment_id: str):
+    if not _COMMENT_ID_RE.fullmatch(str(comment_id or "")):
+        raise ValueError("invalid comment id")
+    comment = next((item for item in comments if item.get("id") == comment_id), None)
+    if not comment:
+        raise ValueError("comment not found")
+    return comment
+
+
+def _require_comment_version(payload, comment, comments_rev):
+    supplied = _first(payload, "base_comment_version", "baseCommentVersion")
+    try:
+        supplied = int(supplied)
+    except (TypeError, ValueError):
+        supplied = -1
+    if supplied != int(comment.get("comment_version") or 1):
+        raise CommentVersionConflictError(dict(comment), comments_rev)
+
+
+def _reply_by_id(comment, reply_id: str):
+    if not _COMMENT_ID_RE.fullmatch(str(reply_id or "")):
+        raise ValueError("invalid reply id")
+    reply = next((item for item in comment.get("replies") or [] if item.get("id") == reply_id), None)
+    if not reply:
+        raise ValueError("reply not found")
+    return reply
+
+
+def _purge_comment(doc_path: str, comment_id: str):
+    """Maintenance-only physical removal; normal routes always withdraw."""
+    comments = _load_comments(doc_path)
+    _comment_by_id(comments, comment_id)
+    kept = [item for item in comments if item.get("id") != comment_id]
+    return _save_comments(doc_path, kept)
+
+
+def migrate_slice_a_data(data_root: str, *, apply=False):
+    """Normalize legacy comment sidecars without reading manuscript bodies."""
+    root = os.path.realpath(os.path.expanduser(str(data_root or "")))
+    if not os.path.isdir(root):
+        raise ValueError("data root not found")
+    sidecars = []
+    for current_root, dirs, names in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in {".comma-review", "__pycache__"}]
+        for name in names:
+            if name.endswith(".comments.json"):
+                sidecars.append(os.path.join(current_root, name))
+    session_root = os.path.join(root, "review-sessions")
+    session_paths = [
+        os.path.join(session_root, name) for name in sorted(os.listdir(session_root))
+        if name.endswith(".json")
+    ] if os.path.isdir(session_root) else []
+
+    prepared = []
+    comment_count_before = 0
+    comment_count_after = 0
+    kind_null_before = 0
+    kind_counts_after = {"anchored": 0, "overall": 0}
+    before_finding_ids, after_finding_ids = [], []
+    before_source_keys, after_source_keys = [], []
+    before_fields, after_fields = set(), set()
+    for path in sorted(sidecars):
+        raw_data = _read_json_file(path, None)
+        if not isinstance(raw_data, dict) or not isinstance(raw_data.get("comments"), list):
+            raise ValueError("invalid comments sidecar")
+        raw_comments = raw_data["comments"]
+        normalized = []
+        for raw in raw_comments:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid comment record")
+            before_fields.update(raw.keys())
+            kind_null_before += int(raw.get("kind") is None)
+            if raw.get("finding_id"):
+                before_finding_ids.append(str(raw["finding_id"]))
+            if raw.get("source_key"):
+                before_source_keys.append(str(raw["source_key"]))
+            record = _comment_record(raw, strict=False)
+            normalized.append(record)
+            after_fields.update(record.keys())
+            kind_counts_after[record["kind"]] = kind_counts_after.get(record["kind"], 0) + 1
+            if record.get("finding_id"):
+                after_finding_ids.append(str(record["finding_id"]))
+            if record.get("source_key"):
+                after_source_keys.append(str(record["source_key"]))
+        comment_count_before += len(raw_comments)
+        comment_count_after += len(normalized)
+        needs_rewrite = (
+            raw_data.get("schema_version") != "comma-comments-view/v1.1"
+            or raw_data.get("comments_rev") != _comments_rev(normalized)
+            or raw_comments != normalized
+        )
+        prepared.append((path, normalized, needs_rewrite))
+
+    sessions = []
+    session_fields = set()
+    for path in session_paths:
+        data = _read_json_file(path, None)
+        if not isinstance(data, dict):
+            raise ValueError("invalid review session")
+        session_fields.update(data.keys())
+        sessions.append(data)
+
+    if comment_count_before != comment_count_after:
+        raise ValueError("comment count changed during migration")
+    finding_ids_preserved = sorted(before_finding_ids) == sorted(after_finding_ids)
+    source_keys_preserved = sorted(before_source_keys) == sorted(after_source_keys)
+    if not finding_ids_preserved or not source_keys_preserved:
+        raise ValueError("finding identity changed during migration")
+
+    rewritten = sum(1 for _, _, needs_rewrite in prepared if needs_rewrite)
+    backup_created = False
+    if apply and rewritten:
+        backup_root = os.path.join(
+            root, ".comma-review", "migration-backups",
+            time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8],
+        )
+        originals = []
+        backup_targets = []
+        created_paths = []
+        for path, _, needs_rewrite in prepared:
+            if not needs_rewrite:
+                continue
+            originals.append(path)
+            ledger = path[:-len(".comments.json")] + ".comment-events.jsonl"
+            if os.path.exists(ledger):
+                originals.append(ledger)
+        originals.extend(session_paths)
+        try:
+            for original in originals:
+                relative = os.path.relpath(original, root)
+                backup = os.path.join(backup_root, relative)
+                os.makedirs(os.path.dirname(backup), exist_ok=True)
+                shutil.copyfile(original, backup)
+                with open(original, "rb") as source, open(backup, "rb") as copied:
+                    if source.read() != copied.read():
+                        raise ValueError("migration backup verification failed")
+                backup_targets.append((original, backup))
+            backup_created = True
+            for path, normalized, needs_rewrite in prepared:
+                if not needs_rewrite:
+                    continue
+                comments_rev = _comments_rev(normalized)
+                _atomic_write_json(path, {
+                    "schema_version": "comma-comments-view/v1.1",
+                    "comments_rev": comments_rev,
+                    "comments": normalized,
+                })
+                ledger_path = path[:-len(".comments.json")] + ".comment-events.jsonl"
+                existing = ""
+                if os.path.exists(ledger_path):
+                    with open(ledger_path, encoding="utf-8") as fh:
+                        existing = fh.read()
+                else:
+                    created_paths.append(ledger_path)
+                migration_lines = []
+                for comment in normalized:
+                    event = {
+                        "event_id": _new_id("ce-", 16),
+                        "comment_id": comment["id"],
+                        "action": "migrate",
+                        "actor": "migration",
+                        "from_version": 0,
+                        "to_version": comment["comment_version"],
+                        "content_before_hash": _comment_content_hash(comment.get("content")),
+                        "content_after_hash": _comment_content_hash(comment.get("content")),
+                        "at": _now(),
+                    }
+                    migration_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                _atomic_write(ledger_path, existing + "".join(migration_lines))
+        except Exception:
+            for original, backup in reversed(backup_targets):
+                os.makedirs(os.path.dirname(original), exist_ok=True)
+                shutil.copyfile(backup, original)
+            for created in created_paths:
+                if os.path.exists(created):
+                    os.remove(created)
+            raise
+
+    return {
+        "ok": True,
+        "dry_run": not apply,
+        "sidecars": len(sidecars),
+        "comments_before": comment_count_before,
+        "comments_after": comment_count_after,
+        "sessions_before": len(session_paths),
+        "sessions_after": len(sessions),
+        "kind_null_before": kind_null_before,
+        "kind_anchored_after": kind_counts_after.get("anchored", 0),
+        "kind_overall_after": kind_counts_after.get("overall", 0),
+        "finding_ids_before": len(before_finding_ids),
+        "finding_ids_after": len(after_finding_ids),
+        "finding_ids_preserved": finding_ids_preserved,
+        "source_keys_before": len(before_source_keys),
+        "source_keys_after": len(after_source_keys),
+        "source_keys_preserved": source_keys_preserved,
+        "comment_fields_before": sorted(before_fields),
+        "comment_fields_after": sorted(after_fields),
+        "session_fields": sorted(session_fields),
+        "sidecars_requiring_rewrite": rewritten,
+        "backup_created": backup_created,
+    }
 
 
 def _now() -> str:
@@ -857,6 +1214,8 @@ def _load_session(session_id: str):
         data = json.load(fh)
     if not isinstance(data, dict):
         raise ValueError("invalid review session")
+    if data.get("status") == "ready":
+        data["status"] = "preview"
     return data
 
 
@@ -882,7 +1241,7 @@ def _session_summaries(doc_rel: str):
             findings = session.get("findings") or []
             rows.append({
                 "id": session.get("id"),
-                "status": session.get("status"),
+                "status": "preview" if session.get("status") == "ready" else session.get("status"),
                 "tool": session.get("tool"),
                 "created_at": session.get("created_at"),
                 "updated_at": session.get("updated_at"),
@@ -1177,6 +1536,7 @@ def _writeback_session(session, doc_path: str, finding_ids=None, actor="AI Revie
     comments = _load_comments(doc_path)
     by_source = {c.get("source_key"): c for c in comments if c.get("source_key")}
     created, updated, skipped, blocked = [], [], [], []
+    pending_events = []
     now = _now()
     for finding in session["findings"]:
         fid = finding.get("id")
@@ -1187,15 +1547,22 @@ def _writeback_session(session, doc_path: str, finding_ids=None, actor="AI Revie
         existing = by_source.get(source_key)
         decision = finding.get("decision")
         if decision != "accepted":
-            review_state = "withdrawn" if decision == "rejected" else "pending"
-            if existing and (existing.get("review_state") != review_state
+            finding_state = "withdrawn" if decision == "rejected" else "pending"
+            if existing and (existing.get("finding_state") != finding_state
                              or finding.get("applied_signature") != signature):
-                existing["review_state"] = review_state
+                from_version = int(existing.get("comment_version") or 1)
+                existing["finding_state"] = finding_state
                 existing["updated_at"] = now
+                existing["comment_version"] = from_version + 1
                 finding["applied_comment_id"] = existing["id"]
                 finding["applied_signature"] = signature
                 updated.append({"finding_id": fid, "comment_id": existing["id"],
-                                "action": review_state})
+                                "action": finding_state})
+                pending_events.append({
+                    "comment_id": existing["id"], "action": "finding-update",
+                    "from_version": from_version, "to_version": existing["comment_version"],
+                    "content_before": existing.get("content"), "content_after": existing.get("content"),
+                })
             else:
                 skipped.append({"finding_id": fid, "reason": "not accepted"})
             continue
@@ -1207,41 +1574,57 @@ def _writeback_session(session, doc_path: str, finding_ids=None, actor="AI Revie
             skipped.append({"finding_id": fid, "comment_id": existing.get("id"), "reason": "unchanged"})
             continue
         if existing:
+            if existing.get("human_edited") and existing.get("content") != content:
+                blocked.append({"finding_id": fid, "comment_id": existing["id"],
+                                "reason": "human-edited comment requires explicit operation acceptance"})
+                continue
+            before = existing.get("content") or ""
+            from_version = int(existing.get("comment_version") or 1)
             existing.update({
                 "content": content,
                 "quote_text": finding["quote_text"],
                 "section": finding.get("section") or "",
                 "source_locator": finding.get("source_locator") or {},
                 "priority": finding.get("priority") or "P2",
-                "review_state": "active",
                 "updated_at": now,
+                "comment_version": from_version + 1,
             })
+            if existing.get("finding_state") in ("pending", "withdrawn"):
+                existing["finding_state"] = "accepted"
             comment = existing
             updated.append({"finding_id": fid, "comment_id": comment["id"]})
+            pending_events.append({
+                "comment_id": comment["id"], "action": "edit",
+                "from_version": from_version, "to_version": comment["comment_version"],
+                "content_before": before, "content_after": content,
+            })
         else:
-            comment = {
-                "id": _new_id("c-", 10),
-                "author": actor,
-                "content": content,
-                "quote_text": finding["quote_text"],
-                "section": finding.get("section") or "",
+            comment = _comment_record({
+                "id": _new_id("c-", 10), "kind": "anchored",
+                "author": actor, "content": content,
+                "quote_text": finding["quote_text"], "section": finding.get("section") or "",
                 "source_locator": finding.get("source_locator") or {},
-                "priority": finding.get("priority") or "P2",
-                "source": "ai-review",
-                "review_state": "active",
-                "source_key": source_key,
-                "finding_id": fid,
-                "review_session_id": session["id"],
-                "created_at": now,
-                "updated_at": now,
-            }
+                "priority": finding.get("priority") or "P2", "source": "ai-review",
+                "finding_state": "provisional", "source_key": source_key,
+                "finding_id": fid, "review_session_id": session["id"],
+                "origin_signature": _comment_content_hash(content),
+                "created_at": now, "updated_at": now,
+            })
             comments.append(comment)
             by_source[source_key] = comment
             created.append({"finding_id": fid, "comment_id": comment["id"]})
+            pending_events.append({
+                "comment_id": comment["id"], "action": "create",
+                "from_version": 0, "to_version": comment["comment_version"],
+                "content_before": "", "content_after": content,
+            })
         finding["applied_comment_id"] = comment["id"]
         finding["applied_signature"] = signature
+    comments_rev = _comments_rev(comments)
     if created or updated:
-        _save_comments(doc_path, comments)
+        comments_rev = _save_comments(doc_path, comments)
+        for item in pending_events:
+            _append_comment_event(doc_path, actor=actor, **item)
     receipt = {
         "id": _new_id("write-", 10), "at": now, "document_rev": current_rev,
         "created": created, "updated": updated, "skipped": skipped, "blocked": blocked,
@@ -1250,7 +1633,7 @@ def _writeback_session(session, doc_path: str, finding_ids=None, actor="AI Revie
     session["status"] = "completed" if not blocked else "needs_attention"
     _append_event(actor, "review-writeback", doc_path,
                   f"{session['id']}: +{len(created)} ~{len(updated)} blocked={len(blocked)}")
-    return {"ok": True, **receipt, "comments": comments}
+    return {"ok": True, **receipt, "comments": comments, "comments_rev": comments_rev}
 
 
 def _initial_review_prompt(body: str, doc_rel: str, body_rev: str, rubric: str, instruction: str) -> str:
@@ -1603,7 +1986,17 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if route == "/api/comments":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
-                return self._send_json({"ok": True, "comments": _load_comments(doc)})
+                store = _load_comment_store(doc)
+                return self._send_json({"ok": True, **store})
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/events$", route)
+            if match:
+                doc = _safe_doc_path((qs.get("path") or [""])[0])
+                comment_id = match.group(1)
+                _comment_by_id(_load_comments(doc), comment_id)
+                return self._send_json({
+                    "ok": True, "comment_id": comment_id,
+                    "events": _load_comment_events(doc, comment_id),
+                })
             if route == "/api/review-sessions":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 doc_rel = os.path.relpath(doc, DATA_ROOT)
@@ -1637,6 +2030,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         return self._mutate("DELETE")
 
+    def do_PATCH(self):
+        return self._mutate("PATCH")
+
     def _mutate(self, method):
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
@@ -1660,6 +2056,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._delete_comment(payload)
             if route == "/api/comments/batch" and method == "POST":
                 return self._create_comment_batch(payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})$", route)
+            if match and method in ("PATCH", "DELETE"):
+                if method == "PATCH":
+                    return self._edit_comment_item(match.group(1), payload)
+                return self._withdraw_comment_item(match.group(1), payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/restore$", route)
+            if match and method == "POST":
+                return self._restore_comment_item(match.group(1), payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/replies$", route)
+            if match and method == "POST":
+                return self._create_comment_reply(match.group(1), payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/replies/([A-Za-z0-9_.:-]{1,160})$", route)
+            if match and method in ("PATCH", "DELETE"):
+                if method == "PATCH":
+                    return self._edit_comment_reply(match.group(1), match.group(2), payload)
+                return self._withdraw_comment_reply(match.group(1), match.group(2), payload)
             if route == "/api/ai-run" and method == "POST":
                 return self._ai_run(payload)
             if route == "/api/review-sessions" and method == "POST":
@@ -1692,6 +2104,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._comment_on_conversation(match.group(1), payload)
                 return self._writeback_conversation(match.group(1), payload)
             return self._send_json({"ok": False, "error": "unknown route"}, 404)
+        except CommentVersionConflictError as e:
+            return self._send_json({
+                "ok": False,
+                "code": "comment_version_conflict",
+                "message": str(e),
+                "current_comment": e.current_comment,
+                "comments_rev": e.comments_rev,
+            }, 409)
         except CliUnavailableError as e:
             return self._send_json({"ok": False, "error": str(e), "code": "cli_unavailable"}, 503)
         except ValueError as e:
@@ -1827,10 +2247,18 @@ class Handler(BaseHTTPRequestHandler):
             comments = _load_comments(doc)
             rec = _comment_record(payload)
             comments.append(rec)
-            _save_comments(doc, comments)
-        _append_event(rec["author"], "add-comment", doc,
-                      f"anchor '{rec['quote_text'][:40]}' -> {rec['content'][:40]}")
-        return self._send_json({"ok": True, "comment": rec, "comments": comments})
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=rec["id"], action="create", actor=rec["author"],
+                from_version=0, to_version=rec["comment_version"],
+                content_before="", content_after=rec["content"],
+            )
+        _append_event(rec["author"], "add-comment", doc, rec["id"])
+        return self._send_json({
+            "ok": True, "comment": rec, "comments": comments,
+            "comment_version": rec["comment_version"],
+            "comments_rev": comments_rev, "event": event,
+        })
 
     def _create_comment_batch(self, payload):
         doc = _safe_doc_path(payload.get("path"))
@@ -1849,7 +2277,7 @@ class Handler(BaseHTTPRequestHandler):
             }, 409)
         actor = str(payload.get("actor") or "AI Reviewer")
         source = str(payload.get("source") or "ai-review")
-        created = []
+        created, events = [], []
         with _MUTATION_LOCK:
             comments = _load_comments(doc)
             for row in rows:
@@ -1858,36 +2286,190 @@ class Handler(BaseHTTPRequestHandler):
                 rec = _comment_record({**row, "actor": row.get("actor") or actor, "source": row.get("source") or source})
                 comments.append(rec)
                 created.append(rec)
-            _save_comments(doc, comments)
+            comments_rev = _save_comments(doc, comments)
+            for rec in created:
+                events.append(_append_comment_event(
+                    doc, comment_id=rec["id"], action="create", actor=rec["author"],
+                    from_version=0, to_version=rec["comment_version"],
+                    content_before="", content_after=rec["content"],
+                ))
         _append_event(actor, "add-comment-batch", doc, f"{len(created)} comments from {source}")
-        return self._send_json({"ok": True, "comments": created, "rev": current_rev})
+        return self._send_json({
+            "ok": True, "comments": created, "rev": current_rev,
+            "comments_rev": comments_rev, "events": events,
+        })
 
     def _edit_comment(self, payload):
-        doc = _safe_doc_path(payload.get("path"))
-        cid = str(payload.get("id") or "")
-        content = str(payload.get("content") or "")
-        comments = _load_comments(doc)
-        changed = False
-        for c in comments:
-            if c.get("id") == cid:
-                changed = c.get("content") != content
-                c["content"] = content
-                c["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-                break
-        else:
-            raise ValueError("comment not found")
-        _save_comments(doc, comments)
-        _append_event("June", "edit-comment", doc, f"{cid}: {content[:40]}")
-        return self._send_json({"ok": True, "changed": changed, "comments": comments})
+        return self._edit_comment_item(str(payload.get("id") or ""), payload)
 
     def _delete_comment(self, payload):
+        return self._withdraw_comment_item(str(payload.get("id") or ""), payload)
+
+    def _edit_comment_item(self, comment_id, payload):
         doc = _safe_doc_path(payload.get("path"))
-        cid = str(payload.get("id") or "")
-        comments = _load_comments(doc)
-        kept = [c for c in comments if c.get("id") != cid]
-        _save_comments(doc, kept)
-        _append_event("June", "delete-comment", doc, cid)
-        return self._send_json({"ok": True, "comments": kept})
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise ValueError("comment content required")
+        actor = str(payload.get("actor") or "June")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            before = comment.get("content") or ""
+            from_version = int(comment.get("comment_version") or 1)
+            comment["content"] = content
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            if comment.get("source") in ("ai-review", "selection-conversation"):
+                comment["human_edited"] = True
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="edit", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before=before, content_after=content,
+            )
+        _append_event(actor, "edit-comment", doc, comment_id)
+        return self._send_comment_mutation(comment, comments_rev, event)
+
+    def _withdraw_comment_item(self, comment_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            if comment.get("lifecycle_state") == "withdrawn":
+                raise ValueError("comment is already withdrawn")
+            from_version = int(comment.get("comment_version") or 1)
+            comment["lifecycle_state"] = "withdrawn"
+            comment["withdrawn_at"] = _now()
+            comment["withdrawn_by"] = actor
+            comment["withdraw_reason"] = str(payload.get("reason") or "").strip()[:1000]
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="withdraw", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before=comment.get("content"), content_after=comment.get("content"),
+            )
+        _append_event(actor, "withdraw-comment", doc, comment_id)
+        return self._send_comment_mutation(comment, comments_rev, event)
+
+    def _restore_comment_item(self, comment_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            if comment.get("lifecycle_state") != "withdrawn":
+                raise ValueError("comment is not withdrawn")
+            from_version = int(comment.get("comment_version") or 1)
+            comment["lifecycle_state"] = "active"
+            comment["withdrawn_at"] = ""
+            comment["withdrawn_by"] = ""
+            comment["withdraw_reason"] = ""
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="restore", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before=comment.get("content"), content_after=comment.get("content"),
+            )
+        _append_event(actor, "restore-comment", doc, comment_id)
+        return self._send_comment_mutation(comment, comments_rev, event)
+
+    def _create_comment_reply(self, comment_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            if comment.get("lifecycle_state") == "withdrawn":
+                raise ValueError("cannot reply to a withdrawn comment")
+            reply = _normalize_reply({"author": actor, "content": payload.get("content")}, strict=True)
+            from_version = int(comment.get("comment_version") or 1)
+            comment.setdefault("replies", []).append(reply)
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="reply", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before="", content_after=reply["content"],
+            )
+        _append_event(actor, "reply-comment", doc, f"{comment_id}:{reply['id']}")
+        return self._send_comment_mutation(comment, comments_rev, event, reply=reply)
+
+    def _edit_comment_reply(self, comment_id, reply_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise ValueError("reply content required")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            reply = _reply_by_id(comment, reply_id)
+            if reply.get("state") == "withdrawn":
+                raise ValueError("reply is withdrawn")
+            before = reply.get("content") or ""
+            from_version = int(comment.get("comment_version") or 1)
+            reply["content"] = content
+            reply["updated_at"] = _now()
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="reply-edit", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before=before, content_after=content,
+            )
+        _append_event(actor, "edit-comment-reply", doc, f"{comment_id}:{reply_id}")
+        return self._send_comment_mutation(comment, comments_rev, event, reply=reply)
+
+    def _withdraw_comment_reply(self, comment_id, reply_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        actor = str(payload.get("actor") or "June")
+        with _MUTATION_LOCK:
+            store = _load_comment_store(doc)
+            comments = store["comments"]
+            comment = _comment_by_id(comments, comment_id)
+            _require_comment_version(payload, comment, store["comments_rev"])
+            reply = _reply_by_id(comment, reply_id)
+            if reply.get("state") == "withdrawn":
+                raise ValueError("reply is already withdrawn")
+            from_version = int(comment.get("comment_version") or 1)
+            reply["state"] = "withdrawn"
+            reply["updated_at"] = _now()
+            comment["updated_at"] = _now()
+            comment["comment_version"] = from_version + 1
+            comments_rev = _save_comments(doc, comments)
+            event = _append_comment_event(
+                doc, comment_id=comment_id, action="reply-withdraw", actor=actor,
+                from_version=from_version, to_version=comment["comment_version"],
+                content_before=reply.get("content"), content_after=reply.get("content"),
+            )
+        _append_event(actor, "withdraw-comment-reply", doc, f"{comment_id}:{reply_id}")
+        return self._send_comment_mutation(comment, comments_rev, event, reply=reply)
+
+    def _send_comment_mutation(self, comment, comments_rev, event, **extra):
+        return self._send_json({
+            "ok": True, "comment": comment,
+            "comment_version": comment.get("comment_version"),
+            "comments_rev": comments_rev,
+            "event": event,
+            **extra,
+        })
 
     def _start_review(self, payload):
         doc = _safe_doc_path(payload.get("path"))
@@ -2267,10 +2849,16 @@ class Handler(BaseHTTPRequestHandler):
             comments = _load_comments(doc)
             existing = next((item for item in comments if item.get("source_key") == source_key), None)
             action = "skipped"
+            event = None
             if existing:
                 if existing.get("content") != content:
+                    if existing.get("human_edited"):
+                        raise ValueError("human-edited comment requires explicit confirmation before overwrite")
+                    before = existing.get("content") or ""
+                    from_version = int(existing.get("comment_version") or 1)
                     existing["content"] = content
                     existing["updated_at"] = _now()
+                    existing["comment_version"] = from_version + 1
                     action = "updated"
                 comment = existing
             else:
@@ -2285,7 +2873,17 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 comments.append(comment)
                 action = "created"
-            _save_comments(doc, comments)
+            comments_rev = _comments_rev(comments)
+            if action != "skipped":
+                comments_rev = _save_comments(doc, comments)
+                event = _append_comment_event(
+                    doc, comment_id=comment["id"], action="create" if action == "created" else "edit",
+                    actor=session.get("tool") or "AI Reviewer",
+                    from_version=0 if action == "created" else from_version,
+                    to_version=comment.get("comment_version") or 1,
+                    content_before="" if action == "created" else before,
+                    content_after=content,
+                )
             message["writeback_comment_id"] = comment["id"]
             receipt = {
                 "id": _new_id("receipt-", 10), "message_id": message_id,
@@ -2299,6 +2897,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({
             "ok": True, "session": session, "comment": comment,
             "receipt": receipt, "action": action,
+            "comments_rev": comments_rev, "event": event,
         })
 
 

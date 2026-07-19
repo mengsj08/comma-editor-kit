@@ -71,6 +71,8 @@ The component dispatches host-level events instead of binding to a particular AI
 - `comma-comment-batch-create`
 - `comma-ai-request`
 - `comma-selection-action`
+- `comma-toolbar-action`
+- `comma-comment-action`
 
 Hosts can replace the default one-shot selection action without putting a
 provider inside the component:
@@ -89,6 +91,22 @@ editor.addEventListener('comma-selection-action', (event) => {
 
 The native `Add note` action remains editor-owned. Host actions receive the
 same quote snapshot and stable locator but cannot silently mutate Markdown.
+
+Header and per-comment commands are also host-declared. The component filters
+them against adapter capabilities and emits composed events; labels and
+provider behavior stay in the host:
+
+```js
+editor.toolbarActions = [
+  { id: 'document-info', label: 'Document info', slot: 'primary', appliesTo: 'document.load' },
+  { id: 'comments', label: 'Comments', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
+];
+editor.commentActions = [
+  { id: 'edit', label: 'Edit', appliesTo: { capability: 'update', target: 'comment' } },
+];
+```
+
+A document-only adapter renders neither comment actions nor a comment count.
 
 Rendered Markdown stays in reading mode during clicks and drag selections.
 Writable hosts expose an explicit per-block `Edit block` affordance instead of

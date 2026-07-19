@@ -32,7 +32,8 @@ newest disk revision and offers diff, revision-checked recovery, or dismissal.
 The export center provides exact Markdown, Markdown with appended review
 comments, and a Review Package ZIP containing the selected manuscript,
 document-relative image assets, native comments, matching review/conversation
-ledgers, and version snapshots. The global event ledger and raw AI traces are
+ledgers, the per-document hash-only `CommentEvent` ledger, and version
+snapshots. The global event ledger and raw AI traces are
 excluded. DOCX and PDF use a detected local LibreOffice executable; set
 `COMMA_REVIEW_SOFFICE_BIN=/absolute/path/to/soffice` when auto-detection is not
 appropriate.
@@ -58,6 +59,21 @@ python3 server.py
 Capability detection runs only `--version` and read-only login-status commands;
 their authentication output is discarded and page load never starts a model
 task.
+
+## Comment lifecycle migration
+
+Legacy comment sidecars remain readable without a write. Inspect a copied data
+root with the Slice A migration in dry-run mode:
+
+```bash
+python3 migrate_slice_a.py --data-root /absolute/path/to/copied-data
+```
+
+`--apply` is reserved for an explicitly authorized migration. It verifies all
+records first and creates byte-identical sidecar/session backups under
+`.comma-review/migration-backups/` before the first normalized write. The
+command reports counts and field names only; it does not print comment or
+manuscript content.
 
 ## Verify
 

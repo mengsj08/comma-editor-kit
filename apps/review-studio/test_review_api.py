@@ -117,6 +117,13 @@ class ReviewApiTests(unittest.TestCase):
         self.assertIn('id="cli-redetect"', html)
         self.assertIn("/api/runtime/capabilities", script)
         self.assertIn("requireRuntimeTool(tool, 'quick_explain')", script)
+        self.assertIn("文章总览", script)
+        self.assertIn("源码编辑", script)
+        self.assertIn("全文批注", script)
+        self.assertIn('id="overview-drawer"', html)
+        self.assertIn("未读取图片或图表像素", html)
+        self.assertIn("未获取或全文核验所引用的文献", html)
+        self.assertIn("未重新计算统计结果", html)
         self.assertNotIn("json.stub", script)
 
     def test_runtime_capabilities_report_provider_readiness(self):
@@ -263,6 +270,162 @@ class ReviewApiTests(unittest.TestCase):
                     httpd.shutdown()
                     httpd.server_close()
                     thread.join(timeout=2)
+
+    def test_comment_item_lifecycle_versions_replies_and_append_only_ledger(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            body = "# Controlled manuscript\n\nA synthetic sentence.\n"
+            doc_path = os.path.join(tmp, "paper.md")
+            with open(doc_path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")):
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    created = self._request(base + "/api/comments?path=paper.md", "POST", {
+                        "kind": "anchored", "actor": "AI Reviewer", "source": "ai-review",
+                        "quote_text": "A synthetic sentence.", "content": "Initial synthetic finding.",
+                    })
+                    comment_id = created["comment"]["id"]
+                    self.assertEqual(created["comment_version"], 1)
+                    self.assertEqual(created["comment"]["finding_state"], "provisional")
+                    first_comments_rev = created["comments_rev"]
+
+                    edited = self._request(base + f"/api/comments/{comment_id}?path=paper.md", "PATCH", {
+                        "base_comment_version": 1, "actor": "June", "content": "Human-edited synthetic finding.",
+                    })
+                    self.assertEqual(edited["comment_version"], 2)
+                    self.assertTrue(edited["comment"]["human_edited"])
+                    self.assertNotEqual(edited["comments_rev"], first_comments_rev)
+
+                    status, stale = self._request_error(
+                        base + f"/api/comments/{comment_id}?path=paper.md", "PATCH",
+                        {"base_comment_version": 1, "actor": "Stale", "content": "Must not win."},
+                    )
+                    self.assertEqual(status, 409)
+                    self.assertEqual(stale["code"], "comment_version_conflict")
+                    self.assertEqual(stale["current_comment"]["comment_version"], 2)
+
+                    replied = self._request(base + f"/api/comments/{comment_id}/replies?path=paper.md", "POST", {
+                        "base_comment_version": 2, "actor": "June", "content": "Synthetic reply.",
+                    })
+                    reply_id = replied["reply"]["id"]
+                    self.assertEqual(replied["comment_version"], 3)
+                    self.assertEqual(len(replied["comment"]["replies"]), 1)
+
+                    reply_edited = self._request(
+                        base + f"/api/comments/{comment_id}/replies/{reply_id}?path=paper.md", "PATCH",
+                        {"base_comment_version": 3, "actor": "June", "content": "Edited synthetic reply."},
+                    )
+                    self.assertEqual(reply_edited["comment_version"], 4)
+                    reply_withdrawn = self._request(
+                        base + f"/api/comments/{comment_id}/replies/{reply_id}?path=paper.md", "DELETE",
+                        {"base_comment_version": 4, "actor": "June"},
+                    )
+                    self.assertEqual(reply_withdrawn["reply"]["state"], "withdrawn")
+
+                    withdrawn = self._request(base + f"/api/comments/{comment_id}?path=paper.md", "DELETE", {
+                        "base_comment_version": 5, "actor": "June", "reason": "Superseded locally",
+                    })
+                    self.assertEqual(withdrawn["comment"]["lifecycle_state"], "withdrawn")
+                    restored = self._request(base + f"/api/comments/{comment_id}/restore?path=paper.md", "POST", {
+                        "base_comment_version": 6, "actor": "June",
+                    })
+                    self.assertEqual(restored["comment"]["id"], comment_id)
+                    self.assertEqual(restored["comment"]["lifecycle_state"], "active")
+                    self.assertEqual(restored["comment_version"], 7)
+
+                    listed = self._request(base + "/api/comments?path=paper.md")
+                    self.assertEqual(len(listed["comments"]), 1)
+                    self.assertEqual(listed["comments_rev"], restored["comments_rev"])
+                    history = self._request(base + f"/api/comments/{comment_id}/events?path=paper.md")
+                    self.assertEqual(
+                        [item["action"] for item in history["events"]],
+                        ["create", "edit", "reply", "reply-edit", "reply-withdraw", "withdraw", "restore"],
+                    )
+                    self.assertTrue(all("content" not in item for item in history["events"]))
+                    with open(server._comment_events_path(doc_path), encoding="utf-8") as fh:
+                        ledger_text = fh.read()
+                    self.assertNotIn("A synthetic sentence.", ledger_text)
+                    self.assertNotIn("Human-edited synthetic finding.", ledger_text)
+                    self.assertEqual(len(ledger_text.splitlines()), 7)
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
+    def test_slice_a_migration_is_lossless_idempotent_and_legacy_readable(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            sidecar = os.path.join(tmp, "paper.md.comments.json")
+            legacy = {
+                "comments": [
+                    {
+                        "id": "c-ai", "kind": None, "author": "AI Reviewer",
+                        "content": "Synthetic anchored finding.", "quote_text": "Exact synthetic quote.",
+                        "source_locator": {"text_index": 12}, "source": "ai-review",
+                        "review_state": "active", "finding_id": "F001",
+                        "source_key": "review-fixture:F001",
+                    },
+                    {
+                        "id": "c-overall", "kind": None, "author": "Assistant",
+                        "content": "Synthetic overall note.", "quote_text": "",
+                        "source": "selection-conversation", "source_key": "conversation:fixture:m1",
+                    },
+                ],
+            }
+            with open(sidecar, "w", encoding="utf-8") as fh:
+                json.dump(legacy, fh, ensure_ascii=False)
+            session_root = os.path.join(tmp, "review-sessions")
+            os.makedirs(session_root)
+            for index, status in enumerate(("ready", "failed"), 1):
+                with open(os.path.join(session_root, f"review-{index:012x}.json"), "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "id": f"review-{index:012x}", "doc_path": "paper.md",
+                        "status": status, "findings": [],
+                    }, fh)
+            with open(sidecar, "rb") as fh:
+                original = fh.read()
+
+            dry_run = server.migrate_slice_a_data(tmp, apply=False)
+            self.assertEqual((dry_run["comments_before"], dry_run["comments_after"]), (2, 2))
+            self.assertEqual((dry_run["sessions_before"], dry_run["sessions_after"]), (2, 2))
+            self.assertEqual(dry_run["kind_null_before"], 2)
+            self.assertEqual((dry_run["kind_anchored_after"], dry_run["kind_overall_after"]), (1, 1))
+            self.assertTrue(dry_run["finding_ids_preserved"])
+            self.assertTrue(dry_run["source_keys_preserved"])
+            with open(sidecar, "rb") as fh:
+                self.assertEqual(fh.read(), original)
+
+            applied = server.migrate_slice_a_data(tmp, apply=True)
+            self.assertTrue(applied["backup_created"])
+            migrated = server._read_json_file(sidecar, {})
+            self.assertEqual(migrated["schema_version"], "comma-comments-view/v1.1")
+            self.assertEqual(migrated["comments"][0]["finding_state"], "accepted")
+            self.assertEqual(migrated["comments"][0]["lifecycle_state"], "active")
+            self.assertEqual(migrated["comments"][1]["kind"], "overall")
+            ledger = server._load_comment_events(os.path.join(tmp, "paper.md"))
+            self.assertEqual([item["action"] for item in ledger], ["migrate", "migrate"])
+            self.assertTrue(all("content" not in item for item in ledger))
+            repeated = server.migrate_slice_a_data(tmp, apply=True)
+            self.assertEqual(repeated["sidecars_requiring_rewrite"], 0)
+            self.assertFalse(repeated["backup_created"])
+
+            with tempfile.TemporaryDirectory() as failure_tmp:
+                failed_sidecar = os.path.join(failure_tmp, "paper.md.comments.json")
+                with open(failed_sidecar, "wb") as fh:
+                    fh.write(original)
+                with mock.patch.object(server, "_atomic_write_json", side_effect=OSError("controlled failure")):
+                    with self.assertRaises(OSError):
+                        server.migrate_slice_a_data(failure_tmp, apply=True)
+                with open(failed_sidecar, "rb") as fh:
+                    self.assertEqual(fh.read(), original)
+                fallback = server._load_comments(os.path.join(failure_tmp, "paper.md"))
+                self.assertEqual(len(fallback), 2)
+                self.assertEqual(fallback[0]["finding_state"], "accepted")
 
     def test_review_discussion_and_incremental_writeback(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
