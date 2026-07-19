@@ -26,7 +26,9 @@ function scoreMatch(body, quote, index, locator = {}) {
   return score;
 }
 
-export function createSourceLocator(body, quote, { rev = '', blockIndex = -1, blockStart = -1, blockEnd = -1 } = {}) {
+export function createSourceLocator(body, quote, {
+  rev = '', blockIndex = -1, endBlockIndex = blockIndex, blockStart = -1, blockEnd = -1,
+} = {}) {
   const source = String(body || '');
   const quoteText = String(quote || '').trim();
   const matches = findQuoteMatches(source, quoteText);
@@ -40,6 +42,7 @@ export function createSourceLocator(body, quote, { rev = '', blockIndex = -1, bl
     bodyRev: String(rev || ''),
     textIndex,
     blockIndex: Number.isInteger(blockIndex) ? blockIndex : -1,
+    endBlockIndex: Number.isInteger(endBlockIndex) ? endBlockIndex : (Number.isInteger(blockIndex) ? blockIndex : -1),
     occurrenceIndex: matches.length > 1 && textIndex >= 0 ? matches.indexOf(textIndex) : 0,
     prefix: textIndex >= 0 ? source.slice(Math.max(0, textIndex - 160), textIndex) : '',
     suffix: textIndex >= 0 ? source.slice(textIndex + quoteText.length, textIndex + quoteText.length + 160) : '',

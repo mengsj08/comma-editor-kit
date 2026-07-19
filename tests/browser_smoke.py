@@ -63,6 +63,69 @@ def main() -> None:
                 }"""
             )
 
+            # A real pointer drag must be captured. Script-created ranges do
+            # not exercise the browser's native selection event timing.
+            native_target = page.locator("comma-editor .ce-block p").first
+            native_box = native_target.bounding_box()
+            assert native_box is not None
+            native_y = native_box["y"] + min(12, native_box["height"] / 2)
+            page.mouse.move(native_box["x"] + 6, native_y)
+            page.mouse.down()
+            page.mouse.move(native_box["x"] + min(280, native_box["width"] - 8), native_y, steps=12)
+            page.mouse.up()
+            page.wait_for_function("!document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=selection-bar]').hidden")
+            native_pointer_state = page.locator("comma-editor").evaluate(
+                """el => ({
+                  quoteText: el._selection?.quoteText || '',
+                  editorActive: Boolean(el.shadowRoot.querySelector('.ce-block-editor')),
+                  barHidden: el.shadowRoot.querySelector('[data-el=selection-bar]').hidden
+                })"""
+            )
+            assert native_pointer_state["quoteText"]
+            assert native_pointer_state["editorActive"] is False
+            assert native_pointer_state["barHidden"] is False
+
+            native_paragraphs = page.locator("comma-editor .ce-block p")
+            assert native_paragraphs.count() >= 2
+            native_second_box = native_paragraphs.nth(1).bounding_box()
+            assert native_second_box is not None
+            page.mouse.click(native_box["x"] + 60, native_y)
+            page.mouse.move(native_box["x"] + 60, native_y)
+            page.mouse.down()
+            page.mouse.move(
+                native_second_box["x"] + min(190, native_second_box["width"] - 8),
+                native_second_box["y"] + min(12, native_second_box["height"] / 2),
+                steps=18,
+            )
+            page.mouse.up()
+            page.wait_for_function(
+                """previous => {
+                  const selection = document.querySelector('comma-editor')._selection;
+                  return selection?.quoteText && selection.quoteText !== previous
+                    && selection.sourceLocator?.endBlockIndex > selection.sourceLocator?.blockIndex;
+                }""",
+                arg=native_pointer_state["quoteText"],
+            )
+            native_multiblock_state = page.locator("comma-editor").evaluate(
+                """el => ({
+                  quoteText: el._selection?.quoteText || '',
+                  blockIndex: el._selection?.sourceLocator?.blockIndex,
+                  endBlockIndex: el._selection?.sourceLocator?.endBlockIndex,
+                  barHidden: el.shadowRoot.querySelector('[data-el=selection-bar]').hidden
+                })"""
+            )
+            assert native_multiblock_state["quoteText"]
+            assert native_multiblock_state["endBlockIndex"] > native_multiblock_state["blockIndex"]
+            assert native_multiblock_state["barHidden"] is False
+            native_multiblock_resolution = page.locator("comma-editor").evaluate(
+                """el => el._resolveComment({
+                  quoteText: el._selection.quoteText,
+                  sourceLocator: el._selection.sourceLocator
+                })"""
+            )
+            assert native_multiblock_resolution["state"] == "rendered-range"
+            assert native_multiblock_resolution["blockIndex"] == native_multiblock_state["blockIndex"]
+
             # Select a whole rendered paragraph that crosses ** markers in the
             # raw source. The component must use rendered-block fallback.
             page.locator("comma-editor").evaluate(
@@ -202,6 +265,9 @@ def main() -> None:
                 "blocks": blocks,
                 "selection_actions": selection_actions,
                 "selection_event": selection_event,
+                "native_pointer_state": native_pointer_state,
+                "native_multiblock_state": native_multiblock_state,
+                "native_multiblock_resolution": native_multiblock_resolution,
                 "selection_priority_state": selection_priority_state,
                 "anchor_state": anchor_state,
                 "batch_ready": batch_preview["counts"]["ready"],

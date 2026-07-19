@@ -52,14 +52,41 @@ function trailingNewlines(value) {
 
 function selectionInside(root) {
   const selection = globalThis.getSelection?.();
-  if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
-  const range = selection.getRangeAt(0);
+  const text = selection?.toString().trim() || '';
+  if (!selection || !text) return null;
+
+  let range = null;
+  const selectionRoot = root.getRootNode();
+  if (selectionRoot instanceof ShadowRoot && typeof selection.getComposedRanges === 'function') {
+    try {
+      const [composed] = selection.getComposedRanges({ shadowRoots: [selectionRoot] });
+      if (composed) {
+        range = root.ownerDocument.createRange();
+        range.setStart(composed.startContainer, composed.startOffset);
+        range.setEnd(composed.endContainer, composed.endOffset);
+      }
+    } catch {
+      range = null;
+    }
+  }
+  if (!range && selection.rangeCount) range = selection.getRangeAt(0);
+  if (!range) return null;
+
+  const elementFor = (node) => node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  const startElement = elementFor(range.startContainer);
+  const endElement = elementFor(range.endContainer);
+  if (!startElement || !endElement || !root.contains(startElement) || !root.contains(endElement)) return null;
   const ancestor = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
     ? range.commonAncestorContainer
     : range.commonAncestorContainer.parentElement;
-  if (!ancestor || !root.contains(ancestor)) return null;
-  const text = selection.toString().trim();
-  return text ? { selection, range, text, ancestor } : null;
+  if (!ancestor) return null;
+  return { selection, range, text, ancestor, startElement, endElement };
+}
+
+function readableBlockText(element) {
+  const clone = element.cloneNode(true);
+  clone.querySelectorAll('.ce-block-edit-action, .ce-block-badge').forEach((control) => control.remove());
+  return normalizeQuoteText(clone.textContent);
 }
 
 export class CommaEditorElement extends HTMLElement {
@@ -711,14 +738,18 @@ export class CommaEditorElement extends HTMLElement {
       bar.hidden = true;
       return;
     }
-    const blockElement = captured.ancestor.closest('.ce-block');
+    const blockElement = captured.startElement.closest('.ce-block');
+    const endBlockElement = captured.endElement.closest('.ce-block');
     const blockIndex = Number(blockElement?.dataset.blockIndex ?? -1);
+    const endBlockIndex = Number(endBlockElement?.dataset.blockIndex ?? blockIndex);
     const sourceBlock = this._blocks.find((block) => block.index === blockIndex);
+    const endSourceBlock = this._blocks.find((block) => block.index === endBlockIndex);
     const locator = createSourceLocator(this._document.body, captured.text, {
       rev: this._document.rev,
       blockIndex,
+      endBlockIndex,
       blockStart: sourceBlock?.start,
-      blockEnd: sourceBlock?.end,
+      blockEnd: endSourceBlock?.end ?? sourceBlock?.end,
     });
     this._selection = { quoteText: captured.text, sourceLocator: locator };
     this.shadowRoot.querySelector('[data-action="selection-comment"]').hidden = !this._capabilities.comments.create || this._dirty;
@@ -963,13 +994,24 @@ export class CommaEditorElement extends HTMLElement {
     if (!needle) return { state: 'missing', index: -1, blockIndex: -1 };
     const blockElements = Array.from(this._el('preview').querySelectorAll('.ce-block'));
     const recorded = Number(comment.sourceLocator?.blockIndex ?? comment.sourceLocator?.block_index);
+    const recordedEnd = Number(comment.sourceLocator?.endBlockIndex ?? comment.sourceLocator?.end_block_index ?? recorded);
     if (Number.isInteger(recorded) && recorded >= 0) {
       const element = blockElements.find((block) => Number(block.dataset.blockIndex) === recorded);
-      if (element && normalizeQuoteText(element.textContent).includes(needle)) {
+      if (element && recordedEnd === recorded && readableBlockText(element).includes(needle)) {
         return { state: 'rendered-block', index: -1, blockIndex: recorded };
       }
+      if (Number.isInteger(recordedEnd) && recordedEnd > recorded) {
+        const rangeElements = blockElements.filter((block) => {
+          const index = Number(block.dataset.blockIndex);
+          return index >= recorded && index <= recordedEnd;
+        });
+        const rangeText = normalizeQuoteText(rangeElements.map(readableBlockText).join(' '));
+        if (rangeElements.length && rangeText.includes(needle)) {
+          return { state: 'rendered-range', index: -1, blockIndex: recorded, endBlockIndex: recordedEnd };
+        }
+      }
     }
-    const candidates = blockElements.filter((element) => normalizeQuoteText(element.textContent).includes(needle));
+    const candidates = blockElements.filter((element) => readableBlockText(element).includes(needle));
     if (candidates.length === 1) {
       return { state: 'rendered-unique', index: -1, blockIndex: Number(candidates[0].dataset.blockIndex) };
     }

@@ -72,7 +72,18 @@ test('selection locators disambiguate repeated quotes through the selected sourc
   });
   assert.equal(locator.textIndex, secondStart);
   assert.equal(locator.occurrenceIndex, 1);
+  assert.equal(locator.endBlockIndex, 2);
   assert.equal(resolveQuote(body, 'Repeated phrase.', locator, 'same').index, secondStart);
+});
+
+test('selection locators retain multi-block range boundaries', () => {
+  const body = 'First paragraph.\n\nSecond paragraph.';
+  const locator = createSourceLocator(body, body, {
+    rev: 'same', blockIndex: 0, endBlockIndex: 1, blockStart: 0, blockEnd: body.length,
+  });
+  assert.equal(locator.blockIndex, 0);
+  assert.equal(locator.endBlockIndex, 1);
+  assert.equal(locator.textIndex, 0);
 });
 
 test('comment batch preview separates ready, ambiguous, missing, and invalid proposals', () => {

@@ -6,7 +6,7 @@ Comma Editor treats **Markdown as the source of truth**. The rendered page is an
 
 ## The small contract
 
-1. Click a rendered block to edit its Markdown in place.
+1. Use the explicit Edit block control to edit Markdown in place.
 2. Select a sentence to attach a durable margin note.
 3. Open **Source** when a whole-document edit is clearer.
 4. Every save carries a revision, so stale work cannot overwrite a newer draft.

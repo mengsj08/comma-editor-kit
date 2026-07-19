@@ -43,6 +43,10 @@ The component consumes a document contract. It does not know where a document li
 - Reading-mode pointer gestures never imply mutation. Block editing starts only
   from the editor-owned explicit affordance, so native text selection remains
   available to comments and host-declared quote actions.
+- Native selections inside the component's Shadow DOM are recovered through
+  composed ranges. Chromium can expose selected text while reporting the outer
+  document range as collapsed, so ordinary `getRangeAt(0)` is not an adequate
+  acceptance test for real pointer selections.
 - `previewCommentBatch`: validates a structured response and opens a human confirmation queue; it never writes by itself.
 - CSS custom properties: host-level visual tuning without DOM coupling.
 - `resolveAsset`: optional adapter capability for turning document-relative
