@@ -21,6 +21,20 @@ v1.1 merges the independent architecture review (Claude) and the red-team review
 13. Product claims must state what was not done: image pixels were not read, cited literature was not verified in full text, statistics were not recomputed.
 14. Calendar estimates are removed by June's direction; slices define scope only.
 
+## v1.1.1 changelog (red-team fixes, June-confirmed 2026-07-20)
+
+Normative fixes from the independent red-team review of the Slice A–C implementation. Where v1.1.1 conflicts with earlier text, v1.1.1 wins.
+
+1. **Export truthfulness.** `_reviewed_markdown` (and any distributable review rendition) must read `lifecycle_state` and `finding_state` and render three distinct groups: confirmed comments; provisional comments marked `AI 暂定 · 未经人工确认`; withdrawn comments in a separate labeled section with reason. The export header carries a status count line. Withdrawn items stay in the export (per Migration rules) but never render as live review opinions.
+2. **Acceptance display and action.** UI counts and highlights derive from the comment's real `finding_state`, never from the model's self-reported `decision` field. Model-proposed findings display as `AI 建议`; "已接受"-class wording is reserved for human-confirmed state. Add the explicit acceptance action: per-comment `确认接受` (provisional → accepted via comment_version-locked mutation + CommentEvent) and a bulk `接受全部暂定` with confirmation.
+3. **Protected-section routing hardening.** Section classification uses a heading stack: a subsection inherits its ancestors' protection (e.g. `### Statistical analysis` under `## Methods` is protected). Default direction inverts: sections that cannot be classified (headingless documents, pre-heading content, unrecognized structure) are treated as protected and route to full re-review; incremental is recommended only for an explicit low-risk allowlist (acknowledgements, discussion-local prose, wording-level edits). CN/EN keyword tables expand (statistical analysis / participants / study design / sample size / outcome / cohort / findings / 统计 / 样本量 / 纳入排除 etc.) as a fallback layer. The `仍按增量复审` escape hatch remains.
+4. **Legacy route closure.** `POST /api/review-sessions` returns 409 (pointing to preflight/review-runs) when a completed review already exists for the document; first review keeps current behavior (provisional writes). `POST /api/review-sessions/<id>/writeback` is closed (409); all post-first-review mutations go only through the journaled, triple-locked run writeback. `_writeback_session`'s decision-downgrade branch gains the same `human_edited` guard as the content-update branch.
+5. **Stale-run recovery.** Startup reconciliation sweeps runs persisted as `running` to `failed` (model invocation is synchronous and in-process, so a reboot proves no live call), and an in-memory active-run registry backs the in-flight idempotency check so a crashed run cannot permanently occupy a revision key.
+6. **Comment-creation hardening.** `POST /api/comments` ignores caller-supplied privileged fields (`id`, `source_key`, `applied_signature`, `applied_operation_id`, `finding_state`, `human_edited`); the server assigns them.
+7. **Journal reconciliation refinement.** When the document rev changed after comments landed but before receipt finalization, reconciliation verifies landed operations by op id/source_key/applied_signature and finalizes the receipt (marked recovered) instead of reporting a false inconsistency.
+8. **DocumentSummary implementation.** Section 3 is implemented as specified (generation via the existing CLI invocation chain, revision-bound persistence, stale marking, drawer rendering, export ledger inclusion), replacing the static shell.
+9. **Dual-normalization completion.** Core `normalizeComment` adds aliases for `review_run_id`, `applied_signature`, `applied_operation_id`.
+
 ## Outcome
 
 Turn Comma Review Studio from a capable Markdown review host into a professional scientific-manuscript review surface without moving provider, filesystem, or evidence-source responsibilities into editor-core.
