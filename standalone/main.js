@@ -38,6 +38,19 @@ const adapter = new LocalStorageDocumentAdapter({
 const editor = document.querySelector('#editor');
 const hostState = document.querySelector('#host-state');
 editor.adapter = adapter;
+editor.toolbarActions = [
+  { id: 'source', label: 'Source', slot: 'primary', appliesTo: 'document.save' },
+  { id: 'ai-review', label: 'AI review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true } },
+  { id: 'overall-comment', label: 'Overall note', slot: 'primary', appliesTo: 'comments.create' },
+  { id: 'comments', label: 'Comments', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
+];
+
+editor.addEventListener('comma-toolbar-action', (event) => {
+  if (event.detail.actionId === 'source') editor.openSourceEditor();
+  if (event.detail.actionId === 'ai-review') editor.requestAiReview();
+  if (event.detail.actionId === 'overall-comment') editor.openOverallCommentComposer();
+  if (event.detail.actionId === 'comments') editor.toggleComments();
+});
 
 editor.addEventListener('comma-save', () => { hostState.textContent = 'host saw save'; });
 editor.addEventListener('comma-comment-create', () => { hostState.textContent = 'host saw note'; });

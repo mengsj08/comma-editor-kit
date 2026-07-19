@@ -13,6 +13,9 @@ export const COMMA_SCHEMAS = Object.freeze({
   editEvent: 'comma-edit-event/v1',
 });
 
+const LIFECYCLE_STATES = new Set(['active', 'withdrawn']);
+const FINDING_STATES = new Set(['provisional', 'accepted', 'pending', 'withdrawn']);
+
 function first(input, ...keys) {
   for (const key of keys) {
     if (input?.[key] != null) return input[key];
@@ -23,6 +26,37 @@ function first(input, ...keys) {
 function normalizedDecision(value) {
   const decision = String(value || 'proposed').trim().toLowerCase();
   return ['accepted', 'proposed', 'rejected'].includes(decision) ? decision : 'proposed';
+}
+
+function normalizedBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function normalizedLifecycleState(value) {
+  const state = String(value || 'active').trim().toLowerCase();
+  return LIFECYCLE_STATES.has(state) ? state : 'active';
+}
+
+function normalizedFindingState(input) {
+  const explicit = String(first(input, 'findingState', 'finding_state') || '').trim().toLowerCase();
+  if (FINDING_STATES.has(explicit)) return explicit;
+  const legacy = String(first(input, 'reviewState', 'review_state') || '').trim().toLowerCase();
+  if (legacy === 'active') return 'accepted';
+  if (legacy === 'pending' || legacy === 'withdrawn') return legacy;
+  return '';
+}
+
+export function normalizeCommentReply(input = {}) {
+  return {
+    id: String(input.id || randomId('reply')),
+    actor: String(first(input, 'actor', 'author') || 'user'),
+    content: String(input.content || '').trim(),
+    createdAt: String(first(input, 'createdAt', 'created_at') || new Date().toISOString()),
+    updatedAt: String(first(input, 'updatedAt', 'updated_at') || new Date().toISOString()),
+    state: normalizedLifecycleState(input.state),
+  };
 }
 
 export function normalizeDocument(input = {}) {
@@ -37,15 +71,18 @@ export function normalizeDocument(input = {}) {
 
 export function normalizeComment(input = {}) {
   const quoteText = String(first(input, 'quoteText', 'quote_text') || '').trim();
-  const kind = input.kind === 'overall' || !quoteText ? 'overall' : 'anchored';
+  const sourceLocator = first(input, 'sourceLocator', 'source_locator') || null;
+  const kind = input.kind === 'overall' || (!quoteText && !sourceLocator) ? 'overall' : 'anchored';
   const priority = String(input.priority || '').toUpperCase();
+  const findingState = normalizedFindingState(input);
+  const commentVersion = Number(first(input, 'commentVersion', 'comment_version') || 1);
   return {
     schemaVersion: String(first(input, 'schemaVersion', 'schema_version') || COMMA_SCHEMAS.comment),
     id: String(input.id || randomId('comment')),
     kind,
     content: String(input.content || '').trim(),
     quoteText,
-    sourceLocator: first(input, 'sourceLocator', 'source_locator') || null,
+    sourceLocator,
     anchorState: String(first(input, 'anchorState', 'anchor_state') || (kind === 'overall' ? 'overall' : 'unresolved')),
     section: String(input.section || '').trim(),
     priority: ['P0', 'P1', 'P2', 'P3'].includes(priority) ? priority : '',
@@ -57,9 +94,27 @@ export function normalizeComment(input = {}) {
     conversationSessionId: String(first(input, 'conversationSessionId', 'conversation_session_id') || ''),
     conversationMessageId: String(first(input, 'conversationMessageId', 'conversation_message_id') || ''),
     reviewState: String(first(input, 'reviewState', 'review_state') || 'active'),
+    lifecycleState: normalizedLifecycleState(first(input, 'lifecycleState', 'lifecycle_state')),
+    findingState,
+    commentVersion: Number.isInteger(commentVersion) && commentVersion > 0 ? commentVersion : 1,
+    humanEdited: normalizedBoolean(first(input, 'humanEdited', 'human_edited')),
+    originSignature: String(first(input, 'originSignature', 'origin_signature') || ''),
+    withdrawnAt: String(first(input, 'withdrawnAt', 'withdrawn_at') || ''),
+    withdrawnBy: String(first(input, 'withdrawnBy', 'withdrawn_by') || ''),
+    withdrawReason: String(first(input, 'withdrawReason', 'withdraw_reason') || ''),
+    replies: (Array.isArray(input.replies) ? input.replies : []).map(normalizeCommentReply),
     createdAt: String(first(input, 'createdAt', 'created_at') || new Date().toISOString()),
     updatedAt: String(first(input, 'updatedAt', 'updated_at') || new Date().toISOString()),
   };
+}
+
+export function isCommentWithdrawn(comment = {}) {
+  const normalized = normalizeComment(comment);
+  return normalized.lifecycleState === 'withdrawn' || normalized.findingState === 'withdrawn';
+}
+
+export function isCommentVisible(comment = {}, { showWithdrawn = false } = {}) {
+  return Boolean(showWithdrawn || !isCommentWithdrawn(comment));
 }
 
 export function normalizeFinding(input = {}, fallbackId = '') {

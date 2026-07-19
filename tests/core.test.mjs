@@ -11,6 +11,8 @@ import { replaceBlock, segmentMarkdown } from '../src/core/blocks.js';
 import { previewCommentBatch } from '../src/core/comment-batch.js';
 import { revisionOf } from '../src/core/revision.js';
 import {
+  isCommentVisible,
+  normalizeComment,
   normalizeFinding,
   normalizeConversationSession,
   normalizeReviewSession,
@@ -116,6 +118,29 @@ test('comment batch preview rejects duplicate proposals without guessing', () =>
   assert.match(preview.items[1].reason, /Duplicate/);
 });
 
+test('comment lifecycle and finding state normalize as orthogonal dimensions', () => {
+  const legacyFinding = normalizeComment({
+    id: 'c-legacy', kind: null, quote_text: 'Exact quote.', source_locator: { text_index: 4 },
+    review_state: 'withdrawn', comment_version: 7, human_edited: true,
+    replies: [{ id: 'reply-1', author: 'June', content: 'Follow-up.', state: 'active' }],
+  });
+  assert.equal(legacyFinding.kind, 'anchored');
+  assert.equal(legacyFinding.lifecycleState, 'active');
+  assert.equal(legacyFinding.findingState, 'withdrawn');
+  assert.equal(legacyFinding.commentVersion, 7);
+  assert.equal(legacyFinding.humanEdited, true);
+  assert.equal(legacyFinding.replies[0].actor, 'June');
+  assert.equal(isCommentVisible(legacyFinding), false);
+
+  const userWithdrawn = normalizeComment({
+    content: 'Manual note.', lifecycle_state: 'withdrawn', finding_state: 'accepted',
+  });
+  assert.equal(userWithdrawn.lifecycleState, 'withdrawn');
+  assert.equal(userWithdrawn.findingState, 'accepted');
+  assert.equal(isCommentVisible(userWithdrawn), false);
+  assert.equal(isCommentVisible(userWithdrawn, { showWithdrawn: true }), true);
+});
+
 test('review models normalize legacy snake_case without losing writeback identity', () => {
   const finding = normalizeFinding({
     id: 'F001', quote_text: 'Exact quote.', evidence_requirement: 'PMID',
@@ -152,4 +177,27 @@ test('adapter capabilities expose asset resolution only when implemented', () =>
   };
   assert.equal(resolveAdapterCapabilities(adapter).assets.resolve, true);
   assert.equal(resolveAdapterCapabilities({ capabilities: { assets: { resolve: true } } }).assets.resolve, false);
+});
+
+test('comment lifecycle capabilities require the declared adapter methods', () => {
+  const adapter = {
+    async load() { return {}; },
+    async listComments() { return []; },
+    async restoreComment() {},
+    async createCommentReply() {},
+    async updateCommentReply() {},
+    async deleteCommentReply() {},
+    async listCommentEvents() { return []; },
+    capabilities: {
+      comments: { list: true, restore: true, reply: true, history: true },
+    },
+  };
+  const capabilities = resolveAdapterCapabilities(adapter);
+  assert.equal(capabilities.comments.restore, true);
+  assert.equal(capabilities.comments.reply, true);
+  assert.equal(capabilities.comments.history, true);
+  assert.equal(resolveAdapterCapabilities({
+    ...adapter,
+    deleteCommentReply: undefined,
+  }).comments.reply, false);
 });

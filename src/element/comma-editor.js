@@ -5,7 +5,11 @@ import { createSourceLocator, normalizeQuoteText, resolveQuote } from '../core/a
 import { normalizeSavePolicy, resolveAdapterCapabilities } from '../core/adapter-contract.js';
 import { replaceBlock, segmentMarkdown } from '../core/blocks.js';
 import { previewCommentBatch as buildCommentBatchPreview } from '../core/comment-batch.js';
-import { normalizeComment, normalizeDocument } from '../core/models.js';
+import {
+  isCommentVisible,
+  normalizeComment,
+  normalizeDocument,
+} from '../core/models.js';
 import { RevisionConflictError } from '../core/revision.js';
 import { MarkdownRenderer } from './markdown-renderer.js';
 
@@ -106,6 +110,12 @@ export class CommaEditorElement extends HTMLElement {
     this._activeBlock = null;
     this._selection = null;
     this._selectionActions = [{ id: 'ask-ai', label: 'Ask AI' }];
+    this._toolbarActions = [];
+    this._commentActions = [];
+    this._showWithdrawnComments = false;
+    this._commentsRev = '';
+    this._inlineCommentAction = null;
+    this._commentDetails = null;
     this._sourceMode = false;
     this._commentBatchPreview = null;
     this._loading = false;
@@ -168,8 +178,113 @@ export class CommaEditorElement extends HTMLElement {
     return structuredClone(this._selectionActions);
   }
 
+  set toolbarActions(value) {
+    const rows = Array.isArray(value) ? value : [];
+    this._toolbarActions = rows.slice(0, 16).map((action) => ({
+      id: String(action?.id || '').trim(),
+      label: String(action?.label || action?.id || '').trim(),
+      title: String(action?.title || '').trim(),
+      slot: action?.slot === 'overflow' ? 'overflow' : 'primary',
+      appliesTo: structuredClone(action?.appliesTo ?? null),
+      count: String(action?.count || '').trim(),
+    })).filter((action) => action.id && action.label);
+    if (this._connected) this._renderToolbarActions();
+  }
+
+  get toolbarActions() {
+    return structuredClone(this._toolbarActions);
+  }
+
+  set commentActions(value) {
+    const rows = Array.isArray(value) ? value : [];
+    this._commentActions = rows.slice(0, 16).map((action) => ({
+      id: String(action?.id || '').trim(),
+      label: String(action?.label || action?.id || '').trim(),
+      title: String(action?.title || '').trim(),
+      appliesTo: structuredClone(action?.appliesTo ?? null),
+    })).filter((action) => action.id && action.label);
+    if (this._connected) this._renderComments();
+  }
+
+  get commentActions() {
+    return structuredClone(this._commentActions);
+  }
+
+  set showWithdrawnComments(value) {
+    this._showWithdrawnComments = Boolean(value);
+    if (this._connected) {
+      this._renderComments();
+      this._applyCommentAnchors();
+      this._renderMeta();
+    }
+  }
+
+  get showWithdrawnComments() {
+    return this._showWithdrawnComments;
+  }
+
+  get commentsRev() {
+    return this._commentsRev;
+  }
+
   get documentState() {
     return structuredClone({ ...this._document, dirty: this._dirty, savePolicy: this.savePolicy });
+  }
+
+  openSourceEditor() {
+    this._enterSource();
+  }
+
+  openOverallCommentComposer() {
+    this._openCommentComposer(null);
+  }
+
+  toggleComments(force) {
+    if (!this._capabilities.comments.list) return false;
+    const sidebar = this._el('sidebar');
+    sidebar.hidden = typeof force === 'boolean' ? !force : !sidebar.hidden;
+    return !sidebar.hidden;
+  }
+
+  jumpToComment(id) {
+    return this._jumpToComment(id);
+  }
+
+  openCommentAction(commentId, options = {}) {
+    const comment = this._comments.find((item) => item.id === commentId);
+    if (!comment) return false;
+    const replyId = String(options.replyId || '');
+    const reply = replyId ? comment.replies.find((item) => item.id === replyId) : null;
+    this._inlineCommentAction = {
+      commentId,
+      replyId,
+      actionId: String(options.actionId || ''),
+      label: String(options.label || ''),
+      placeholder: String(options.placeholder || ''),
+      submitLabel: String(options.submitLabel || 'Save'),
+      initialValue: String(options.initialValue ?? reply?.content ?? comment.content ?? ''),
+    };
+    this._commentDetails = null;
+    this._renderComments();
+    queueMicrotask(() => this.shadowRoot.querySelector('[data-el="comment-action-input"]')?.focus());
+    return true;
+  }
+
+  closeCommentAction() {
+    this._inlineCommentAction = null;
+    if (this._connected) this._renderComments();
+  }
+
+  showCommentDetails(commentId, { label = 'History', items = [] } = {}) {
+    if (!this._comments.some((item) => item.id === commentId)) return false;
+    this._commentDetails = {
+      commentId,
+      label: String(label || 'History'),
+      items: structuredClone(Array.isArray(items) ? items : []),
+    };
+    this._inlineCommentAction = null;
+    this._renderComments();
+    return true;
   }
 
   requestAiReview() {
@@ -236,6 +351,9 @@ export class CommaEditorElement extends HTMLElement {
       this._comments = this._capabilities.comments.list
         ? (await this._adapter.listComments()).map(normalizeComment)
         : [];
+      this._commentsRev = this._capabilities.comments.list ? String(this._adapter.commentsRev || '') : '';
+      this._inlineCommentAction = null;
+      this._commentDetails = null;
       this._sourceMode = false;
       this._closeReviewQueue();
       this._renderDocument();
@@ -254,6 +372,7 @@ export class CommaEditorElement extends HTMLElement {
     if (typeof this._adapter.replace === 'function') {
       this._document = normalizeDocument(await this._adapter.replace({ title, body, actor }));
       this._comments = this._capabilities.comments.list ? await this._adapter.listComments() : [];
+      this._commentsRev = this._capabilities.comments.list ? String(this._adapter.commentsRev || '') : '';
     } else {
       const saved = await this._adapter.save({ body, baseRev: this._document.rev, actor });
       this._document = normalizeDocument({ ...saved, title: title || saved.title });
@@ -268,6 +387,9 @@ export class CommaEditorElement extends HTMLElement {
   async refreshComments() {
     if (!this._capabilities.comments.list) return [];
     this._comments = (await this._adapter.listComments()).map(normalizeComment);
+    this._commentsRev = String(this._adapter.commentsRev || this._commentsRev || '');
+    this._inlineCommentAction = null;
+    this._commentDetails = null;
     this._renderComments();
     this._applyCommentAnchors();
     this._renderMeta();
@@ -308,11 +430,12 @@ export class CommaEditorElement extends HTMLElement {
             <div class="ce-meta" data-el="meta">No document loaded</div>
           </div>
           <div class="ce-actions">
-            <button class="ce-button" type="button" data-action="source" data-el="source-button">Source</button>
+            <span class="ce-toolbar-primary" data-el="toolbar-primary"></span>
             <button class="ce-button primary" type="button" data-action="explicit-save" data-el="explicit-save" hidden>Save</button>
-            <button class="ce-button review" type="button" data-action="ai-review" data-el="ai-review-button">AI review</button>
-            <button class="ce-button" type="button" data-action="overall-comment" data-el="overall-comment-button">Overall note</button>
-            <button class="ce-button" type="button" data-action="comments" data-el="comments-button">Comments <span class="ce-count" data-el="comment-count">0</span></button>
+            <details class="ce-toolbar-overflow" data-el="toolbar-overflow" hidden>
+              <summary class="ce-button" aria-label="More actions">···</summary>
+              <div class="ce-toolbar-overflow-menu" data-el="toolbar-overflow-menu"></div>
+            </details>
           </div>
         </header>
         <div class="ce-grid">
@@ -328,7 +451,7 @@ export class CommaEditorElement extends HTMLElement {
           </main>
           <aside class="ce-sidebar" data-el="sidebar">
             <div class="ce-sidebar-head">
-              <h2 class="ce-sidebar-title">Margin notes</h2>
+              <h2 class="ce-sidebar-title" data-el="comment-panel-title">Comments</h2>
               <span class="ce-sidebar-note">quote anchored</span>
             </div>
             <div class="ce-comments" data-el="comments"></div>
@@ -374,6 +497,7 @@ export class CommaEditorElement extends HTMLElement {
         <div class="ce-lightbox-caption" data-el="lightbox-caption"></div>
       </section>`;
     this._renderSelectionActions();
+    this._renderToolbarActions();
   }
 
   _el(name) {
@@ -411,13 +535,21 @@ export class CommaEditorElement extends HTMLElement {
     const action = event.target.closest('[data-action]')?.dataset.action;
     if (action) {
       if (action !== 'toggle-review-item') event.preventDefault();
-      if (action === 'source') this._enterSource();
+      if (action === 'toolbar-action') this._runToolbarAction(event.target.closest('[data-toolbar-action]')?.dataset.toolbarAction);
+      if (action === 'comment-action') this._runCommentAction(
+        event.target.closest('[data-comment-action]')?.dataset.commentAction,
+        event.target.closest('[data-comment-id]')?.dataset.commentId,
+        event.target.closest('[data-reply-id]')?.dataset.replyId || '',
+      );
+      if (action === 'cancel-comment-action') this.closeCommentAction();
+      if (action === 'submit-comment-action') this._submitCommentAction();
+      if (action === 'close-comment-details') {
+        this._commentDetails = null;
+        this._renderComments();
+      }
       if (action === 'explicit-save') await this.save();
-      if (action === 'ai-review') this.requestAiReview();
       if (action === 'cancel-source') this._exitSource();
       if (action === 'save-source') await this._saveSource();
-      if (action === 'comments') this._el('sidebar').toggleAttribute('hidden');
-      if (action === 'overall-comment') this._openCommentComposer(null);
       if (action === 'selection-comment') this._openCommentComposer(this._selection);
       if (action === 'selection-action') this._runSelectionAction(event.target.closest('[data-selection-action]')?.dataset.selectionAction);
       if (action === 'edit-block') this._enterBlockEdit(Number(event.target.closest('[data-block-index]')?.dataset.blockIndex));
@@ -425,7 +557,6 @@ export class CommaEditorElement extends HTMLElement {
       if (action === 'commit-block-edit') await this._commitBlock(false);
       if (action === 'cancel-comment') this._closeCommentComposer();
       if (action === 'save-comment') await this._saveComment();
-      if (action === 'delete-comment') await this._deleteComment(event.target.dataset.commentId);
       if (action === 'close-review') this._closeReviewQueue();
       if (action === 'toggle-review-item') this._toggleReviewItem(event.target.dataset.proposalId, event.target.checked);
       if (action === 'apply-review') await this._applyCommentBatch();
@@ -441,7 +572,7 @@ export class CommaEditorElement extends HTMLElement {
     }
 
     const comment = event.target.closest('.ce-comment');
-    if (comment) {
+    if (comment && !event.target.closest('.ce-comment-menu, .ce-comment-inline, .ce-comment-details, .ce-reply')) {
       this._jumpToComment(comment.dataset.commentId);
       return;
     }
@@ -464,16 +595,11 @@ export class CommaEditorElement extends HTMLElement {
     const mode = this.readonly ? 'read only' : `${policy} · actor ${this.actor}`;
     const dirty = this._dirty ? ' · unsaved' : '';
     this._el('meta').textContent = `${lines} lines · rev ${revision} · ${mode}${dirty}`;
-    this._el('comment-count').textContent = String(this._comments.length);
     const writable = !this.readonly && this._capabilities.document.save;
-    this._el('source-button').hidden = !writable;
     this._el('explicit-save').hidden = this.savePolicy !== 'explicit' || !writable;
     this._el('explicit-save').disabled = !this._dirty;
-    this._el('ai-review-button').hidden = this.hasAttribute('hide-ai-review');
-    this._el('ai-review-button').disabled = this._dirty || this.readonly;
-    this._el('overall-comment-button').hidden = !this._capabilities.comments.create;
-    this._el('comments-button').hidden = !this._capabilities.comments.list;
     this._el('sidebar').hidden = !this._capabilities.comments.list;
+    this._renderToolbarActions();
   }
 
   _renderPreview() {
@@ -796,6 +922,7 @@ export class CommaEditorElement extends HTMLElement {
         actor: this.actor,
       });
       this._comments.push(normalizeComment(comment));
+      this._commentsRev = String(this._adapter.commentsRev || this._commentsRev || '');
       this._closeCommentComposer();
       this._renderComments();
       this._applyCommentAnchors();
@@ -888,6 +1015,7 @@ export class CommaEditorElement extends HTMLElement {
       });
       const created = (result.comments || []).map(normalizeComment);
       this._comments.push(...created);
+      this._commentsRev = String(this._adapter.commentsRev || this._commentsRev || '');
       const detail = {
         comments: structuredClone(created),
         baseRev: preview.baseRev,
@@ -914,24 +1042,76 @@ export class CommaEditorElement extends HTMLElement {
 
   _renderComments() {
     const root = this._el('comments');
-    this._el('comment-count').textContent = String(this._comments.length);
-    if (!this._comments.length) {
+    const visibleComments = this._comments.filter((comment) => isCommentVisible(comment, {
+      showWithdrawn: this._showWithdrawnComments,
+    }));
+    this._renderToolbarActions();
+    if (!visibleComments.length) {
       root.innerHTML = '<div class="ce-comment-empty">Select a sentence to leave a margin note. The note keeps a quote snapshot if the source later moves.</div>';
       return;
     }
-    root.innerHTML = this._comments.map((comment) => {
+    root.innerHTML = visibleComments.map((comment) => {
       const resolution = comment.kind === 'overall' ? { state: 'overall' } : this._resolveComment(comment);
-      const state = comment.reviewState === 'withdrawn' || comment.reviewState === 'pending'
-        ? comment.reviewState : resolution.state;
-      return `<article class="ce-comment ${escapeHtml(comment.reviewState)}" data-comment-id="${escapeHtml(comment.id)}">
-        <button class="ce-comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeHtml(comment.id)}" aria-label="Delete comment">×</button>
-        <span class="ce-comment-state ${escapeHtml(state)}">${escapeHtml(state)}</span>
+      const lifecycleWithdrawn = comment.lifecycleState === 'withdrawn';
+      const findingWithdrawn = comment.findingState === 'withdrawn';
+      const findingStatus = ['provisional', 'pending'].includes(comment.findingState) ? comment.findingState : '';
+      const state = lifecycleWithdrawn ? 'withdrawn' : findingWithdrawn ? 'finding withdrawn' : findingStatus || resolution.state;
+      const cardClass = lifecycleWithdrawn ? 'lifecycle-withdrawn' : findingWithdrawn ? 'finding-withdrawn' : comment.findingState;
+      return `<article class="ce-comment ${escapeHtml(cardClass)}" data-comment-id="${escapeHtml(comment.id)}">
+        ${this._renderCommentMenu(comment)}
+        <span class="ce-comment-state ${escapeHtml(state.replace(/\s+/g, '-'))}">${escapeHtml(state)}</span>
         ${comment.priority ? `<span class="ce-comment-priority">${escapeHtml(comment.priority)}</span>` : ''}
+        ${comment.humanEdited ? '<span class="ce-comment-human-edited">human edited</span>' : ''}
         ${comment.quoteText ? `<p class="ce-comment-quote">“${escapeHtml(comment.quoteText)}”</p>` : ''}
         <p class="ce-comment-body">${escapeHtml(comment.content)}</p>
-        <div class="ce-comment-meta">${escapeHtml(comment.actor)}${comment.section ? ` · ${escapeHtml(comment.section)}` : ''} · ${escapeHtml(comment.createdAt.slice(0, 16).replace('T', ' '))}</div>
+        <div class="ce-comment-meta">${escapeHtml(comment.actor)}${comment.section ? ` · ${escapeHtml(comment.section)}` : ''} · v${comment.commentVersion} · ${escapeHtml(comment.createdAt.slice(0, 16).replace('T', ' '))}</div>
+        ${this._renderCommentReplies(comment)}
+        ${this._renderInlineCommentAction(comment)}
+        ${this._renderCommentDetails(comment)}
       </article>`;
     }).join('');
+  }
+
+  _renderCommentMenu(comment, reply = null) {
+    if (!this._capabilities.comments.list) return '';
+    const actions = this._commentActions.filter((action) => this._commentActionAvailable(action, comment, reply));
+    if (!actions.length) return '';
+    const replyAttribute = reply ? ` data-reply-id="${escapeHtml(reply.id)}"` : '';
+    return `<details class="ce-comment-menu"${replyAttribute}>
+      <summary aria-label="Comment actions">···</summary>
+      <div>${actions.map((action) => `<button type="button" data-action="comment-action" data-comment-action="${escapeHtml(action.id)}"${action.title ? ` title="${escapeHtml(action.title)}"` : ''}>${escapeHtml(action.label)}</button>`).join('')}</div>
+    </details>`;
+  }
+
+  _renderCommentReplies(comment) {
+    const replies = comment.replies.filter((reply) => this._showWithdrawnComments || reply.state !== 'withdrawn');
+    if (!replies.length) return '';
+    return `<div class="ce-replies">${replies.map((reply) => `<article class="ce-reply ${escapeHtml(reply.state)}" data-reply-id="${escapeHtml(reply.id)}">
+      ${this._renderCommentMenu(comment, reply)}
+      <p>${escapeHtml(reply.content)}</p>
+      <div>${escapeHtml(reply.actor)} · ${escapeHtml(reply.updatedAt.slice(0, 16).replace('T', ' '))}${reply.state === 'withdrawn' ? ' · withdrawn' : ''}</div>
+    </article>`).join('')}</div>`;
+  }
+
+  _renderInlineCommentAction(comment) {
+    const state = this._inlineCommentAction;
+    if (!state || state.commentId !== comment.id) return '';
+    return `<section class="ce-comment-inline">
+      ${state.label ? `<strong>${escapeHtml(state.label)}</strong>` : ''}
+      <textarea data-el="comment-action-input" placeholder="${escapeHtml(state.placeholder)}">${escapeHtml(state.initialValue)}</textarea>
+      <div><button type="button" data-action="cancel-comment-action">Cancel</button><button class="primary" type="button" data-action="submit-comment-action">${escapeHtml(state.submitLabel)}</button></div>
+    </section>`;
+  }
+
+  _renderCommentDetails(comment) {
+    const details = this._commentDetails;
+    if (!details || details.commentId !== comment.id) return '';
+    const items = details.items.map((item) => `<li>
+      <strong>${escapeHtml(item.action || '')}</strong>
+      <span>${escapeHtml(item.actor || '')} · ${escapeHtml(String(item.at || '').replace('T', ' ').slice(0, 19))}</span>
+      <small>v${escapeHtml(item.fromVersion ?? item.from_version ?? 0)} → v${escapeHtml(item.toVersion ?? item.to_version ?? 0)}</small>
+    </li>`).join('');
+    return `<section class="ce-comment-details"><header><strong>${escapeHtml(details.label)}</strong><button type="button" data-action="close-comment-details">×</button></header><ol>${items || '<li>No recorded changes.</li>'}</ol></section>`;
   }
 
   _applyCommentAnchors() {
@@ -942,7 +1122,9 @@ export class CommaEditorElement extends HTMLElement {
     });
     const counts = new Map();
     for (const comment of this._comments) {
-      if (comment.kind !== 'anchored' || comment.reviewState === 'withdrawn') continue;
+      if (comment.kind !== 'anchored' || !isCommentVisible(comment, {
+        showWithdrawn: this._showWithdrawnComments,
+      })) continue;
       const resolution = this._resolveComment(comment);
       if (!Number.isInteger(resolution.blockIndex) || resolution.blockIndex < 0) continue;
       counts.set(resolution.blockIndex, (counts.get(resolution.blockIndex) || 0) + 1);
@@ -1018,18 +1200,130 @@ export class CommaEditorElement extends HTMLElement {
     return { state: candidates.length > 1 ? 'ambiguous' : 'missing', index: -1, blockIndex: -1 };
   }
 
-  async _deleteComment(id) {
-    if (!id || !this._adapter?.deleteComment || this.readonly) return;
-    if (!globalThis.confirm?.('Delete this comment?')) return;
-    try {
-      await this._adapter.deleteComment(id);
-      this._comments = this._comments.filter((comment) => comment.id !== id);
-      this._renderComments();
-      this._applyCommentAnchors();
-      this._renderMeta();
-    } catch (error) {
-      this._setStatus('error', error.message || 'Delete failed');
+  _capabilityAvailable(appliesTo, defaultGroup = 'comments') {
+    if (appliesTo == null || appliesTo === '') return true;
+    if (Array.isArray(appliesTo)) {
+      return appliesTo.every((item) => this._capabilityAvailable(item, defaultGroup));
     }
+    const raw = typeof appliesTo === 'object' ? appliesTo.capability : appliesTo;
+    if (!raw) return true;
+    const [group, name] = String(raw).includes('.')
+      ? String(raw).split('.', 2)
+      : [defaultGroup, String(raw)];
+    return Boolean(this._capabilities?.[group]?.[name]);
+  }
+
+  _toolbarActionAvailable(action) {
+    if (!this._capabilityAvailable(action.appliesTo, 'document')) return false;
+    const rules = typeof action.appliesTo === 'object' ? action.appliesTo : {};
+    if (rules.requiresWritable && (this.readonly || !this._capabilities.document.save)) return false;
+    return true;
+  }
+
+  _commentActionAvailable(action, comment, reply = null) {
+    if (!this._capabilityAvailable(action.appliesTo, 'comments')) return false;
+    const rules = typeof action.appliesTo === 'object' ? action.appliesTo : {};
+    const target = String(rules.target || 'comment');
+    if ((target === 'reply') !== Boolean(reply)) return false;
+    const state = reply?.state || comment.lifecycleState;
+    if (Array.isArray(rules.states) && !rules.states.includes(state)) return false;
+    if (Array.isArray(rules.lifecycleStates) && !rules.lifecycleStates.includes(comment.lifecycleState)) return false;
+    if (Array.isArray(rules.findingStates) && !rules.findingStates.includes(comment.findingState)) return false;
+    if (Array.isArray(rules.kinds) && !rules.kinds.includes(comment.kind)) return false;
+    return true;
+  }
+
+  _renderToolbarActions() {
+    if (!this._connected || !this._el('toolbar-primary')) return;
+    const available = this._toolbarActions.filter((action) => this._toolbarActionAvailable(action));
+    const createButton = (action, overflow = false) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = overflow ? '' : 'ce-button';
+      button.dataset.action = 'toolbar-action';
+      button.dataset.toolbarAction = action.id;
+      button.append(document.createTextNode(action.label));
+      if (action.count === 'comments') {
+        const count = this._comments.filter((comment) => isCommentVisible(comment, {
+          showWithdrawn: this._showWithdrawnComments,
+        })).length;
+        const badge = document.createElement('span');
+        badge.className = 'ce-count';
+        badge.dataset.commentCount = '';
+        badge.textContent = String(count);
+        button.append(' ', badge);
+      }
+      if (action.title) button.title = action.title;
+      const rules = typeof action.appliesTo === 'object' ? action.appliesTo : {};
+      button.disabled = Boolean(rules.requiresCleanDocument && this._dirty);
+      return button;
+    };
+    const primary = available.filter((action) => action.slot === 'primary');
+    const overflow = available.filter((action) => action.slot === 'overflow');
+    this._el('toolbar-primary').replaceChildren(...primary.map((action) => createButton(action)));
+    this._el('toolbar-overflow-menu').replaceChildren(...overflow.map((action) => createButton(action, true)));
+    this._el('toolbar-overflow').hidden = !overflow.length;
+    const commentCountAction = available.find((action) => action.count === 'comments');
+    this._el('comment-panel-title').textContent = commentCountAction?.label || 'Comments';
+  }
+
+  _runToolbarAction(actionId) {
+    const action = this._toolbarActions.find((candidate) => candidate.id === actionId);
+    if (!action || !this._toolbarActionAvailable(action)) return;
+    this._el('toolbar-overflow').removeAttribute('open');
+    this._emit('comma-toolbar-action', {
+      actionId: action.id,
+      action: structuredClone(action),
+      document: this.documentState,
+      actor: this.actor,
+      commentsRev: this._commentsRev,
+      commentCount: this._comments.filter((comment) => isCommentVisible(comment, {
+        showWithdrawn: this._showWithdrawnComments,
+      })).length,
+      showWithdrawn: this._showWithdrawnComments,
+    });
+  }
+
+  _runCommentAction(actionId, commentId, replyId = '') {
+    const action = this._commentActions.find((candidate) => candidate.id === actionId);
+    const comment = this._comments.find((candidate) => candidate.id === commentId);
+    const reply = replyId ? comment?.replies.find((candidate) => candidate.id === replyId) : null;
+    if (!action || !comment || !this._commentActionAvailable(action, comment, reply)) return;
+    this._emit('comma-comment-action', {
+      phase: 'activate',
+      actionId: action.id,
+      action: structuredClone(action),
+      commentId: comment.id,
+      replyId,
+      comment: structuredClone(comment),
+      reply: reply ? structuredClone(reply) : null,
+      baseCommentVersion: comment.commentVersion,
+      commentsRev: this._commentsRev,
+      document: this.documentState,
+      actor: this.actor,
+    });
+  }
+
+  _submitCommentAction() {
+    const state = this._inlineCommentAction;
+    const content = this._el('comment-action-input')?.value.trim() || '';
+    if (!state || !content) return;
+    const comment = this._comments.find((candidate) => candidate.id === state.commentId);
+    const reply = state.replyId ? comment?.replies.find((candidate) => candidate.id === state.replyId) : null;
+    if (!comment) return;
+    this._emit('comma-comment-action', {
+      phase: 'submit',
+      actionId: state.actionId,
+      commentId: comment.id,
+      replyId: state.replyId,
+      content,
+      comment: structuredClone(comment),
+      reply: reply ? structuredClone(reply) : null,
+      baseCommentVersion: comment.commentVersion,
+      commentsRev: this._commentsRev,
+      document: this.documentState,
+      actor: this.actor,
+    });
   }
 
   _renderSelectionActions() {

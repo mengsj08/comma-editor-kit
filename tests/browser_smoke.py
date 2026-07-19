@@ -250,7 +250,7 @@ def main() -> None:
             )
             page.wait_for_function("document.querySelector('comma-editor').documentState.body.includes('Block edit.')")
 
-            page.locator("comma-editor").evaluate("el => el.shadowRoot.querySelector('[data-action=source]').click()")
+            page.locator("comma-editor").evaluate("el => el.shadowRoot.querySelector('[data-toolbar-action=source]').click()")
             page.locator("comma-editor").evaluate(
                 "el => { const ta = el.shadowRoot.querySelector('[data-el=source-editor]'); ta.value += '\\nBrowser smoke edit.\\n'; }"
             )

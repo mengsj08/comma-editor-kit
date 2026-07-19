@@ -12,6 +12,19 @@ const editor = document.querySelector('#editor');
 const captureButton = document.querySelector('#capture');
 const status = document.querySelector('#chrome-status');
 editor.adapter = adapter;
+editor.toolbarActions = [
+  { id: 'source', label: 'Source', slot: 'primary', appliesTo: 'document.save' },
+  { id: 'ai-review', label: 'AI review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true } },
+  { id: 'overall-comment', label: 'Overall note', slot: 'overflow', appliesTo: 'comments.create' },
+  { id: 'comments', label: 'Comments', slot: 'overflow', appliesTo: 'comments.list', count: 'comments' },
+];
+
+editor.addEventListener('comma-toolbar-action', (event) => {
+  if (event.detail.actionId === 'source') editor.openSourceEditor();
+  if (event.detail.actionId === 'ai-review') editor.requestAiReview();
+  if (event.detail.actionId === 'overall-comment') editor.openOverallCommentComposer();
+  if (event.detail.actionId === 'comments') editor.toggleComments();
+});
 
 function captureReadablePage() {
   const root = document.querySelector('article, main, [role="main"]') || document.body;

@@ -7,6 +7,8 @@ const METHOD_CAPABILITIES = Object.freeze({
   createComments: ['comments', 'batch'],
   updateComment: ['comments', 'update'],
   deleteComment: ['comments', 'delete'],
+  restoreComment: ['comments', 'restore'],
+  listCommentEvents: ['comments', 'history'],
   listEvents: ['events', 'list'],
   resolveAsset: ['assets', 'resolve'],
 });
@@ -32,7 +34,10 @@ export function resolveAdapterCapabilities(adapter) {
   const result = {
     schemaVersion: COMMA_ADAPTER_SCHEMA,
     document: { load: false, save: false, replace: false },
-    comments: { list: false, create: false, batch: false, update: false, delete: false },
+    comments: {
+      list: false, create: false, batch: false, update: false, delete: false,
+      restore: false, reply: false, history: false,
+    },
     events: { list: false },
     assets: { resolve: false },
     savePolicy: normalizeSavePolicy(adapter?.capabilities?.savePolicy || adapter?.savePolicy),
@@ -41,6 +46,10 @@ export function resolveAdapterCapabilities(adapter) {
     const declared = explicitCapability(adapter, group, name);
     result[group][name] = declared == null ? methodAvailable(adapter, method) : declared && methodAvailable(adapter, method);
   }
+  const replyDeclared = explicitCapability(adapter, 'comments', 'reply');
+  const replyMethods = ['createCommentReply', 'updateCommentReply', 'deleteCommentReply']
+    .every((method) => methodAvailable(adapter, method));
+  result.comments.reply = replyDeclared == null ? replyMethods : replyDeclared && replyMethods;
   return result;
 }
 
