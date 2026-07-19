@@ -479,12 +479,13 @@ class ReviewApiTests(unittest.TestCase):
                         {"message": "把建议补充为还需要独立验证队列。"},
                     )
                     self.assertTrue(updated["ok"])
-                    self.assertEqual(len(updated["writeback"]["updated"]), 1)
+                    self.assertIsNone(updated["writeback"])
+                    self.assertEqual(updated["session"]["status"], "preview")
                     self.assertEqual(len(updated["session"]["messages"]), 3)
 
                     comments = self._request(base + "/api/comments?path=paper.md")
                     self.assertEqual(len(comments["comments"]), 1)
-                    self.assertIn("独立验证队列", comments["comments"][0]["content"])
+                    self.assertNotIn("独立验证队列", comments["comments"][0]["content"])
                     sessions = self._request(base + "/api/review-sessions?path=paper.md")
                     self.assertEqual(sessions["sessions"][0]["applied_count"], 1)
                 finally:

@@ -137,6 +137,16 @@ def main():
             }
             page.locator("#overview-close").click()
 
+            page.evaluate("document.querySelector('comma-editor').shadowRoot.querySelector('[data-toolbar-action=ai-review]').click()")
+            page.wait_for_function("!document.querySelector('#review-preflight-modal').hidden && !document.querySelector('#review-preflight-primary').disabled")
+            results["review_preflight"] = {
+                "title": page.locator("#review-preflight-title").text_content(),
+                "route": page.locator("#review-preflight-route-code").text_content(),
+                "primary": page.locator("#review-preflight-primary").text_content(),
+                "claims": page.locator("#review-preflight-modal .preflight-report-grid article").count(),
+            }
+            page.locator("#review-preflight-close").click()
+
             results["document_only_boundary"] = page.evaluate("""async () => {
               const fixture = document.createElement('comma-editor');
               fixture.id = 'document-only-fixture';
@@ -286,6 +296,10 @@ def main():
     assert results["overview_shell"]["title"] == "文章总览"
     assert results["overview_shell"]["claims"] == 3
     assert results["overview_shell"]["revision"] == results["public_component_render"]["rev"]
+    assert results["review_preflight"]["title"] == "复审预检"
+    assert results["review_preflight"]["route"] in {"FIRST PASS", "NO DELTA", "LOCAL DELTA", "GLOBAL RISK"}
+    assert results["review_preflight"]["primary"] in {"开始首次评审", "查看最近评审", "增量复审", "全文复审"}
+    assert results["review_preflight"]["claims"] == 3
     assert results["document_only_boundary"] == {
         "toolbarActions": ["document-info"],
         "commentCountNodes": 0,

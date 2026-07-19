@@ -10,7 +10,7 @@ registerCommaEditor();
 const DOC_PATH = new URLSearchParams(location.search).get('doc') || 'paper.md';
 const $ = (id) => document.getElementById(id);
 const editor = $('comma-editor');
-const reviewState = { active: null, sessions: [], running: false };
+const reviewState = { active: null, activeRun: null, sessions: [], running: false, preflight: null };
 const archiveState = { versions: [], drafts: [], currentRev: '', exportCapabilities: null, loading: false };
 const conversationState = {
   active: null, sessions: [], sourceQuote: null, running: false,
@@ -327,7 +327,7 @@ editor.addEventListener('comma-comment-action', async (event) => {
 });
 
 const REVIEW_STATUS = {
-  running: '评审中', ready: '待写回', preview: '待写回', completed: '已同步',
+  running: '评审中', ready: '操作预览', preview: '操作预览', completed: '已完成',
   needs_attention: '部分需确认', needs_rebase: '原文已变化', failed: '运行失败',
 };
 
@@ -341,6 +341,106 @@ function closeReviewDrawer() {
   $('review-drawer').classList.remove('open');
   $('review-drawer').setAttribute('aria-hidden', 'true');
   $('review-scrim').hidden = true;
+}
+
+function activateReviewSession(rawSession, rawRun = null) {
+  reviewState.active = rawSession ? normalizeReviewSession(rawSession) : null;
+  reviewState.activeRun = rawRun || rawSession?.run || null;
+}
+
+function openReviewPreflight() {
+  $('review-preflight-modal').hidden = false;
+  $('review-preflight-modal').setAttribute('aria-hidden', 'false');
+  $('review-preflight-scrim').hidden = false;
+}
+
+function closeReviewPreflight() {
+  $('review-preflight-modal').hidden = true;
+  $('review-preflight-modal').setAttribute('aria-hidden', 'true');
+  $('review-preflight-scrim').hidden = true;
+}
+
+const PREFLIGHT_ROUTE = {
+  initial: { code: 'FIRST PASS', title: '当前稿件尚无完成评审', scope: '首次完整阅读；可靠 finding 将以 provisional 写入批注' },
+  'view-latest': { code: 'NO DELTA', title: '正文与批注均未变化', scope: '默认查看最近评审；不会调用本机 CLI' },
+  incremental: { code: 'LOCAL DELTA', title: '变化限定在低风险局部范围', scope: '建议只复审变更块、局部上下文与受影响批注' },
+  full: { code: 'GLOBAL RISK', title: '变化命中保护章节', scope: '摘要、方法、结果、结论、引用或图表变化默认全文复审' },
+};
+
+function renderReviewPreflight(preflight) {
+  reviewState.preflight = preflight;
+  const documentDelta = preflight.document || {};
+  const commentDelta = preflight.comments || {};
+  const anchors = preflight.anchors || {};
+  const route = { ...(PREFLIGHT_ROUTE[preflight.recommended_mode] || PREFLIGHT_ROUTE.full) };
+  const comparisonIncomplete = (documentDelta.change_state === 'changed' && !documentDelta.baseline_body_available)
+    || commentDelta.comparison_state === 'unknown';
+  if (preflight.recommended_mode === 'full' && comparisonIncomplete) {
+    route.title = '历史基线不足以安全缩小范围';
+    route.scope = '缺少可核对的正文或批注基线快照，保守推荐全文复审';
+  }
+  const counts = ['added', 'edited', 'withdrawn', 'restored', 'replied']
+    .map((key) => [key, Array.isArray(commentDelta[key]) ? commentDelta[key].length : 0]);
+  const commentCount = counts.reduce((sum, row) => sum + row[1], 0);
+  const sectionNames = (documentDelta.affected_sections || []).filter(Boolean);
+  const missing = (anchors.missing || []).length;
+  const ambiguous = (anchors.ambiguous || []).length;
+  $('review-preflight-route-code').textContent = route.code;
+  $('review-preflight-route').textContent = route.title;
+  $('review-preflight-scope').textContent = route.scope;
+  $('review-preflight-document').textContent = documentDelta.change_state === 'no-baseline'
+    ? '无基线' : documentDelta.change_state === 'unchanged' ? '未变化' : `${(documentDelta.changed_blocks || []).length} 个块`;
+  $('review-preflight-sections').textContent = sectionNames.length
+    ? `影响章节：${sectionNames.join('、')}`
+    : documentDelta.change_state === 'changed' && !documentDelta.baseline_body_available
+      ? '基线正文快照不可用，无法安全缩小范围。'
+      : '未检测到正文块级变化。';
+  $('review-preflight-comments').textContent = commentCount ? `${commentCount} 项变化` : '未变化';
+  $('review-preflight-comment-detail').textContent = [
+    `新增 ${counts[0][1]}`, `人工编辑 ${counts[1][1]}`, `撤回 ${counts[2][1]}`,
+    `恢复 ${counts[3][1]}`, `回复 ${counts[4][1]}`,
+  ].join(' · ');
+  $('review-preflight-anchors').textContent = missing || ambiguous ? `${missing + ambiguous} 项需处理` : `${Number(anchors.ready || 0)} 项可靠`;
+  $('review-preflight-anchor-detail').textContent = `ready ${Number(anchors.ready || 0)} · missing ${missing} · ambiguous ${ambiguous}`;
+  $('review-preflight-baseline').textContent = preflight.baseline_session
+    ? `${preflight.baseline_session.id} · ${preflight.baseline_session.completed_at || '完成时间未知'}`
+    : '无已完成评审；将建立首个 session';
+  const protectedNames = documentDelta.protected_sections || [];
+  $('review-preflight-reason').textContent = protectedNames.length
+    ? `保护类别命中：${protectedNames.join('、')}。增量复审仍可手动选择，但属于明确降级。`
+    : comparisonIncomplete
+      ? '历史 session 缺少完整的 revision 快照；未把未知状态误报为“无变化”，因此保守路由到全文复审。'
+      : preflight.recommended_mode === 'incremental'
+      ? '变化仅限非保护章节或批注层；changed_blocks 只用于路由，不声称已判断语义影响。'
+      : preflight.recommended_mode === 'view-latest'
+        ? 'document rev 与 comments_rev 均等于基线；默认动作不会产生模型调用。'
+        : '首次评审读取当前完整 Markdown；写入项保持 provisional，不能显示为已接受。';
+
+  const primary = $('review-preflight-primary');
+  const view = $('review-preflight-view');
+  const incremental = $('review-preflight-incremental');
+  const force = $('review-preflight-force');
+  primary.disabled = false;
+  view.hidden = !preflight.baseline_session || preflight.recommended_mode === 'view-latest';
+  incremental.hidden = preflight.recommended_mode !== 'full';
+  force.hidden = !preflight.baseline_session || preflight.recommended_mode === 'full';
+  if (preflight.recommended_mode === 'initial') {
+    primary.dataset.mode = 'initial'; primary.textContent = '开始首次评审';
+  } else if (preflight.recommended_mode === 'view-latest') {
+    primary.dataset.mode = 'view-latest'; primary.textContent = '查看最近评审';
+  } else if (preflight.recommended_mode === 'incremental') {
+    primary.dataset.mode = 'incremental'; primary.textContent = '增量复审';
+  } else {
+    primary.dataset.mode = 'forced-full'; primary.textContent = '全文复审';
+  }
+}
+
+async function viewLatestReview() {
+  const id = reviewState.preflight?.baseline_session?.id;
+  if (!id) return;
+  closeReviewPreflight();
+  openReviewDrawer();
+  await loadReviewSession(id);
 }
 
 const VERSION_KIND = {
@@ -551,7 +651,7 @@ async function loadReviewSessions(loadLatest = false) {
 async function loadReviewSession(id) {
   const { json } = await apiJson(`/api/review-sessions/${encodeURIComponent(id)}`);
   if (!json.ok) return toast(json.error || '评审记录读取失败', true);
-  reviewState.active = normalizeReviewSession(json.session);
+  activateReviewSession(json.session);
   renderReviewSession();
 }
 
@@ -577,6 +677,7 @@ function renderReviewHistory() {
 
 function renderReviewSession() {
   const session = reviewState.active;
+  const run = reviewState.activeRun;
   $('review-empty').hidden = Boolean(session);
   $('review-session').hidden = !session;
   if (!session) return;
@@ -588,15 +689,21 @@ function renderReviewSession() {
   const status = $('review-status');
   status.className = `review-status ${session.status || ''}`;
   status.textContent = REVIEW_STATUS[session.status] || session.status || '未知';
-  $('review-session-meta').textContent = `${session.tool.toUpperCase()} · ${session.id} · rev ${session.baseRev}`;
+  $('review-session-meta').textContent = `${session.tool.toUpperCase()} · ${run?.mode || 'legacy'} · ${session.id} · rev ${session.baseRev}`;
   $('review-summary').textContent = session.summary || '本轮未提供总评。';
+  const operationCounts = (run?.operations || []).reduce((counts, operation) => {
+    counts[operation.action] = (counts[operation.action] || 0) + 1;
+    return counts;
+  }, {});
   $('review-stats').innerHTML = [
     `<span class="review-stat">${findings.length} 条 findings</span>`,
     `<span class="review-stat">${accepted} 条已接受</span>`,
     `<span class="review-stat">${ready} 条锚点可靠</span>`,
     `<span class="review-stat">${applied} 条已写回</span>`,
     blocked ? `<span class="review-stat">${blocked} 条待定位</span>` : '',
+    run ? `<span class="review-stat">操作：新增 ${operationCounts.create || 0} · 修改 ${operationCounts.update || 0} · 撤回 ${operationCounts.withdraw || 0} · 不变 ${operationCounts.keep || 0} · 阻断 ${operationCounts.blocked || 0}</span>` : '',
   ].join('');
+  $('review-writeback').hidden = Boolean(run);
   renderFindings(findings);
   renderReviewMessages(session.messages || []);
 }
@@ -654,27 +761,60 @@ function renderReviewMessages(messages) {
 async function startReview() {
   if (reviewState.running) return;
   if (editor.dirty) return toast('请先保存正文，再启动评审。', true);
-  openReviewDrawer();
+  openReviewPreflight();
+  reviewState.preflight = null;
+  $('review-preflight-primary').disabled = true;
+  $('review-preflight-route-code').textContent = 'CHECKING';
+  $('review-preflight-route').textContent = '正在核对 revision、批注与锚点';
+  $('review-preflight-scope').textContent = '确定性预检不会调用模型';
+  const { response, json } = await apiJson(`/api/review-preflight?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
+  if (!response.ok || !json.ok || !json.preflight) {
+    $('review-preflight-route-code').textContent = 'FAILED';
+    $('review-preflight-route').textContent = '预检失败';
+    $('review-preflight-scope').textContent = json.error || `HTTP ${response.status}`;
+    return;
+  }
+  if (json.preflight.document?.current_rev !== editor.documentState.rev) {
+    await editor.load();
+    toast('磁盘 revision 已变化；编辑器已载入当前版本。', true);
+  }
+  renderReviewPreflight(json.preflight);
+}
+
+async function runReview(mode) {
+  const preflight = reviewState.preflight;
+  if (!preflight || reviewState.running) return;
   const tool = selectedReviewTool();
   if (!await requireRuntimeTool(tool, 'structured_review')) return;
-  setReviewRunning(true, `${tool.toUpperCase()} 正在读取当前版本、生成 findings 并校验原文锚点。完整评审可能需要几分钟…`);
-  const { json } = await apiJson('/api/review-sessions', {
+  closeReviewPreflight();
+  openReviewDrawer();
+  const modeLabel = mode === 'initial' ? '首次完整评审' : mode === 'incremental' ? '增量复审' : '强制全文复审';
+  setReviewRunning(true, `${tool.toUpperCase()} 正在执行${modeLabel}；模型返回后会先校验锚点并生成操作。`);
+  const { json } = await apiJson('/api/review-runs', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       path: DOC_PATH,
-      base_rev: editor.documentState.rev,
+      base_rev: preflight.document.current_rev,
+      baseline_session_id: preflight.baseline_session?.id || '',
+      comments_rev: preflight.comments.comments_rev,
+      mode,
       tool,
       instruction: $('review-instruction').value.trim(),
-      writeback_policy: $('review-auto-writeback').checked ? 'auto-ready' : 'preview',
     }),
   });
-  if (!json.ok) return setReviewRunning(false, json.message || json.error || '完整评审失败', true);
-  reviewState.active = normalizeReviewSession(json.session);
-  setReviewRunning(false, json.writeback?.ok
-    ? '评审完成：可靠 findings 已写入公共编辑器批注，重复同步不会产生重复项。'
-    : '评审完成：请确认清单后同步批注。');
+  if (!json.ok) return setReviewRunning(false, json.message || json.error || `${modeLabel}失败`, true);
+  activateReviewSession(json.session, json.run);
+  if (json.run?.status === 'running') {
+    setReviewRunning(false, '相同 revision 的评审已在运行；已复用该 run，不会重复调用模型。');
+  } else if (mode === 'initial' && json.writeback?.ok) {
+    setReviewRunning(false, '首评完成：唯一可靠的 findings 已作为 provisional 批注写入，尚未视为已接受。');
+  } else if (json.run?.status === 'needs_rebase') {
+    setReviewRunning(false, '模型运行期间正文或批注发生变化；操作已保留，但需要重新预检。', true);
+  } else {
+    setReviewRunning(false, '复审完成：操作停在 preview，批注未发生写入。');
+  }
   renderReviewSession();
-  await refreshEditorComments();
+  if (mode === 'initial') await refreshEditorComments();
   await loadReviewSessions(false);
 }
 
@@ -689,8 +829,8 @@ async function continueReview() {
   });
   if (!json.ok) return setReviewRunning(false, json.message || json.error || '更新评审失败', true);
   $('review-message').value = '';
-  reviewState.active = normalizeReviewSession(json.session);
-  setReviewRunning(false, json.writeback?.ok ? '评审清单和批注已增量同步。' : '评审清单已更新。');
+  activateReviewSession(json.session, reviewState.activeRun);
+  setReviewRunning(false, '评审清单已更新并停在 preview；批注未发生写入。');
   renderReviewSession();
   await refreshEditorComments();
   await loadReviewSessions(false);
@@ -699,17 +839,18 @@ async function continueReview() {
 async function syncReview() {
   const session = reviewState.active;
   if (!session || reviewState.running) return;
+  if (reviewState.activeRun) return toast('ReviewRun 写回确认属于 Slice C；当前操作保持 preview。', true);
   setReviewRunning(true, '正在校验文档版本和锚点，并执行幂等批注写回…');
   const { json } = await apiJson(`/api/review-sessions/${encodeURIComponent(session.id)}/writeback`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
   });
   if (!json.ok) {
-    if (json.session) reviewState.active = normalizeReviewSession(json.session);
+    if (json.session) activateReviewSession(json.session);
     setReviewRunning(false, json.message || json.error || '批注同步失败', true);
     renderReviewSession();
     return;
   }
-  reviewState.active = normalizeReviewSession(json.session);
+  activateReviewSession(json.session);
   const writeback = json.writeback || {};
   setReviewRunning(false, `同步完成：新增 ${(writeback.created || []).length}，更新 ${(writeback.updated || []).length}，跳过 ${(writeback.skipped || []).length}。`);
   renderReviewSession();
@@ -725,14 +866,15 @@ async function decideFinding(findingId, decision) {
     body: JSON.stringify({ finding_id: findingId, decision }),
   });
   if (!json.ok) return toast(json.error || '更新 finding 失败', true);
-  reviewState.active = normalizeReviewSession(json.session);
+  activateReviewSession(json.session);
   renderReviewSession();
 }
 
 function resetReviewComposer() {
   reviewState.active = null;
+  reviewState.activeRun = null;
   $('review-instruction').value = '';
-  setReviewRunning(false, '已准备新评审；设置重点后点击“开始完整评审”。');
+  setReviewRunning(false, '当前视图已清空；点击“重新预检”后再选择评审范围。');
   renderReviewSession();
 }
 
@@ -1065,6 +1207,17 @@ $('export-list').onclick = (event) => {
 $('review-close').onclick = closeReviewDrawer;
 $('review-scrim').onclick = closeReviewDrawer;
 $('review-start').onclick = startReview;
+$('review-preflight-close').onclick = closeReviewPreflight;
+$('review-preflight-cancel').onclick = closeReviewPreflight;
+$('review-preflight-scrim').onclick = closeReviewPreflight;
+$('review-preflight-view').onclick = viewLatestReview;
+$('review-preflight-incremental').onclick = () => runReview('incremental');
+$('review-preflight-force').onclick = () => runReview('forced-full');
+$('review-preflight-primary').onclick = () => {
+  const mode = $('review-preflight-primary').dataset.mode;
+  if (mode === 'view-latest') return viewLatestReview();
+  return runReview(mode);
+};
 $('review-new').onclick = resetReviewComposer;
 $('review-writeback').onclick = syncReview;
 $('review-send').onclick = continueReview;
@@ -1120,12 +1273,12 @@ document.querySelectorAll('input[name="review-tool"], input[name="conversation-t
 });
 
 window.__COMMA_REVIEW__ = {
-  editor, adapter, reviewState, startReview, continueReview, syncReview,
+  editor, adapter, reviewState, startReview, runReview, continueReview, syncReview,
   loadReviewSession, loadReviewSessions, conversationState, loadConversationSession,
   loadConversationSessions, openConversationForQuote, sendConversationMessage,
   loadRuntimeCapabilities, runtimeToolReady, archiveState, loadVersions,
   openArchive, closeArchive, createCheckpoint, restoreVersion, restoreDraft,
-  openOverview, closeOverview,
+  openOverview, closeOverview, renderReviewPreflight, closeReviewPreflight,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 

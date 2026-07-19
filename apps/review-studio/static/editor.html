@@ -68,6 +68,46 @@
   </aside>
   <div id="overview-scrim" class="overview-scrim" hidden></div>
 
+  <section id="review-preflight-modal" class="review-preflight-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="review-preflight-title" hidden>
+    <header class="preflight-head">
+      <div><div class="eyebrow">DETERMINISTIC PREFLIGHT</div><h2 id="review-preflight-title">复审预检</h2></div>
+      <button id="review-preflight-close" class="icon-button" type="button" aria-label="关闭复审预检">×</button>
+    </header>
+    <div class="preflight-route-band">
+      <span id="review-preflight-route-code">CHECKING</span>
+      <div><strong id="review-preflight-route">正在核对版本</strong><small id="review-preflight-scope">不会调用模型</small></div>
+    </div>
+    <div class="preflight-report-grid">
+      <article>
+        <span>MANUSCRIPT DELTA</span>
+        <strong id="review-preflight-document">—</strong>
+        <p id="review-preflight-sections">正在读取块级 hash…</p>
+      </article>
+      <article>
+        <span>COMMENT DELTA</span>
+        <strong id="review-preflight-comments">—</strong>
+        <p id="review-preflight-comment-detail">正在核对 comments_rev…</p>
+      </article>
+      <article>
+        <span>ANCHOR HEALTH</span>
+        <strong id="review-preflight-anchors">—</strong>
+        <p id="review-preflight-anchor-detail">正在重新定位批注锚点…</p>
+      </article>
+    </div>
+    <section class="preflight-boundary">
+      <div><span>ROUTING BASIS</span><strong id="review-preflight-baseline">尚未确定基线</strong></div>
+      <p id="review-preflight-reason">预检只比较 revision、块 hash、批注事件与锚点；此阶段不调用 Codex 或 Claude。</p>
+    </section>
+    <footer class="preflight-actions">
+      <button id="review-preflight-cancel" type="button">取消</button>
+      <button id="review-preflight-view" type="button" hidden>查看最近评审</button>
+      <button id="review-preflight-incremental" class="downgrade" type="button" hidden>仍按增量复审</button>
+      <button id="review-preflight-force" type="button" hidden>强制全文复审</button>
+      <button id="review-preflight-primary" class="primary" type="button" disabled>继续</button>
+    </footer>
+  </section>
+  <div id="review-preflight-scrim" class="review-preflight-scrim" hidden></div>
+
   <aside id="review-drawer" class="review-drawer" aria-hidden="true">
     <div class="review-drawer-head">
       <div><div class="eyebrow">REVIEW SESSION</div><h2>审稿台账</h2></div>
@@ -80,12 +120,12 @@
           <label><input type="radio" name="review-tool" value="claude"><span>Claude</span></label>
           <label><input type="radio" name="review-tool" value="codex" checked><span>Codex</span></label>
         </div>
-        <label class="writeback-toggle"><input id="review-auto-writeback" type="checkbox" checked><span>可靠批注自动写回</span></label>
+        <div class="review-policy"><strong>首评</strong><span>provisional 自动写入 · 复审只生成预览</span></div>
       </div>
       <textarea id="review-instruction" rows="2" placeholder="可选：补充这轮评审重点，例如“重点核查临床外推和引文边界”"></textarea>
       <div class="review-launch-actions">
-        <button id="review-new" type="button">新评审</button>
-        <button id="review-start" class="review-run-button" type="button"><span>✦</span> 开始完整评审</button>
+        <button id="review-new" type="button">清空当前视图</button>
+        <button id="review-start" class="review-run-button" type="button"><span>✦</span> 重新预检</button>
       </div>
       <div id="review-run-state" class="review-run-state" hidden></div>
       <p class="review-capability-note">评审只读取正文、图注和引用文本；不读取图片像素、不全文核验文献、不重新计算统计结果。</p>
@@ -117,7 +157,7 @@
         <h3>继续讨论</h3>
         <div id="review-messages" class="review-messages"></div>
         <textarea id="review-message" rows="3" placeholder="例如：标题这一条不改；把重点转到引文和临床表述，再同步批注。"></textarea>
-        <button id="review-send" class="review-send" type="button">更新评审并同步</button>
+        <button id="review-send" class="review-send" type="button">更新评审预览</button>
       </section>
     </div>
 
