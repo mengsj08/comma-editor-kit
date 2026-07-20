@@ -640,6 +640,15 @@ body { margin: 0; overflow-x: clip; font: 15px/1.6 -apple-system, BlinkMacSystem
 .toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.err { background: var(--stale); }
 
+@media (min-width: 761px) and (max-width: 1099px) {
+  .doc-header { flex-wrap: wrap; gap: 8px 14px; align-items: flex-start; padding: 8px 14px; }
+  .doc-title { flex: 1 1 360px; min-width: 0; }
+  #doc-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-actions { flex: 1 1 100%; min-width: 0; max-width: 100%; justify-content: flex-end; flex-wrap: wrap; gap: 5px; }
+  .doc-actions button { flex: 0 1 auto; padding: 5px 9px; }
+  .cli-status-wrap { min-width: 0; }
+}
+
 /* The document surface is now the canonical public Web Component. Review
    Studio only composes the provider/session drawer around it. */
 .comma-host-main { display: block; }

@@ -259,6 +259,29 @@ def main() -> None:
             screenshot = ROOT / "test-artifacts" / "standalone.png"
             screenshot.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(screenshot), full_page=True)
+
+            page.locator("comma-editor").evaluate(
+                """async el => {
+                  await el.replaceDocument({
+                    title: 'broken-images.md',
+                    body: '# Broken images\\n\\n![PDF panel](figures/panel.pdf)\\n\\n![empty source]()\\n',
+                    actor: 'browser-smoke'
+                  });
+                }"""
+            )
+            page.wait_for_function(
+                "document.querySelector('comma-editor').shadowRoot.querySelectorAll('.ce-image-fallback').length === 2"
+            )
+            broken_image_state = page.locator("comma-editor").evaluate(
+                """el => ({
+                  images: el.shadowRoot.querySelectorAll('.ce-preview img').length,
+                  fallbacks: Array.from(el.shadowRoot.querySelectorAll('.ce-image-fallback')).map(node => node.textContent)
+                })"""
+            )
+            assert broken_image_state["images"] == 0
+            assert any("Unsupported image format: panel.pdf" in text for text in broken_image_state["fallbacks"])
+            assert any("missing image source" in text for text in broken_image_state["fallbacks"])
+
             result = {
                 "ok": True,
                 "title": title,
@@ -274,6 +297,7 @@ def main() -> None:
                 "batch_missing": batch_preview["counts"]["missing"],
                 "review_queue_closed": review_queue_closed,
                 "passive_click_state": passive_click_state,
+                "broken_image_state": broken_image_state,
                 "review_screenshot": str(review_screenshot),
                 "screenshot": str(screenshot),
             }

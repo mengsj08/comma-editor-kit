@@ -690,7 +690,9 @@ export class CommaEditorElement extends HTMLElement {
       image.dataset.assetState = 'loading';
       this._promoteImageFigure(image);
       image.closest('.ce-block')?.classList.add('ce-breakout', 'ce-breakout-figure');
-      if (image.complete) {
+      if (!image.getAttribute('src')) {
+        this._replaceImageWithFallback(image, 'missing image source');
+      } else if (image.complete) {
         if (image.naturalWidth > 0) image.dataset.assetState = 'ready';
         else this._replaceImageWithFallback(image);
       } else {
@@ -746,15 +748,26 @@ export class CommaEditorElement extends HTMLElement {
     if (!image?.isConnected || image.dataset.assetState === 'failed') return;
     image.dataset.assetState = 'failed';
     const source = image.dataset.originalSrc || image.getAttribute('src') || '';
-    const fallback = document.createElement('a');
+    const href = image.getAttribute('src') || source || '';
+    const fallback = href ? document.createElement('a') : document.createElement('div');
     fallback.className = 'ce-image-fallback';
-    fallback.href = image.getAttribute('src') || source || '#';
-    fallback.target = '_blank';
-    fallback.rel = 'noopener noreferrer';
-    fallback.textContent = reason
-      ? `Image unavailable: ${reason}`
-      : `Image unavailable: ${image.alt || source || 'unnamed image'}`;
+    if (href) {
+      fallback.href = href;
+      fallback.target = '_blank';
+      fallback.rel = 'noopener noreferrer';
+    }
+    fallback.textContent = this._imageFallbackText({ source, alt: image.alt, reason });
     image.replaceWith(fallback);
+  }
+
+  _imageFallbackText({ source = '', alt = '', reason = '' } = {}) {
+    const name = String(source || alt || 'unnamed image').split('/').filter(Boolean).pop() || String(source || alt || 'unnamed image');
+    const zh = this.lang?.toLowerCase().startsWith('zh');
+    if (/\.pdf(?:$|[?#])/i.test(String(source))) {
+      return zh ? `图片格式暂不支持：${name}` : `Unsupported image format: ${name}`;
+    }
+    if (reason) return zh ? `图片不可用：${reason}` : `Image unavailable: ${reason}`;
+    return zh ? `图片不可用：${name}` : `Image unavailable: ${name}`;
   }
 
   _openImageLightbox(image) {

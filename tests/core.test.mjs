@@ -69,6 +69,7 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
   const hostCss = readFileSync(new URL('../apps/review-studio/static/editor.css', import.meta.url), 'utf8');
   assert.match(componentCss, /@media \(min-width: 1600px\)/);
   assert.match(componentCss, /grid-template-columns:\s*clamp\(180px,\s*11vw,\s*240px\)\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
+  assert.match(componentCss, /@media \(min-width: 1900px\)[\s\S]*grid-template-columns:\s*180px\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
   assert.match(componentCss, /@media \(min-width: 1100px\) and \(max-width: 1599px\)/);
   assert.match(componentCss, /@media \(min-width: 821px\) and \(max-width: 1099px\)/);
   assert.match(componentCss, /@media \(max-width: 820px\)/);
@@ -76,7 +77,9 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
   assert.match(componentCss, /\.ce-block\.ce-breakout[\s\S]*width:\s*min\(1300px,\s*100cqi\)/);
   assert.match(componentCss, /\.ce-table-scroll[\s\S]*overflow-x:\s*auto/);
   assert.match(componentCss, /\.ce-code-copy/);
+  assert.match(componentCss, /\.ce-image-fallback/);
   assert.match(hostCss, /overflow-x:\s*clip/);
+  assert.match(hostCss, /@media \(min-width: 761px\) and \(max-width: 1099px\)[\s\S]*\.doc-actions[\s\S]*flex-wrap:\s*wrap/);
   assert.match(hostCss, /width:\s*min\(1792px,\s*calc\(100% - 64px\)\)/);
 });
 
