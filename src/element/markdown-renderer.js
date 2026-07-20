@@ -60,6 +60,23 @@ function mathExtensions() {
   ];
 }
 
+export function stabilizeImageLabelBackticks(source) {
+  let fenced = false;
+  return String(source ?? '').split(/(\r?\n)/).map((part) => {
+    if (/^\r?\n$/.test(part)) return part;
+    const fence = /^\s*(```|~~~)/.test(part);
+    if (fence) {
+      fenced = !fenced;
+      return part;
+    }
+    if (fenced || /^(?: {4}|\t)/.test(part)) return part;
+    return part.replace(/!\[((?:\\.|[^\]\\])*)\]\(([^)\n]+)\)/g, (match, label, href) => {
+      if (!label.includes('`')) return match;
+      return `![${label.replace(/(^|[^\\])`/g, '$1\\`')}](${href})`;
+    });
+  }).join('');
+}
+
 export class MarkdownRenderer {
   constructor() {
     this.assetResolver = null;
@@ -103,7 +120,7 @@ export class MarkdownRenderer {
   render(source, { resolveAsset = null } = {}) {
     this.assetResolver = typeof resolveAsset === 'function' ? resolveAsset : null;
     try {
-      const unsafe = this.marked.parse(String(source ?? ''));
+      const unsafe = this.marked.parse(stabilizeImageLabelBackticks(source));
       return DOMPurify.sanitize(unsafe, {
         USE_PROFILES: { html: true },
         ADD_ATTR: ['target', 'rel', 'data-language', 'data-original-src'],

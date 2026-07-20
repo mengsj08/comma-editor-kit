@@ -1,6 +1,6 @@
 # arXiv 1706.03762v7 conversion loss report
 
-- Converter: `scripts/convert_attention_arxiv.py` 0.3.0
+- Converter: `scripts/convert_attention_arxiv.py` 0.4.0
 - Runtime: Python 3.13.12
 - Scope: one-paper spike for Attention Is All You Need, not a generic TeX importer.
 - Input chain: official arXiv abs HTML, e-print TeX source, official PDF.

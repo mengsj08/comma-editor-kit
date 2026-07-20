@@ -26,7 +26,7 @@ ABS_URL = f"https://arxiv.org/abs/{ARXIV_ID}"
 SOURCE_URL = f"https://arxiv.org/e-print/{ARXIV_ID}"
 PDF_URL = f"https://arxiv.org/pdf/{ARXIV_ID}"
 CONVERTER_NAME = "scripts/convert_attention_arxiv.py"
-CONVERTER_VERSION = "0.3.0"
+CONVERTER_VERSION = "0.4.0"
 MATH_GUARD_TOKENS = ["sqrt", "frac", "sum", "mathrm", "cdot"]
 
 
@@ -110,6 +110,13 @@ def restore_inline_math(text: str, protected: dict[str, str]) -> str:
 
 def clean_inline(text: str) -> str:
     text, protected_math = protect_inline_math(text)
+    text = (
+        text
+        .replace("``", "\u201c")
+        .replace("''", "\u201d")
+        .replace("`", "\u2018")
+        .replace("'", "\u2019")
+    )
     replacements = {
         r"\dmodel": r"d_{\text{model}}",
         r"\dff": r"d_{\text{ff}}",

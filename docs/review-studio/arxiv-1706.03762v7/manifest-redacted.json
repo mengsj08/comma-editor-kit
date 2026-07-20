@@ -22,7 +22,7 @@
     "converter": {
       "name": "scripts/convert_attention_arxiv.py",
       "python_version": "3.13.12",
-      "version": "0.3.0"
+      "version": "0.4.0"
     },
     "rasterizer": {
       "fallback": "pdftoppm not used",

@@ -262,6 +262,33 @@ def main() -> None:
 
             page.locator("comma-editor").evaluate(
                 """async el => {
+                  const tiny = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
+                  await el.replaceDocument({
+                    title: 'image-integrity.md',
+                    body: `# Image integrity\\n\\n![Tiny \\`tick'.](${tiny})\\n\\n![Second tiny](${tiny})\\n`,
+                    actor: 'browser-smoke'
+                  });
+                }"""
+            )
+            page.wait_for_function(
+                """() => {
+                  const root = document.querySelector('comma-editor').shadowRoot;
+                  const imgs = Array.from(root.querySelectorAll('.ce-preview img'));
+                  return imgs.length === 2 && imgs.every(img => img.complete && img.naturalWidth > 0);
+                }"""
+            )
+            image_integrity_state = page.locator("comma-editor").evaluate(
+                """el => {
+                  const refs = el.documentState.body.match(/!\\[[^\\n]*?\\]\\([^\\n)]+\\)/g) || [];
+                  const imgs = Array.from(el.shadowRoot.querySelectorAll('.ce-preview img'));
+                  const ready = imgs.filter(img => img.dataset.assetState === 'ready' && img.naturalWidth > 0);
+                  return { refs: refs.length, images: imgs.length, ready: ready.length };
+                }"""
+            )
+            assert image_integrity_state == {"refs": 2, "images": 2, "ready": 2}
+
+            page.locator("comma-editor").evaluate(
+                """async el => {
                   await el.replaceDocument({
                     title: 'broken-images.md',
                     body: '# Broken images\\n\\n![PDF panel](figures/panel.pdf)\\n\\n![empty source]()\\n',
@@ -297,6 +324,7 @@ def main() -> None:
                 "batch_missing": batch_preview["counts"]["missing"],
                 "review_queue_closed": review_queue_closed,
                 "passive_click_state": passive_click_state,
+                "image_integrity_state": image_integrity_state,
                 "broken_image_state": broken_image_state,
                 "review_screenshot": str(review_screenshot),
                 "screenshot": str(screenshot),

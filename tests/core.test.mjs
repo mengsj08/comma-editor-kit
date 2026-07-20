@@ -11,6 +11,7 @@ import {
 import { replaceBlock, segmentMarkdown } from '../src/core/blocks.js';
 import { previewCommentBatch } from '../src/core/comment-batch.js';
 import { buildSectionIndex, sectionForBlock } from '../src/core/section-index.js';
+import { stabilizeImageLabelBackticks } from '../src/element/markdown-renderer.js';
 import { revisionOf } from '../src/core/revision.js';
 import {
   isCommentVisible,
@@ -81,6 +82,16 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
   assert.match(hostCss, /overflow-x:\s*clip/);
   assert.match(hostCss, /@media \(min-width: 761px\) and \(max-width: 1099px\)[\s\S]*\.doc-actions[\s\S]*flex-wrap:\s*wrap/);
   assert.match(hostCss, /width:\s*min\(1792px,\s*calc\(100% - 64px\)\)/);
+});
+
+test('renderer preserves image syntax when alt text contains TeX-style backticks', () => {
+  const source = "![An example `making'.](assets/vis/making.png)\n\n```md\n![Code `sample'.](x.png)\n```";
+  const stable = stabilizeImageLabelBackticks(source);
+  assert.ok(stable.includes("![An example \\`making'.](assets/vis/making.png)"));
+  assert.ok(stable.includes("```md\n![Code `sample'.](x.png)\n```"));
+  const tokens = marked.lexer(stable);
+  assert.equal(tokens[0].tokens[0].type, 'image');
+  assert.equal(tokens[0].tokens[0].href, 'assets/vis/making.png');
 });
 
 test('anchors resolve unique, contextual, ambiguous, and missing quotes', () => {
