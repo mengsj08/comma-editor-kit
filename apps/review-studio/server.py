@@ -4026,22 +4026,26 @@ def _comment_user_interacted(comment) -> bool:
     return any((reply.get("state") or "active") == "active" for reply in comment.get("replies") or [])
 
 
-def _lineage_block_hash_unchanged(existing, proposed) -> bool:
+def _lineage_block_hash_state(existing, proposed) -> str:
     old = {
         (item.get("block_id"), item.get("text_index")): item.get("block_hash")
         for item in existing.get("evidence_occurrences") or []
         if item.get("block_id") and item.get("block_hash")
     }
     if not old:
-        return False
+        return "unverified"
     checked = 0
     for item in proposed.get("evidence_occurrences") or []:
         key = (item.get("block_id"), item.get("text_index"))
         if key in old:
             checked += 1
             if old[key] != item.get("block_hash"):
-                return False
-    return checked > 0
+                return "changed"
+    return "unchanged" if checked > 0 else "unverified"
+
+
+def _lineage_block_hash_unchanged(existing, proposed) -> bool:
+    return _lineage_block_hash_state(existing, proposed) == "unchanged"
 
 
 def _lineage_lookup(comments):
@@ -4060,10 +4064,19 @@ def _lineage_notice(existing, proposed):
         (existing.get("workflow") or {}).get("state") == "declined_once"
         or existing.get("finding_state") == "withdrawn"
     )
+    block_hash_state = _lineage_block_hash_state(existing, proposed)
+    message = "本轮再次提出"
+    if previous_declined and block_hash_state == "unchanged":
+        message = "上轮未采纳；相关原文自上轮未变化；本轮再次提出"
+    elif previous_declined and block_hash_state == "changed":
+        message = "上轮未采纳；相关原文自上轮已变化；本轮再次提出"
+    elif previous_declined:
+        message = "上轮未采纳；本轮再次提出（原文变化状态未核验）"
     return {
         "previous_declined": previous_declined,
-        "same_blocks_unchanged": _lineage_block_hash_unchanged(existing, proposed),
-        "message": "上轮未采纳；相关原文自上轮未变化；本轮再次提出" if previous_declined else "本轮再次提出",
+        "block_hash_state": block_hash_state,
+        "same_blocks_unchanged": block_hash_state == "unchanged",
+        "message": message,
         "mute_available": bool(previous_declined),
     }
 

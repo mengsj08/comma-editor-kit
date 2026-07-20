@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SKL-99 cross-run finding lifecycle contracts."""
 from contextlib import contextmanager
+import copy
 import os
 import tempfile
 import unittest
@@ -168,6 +169,31 @@ class ReviewLifecycleTests(unittest.TestCase):
                 self.assertIn("lineage-resurfaced", actions)
                 self.assertIn("lineage-muted", actions)
                 self.assertEqual(new_finding["finding_lineage_id"], old_finding["finding_lineage_id"])
+
+    def test_13b_resurfacing_notice_message_uses_verified_hash_state(self):
+        body = "# Discussion\n\nTemplate phrase repeats.\n"
+        old_finding = _resolve(body, _base_finding(id="F001"))
+        proposed = _resolve(body, _base_finding(id="F999"))
+        old_comment = self._comment_from_finding(
+            old_finding, finding_state="withdrawn", workflow_state="declined_once")
+
+        unchanged = server._lineage_notice(old_comment, proposed)
+        self.assertEqual(unchanged["block_hash_state"], "unchanged")
+        self.assertEqual(unchanged["message"], "上轮未采纳；相关原文自上轮未变化；本轮再次提出")
+
+        changed_comment = copy.deepcopy(old_comment)
+        changed_comment["evidence_occurrences"][0]["block_hash"] = "sha256:changed"
+        changed = server._lineage_notice(changed_comment, proposed)
+        self.assertEqual(changed["block_hash_state"], "changed")
+        self.assertEqual(changed["message"], "上轮未采纳；相关原文自上轮已变化；本轮再次提出")
+        self.assertNotIn("未变化", changed["message"])
+
+        unverified_comment = copy.deepcopy(old_comment)
+        unverified_comment["evidence_occurrences"][0].pop("block_hash", None)
+        unverified = server._lineage_notice(unverified_comment, proposed)
+        self.assertEqual(unverified["block_hash_state"], "unverified")
+        self.assertEqual(unverified["message"], "上轮未采纳；本轮再次提出（原文变化状态未核验）")
+        self.assertNotIn("未变化", unverified["message"])
 
     def test_14_candidate_resolved_is_pending_confirmation_not_auto_close(self):
         body = "# Results\n\nA unique controlled claim needs qualification.\n"
