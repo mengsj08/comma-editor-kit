@@ -1080,6 +1080,16 @@ function selectedReviewTool() {
   return document.querySelector('input[name="review-tool"]:checked')?.value || 'codex';
 }
 
+function selectedReviewAgentIdentity() {
+  return {
+    adapter_id: 'legacy',
+    adapter_version: 'legacy',
+    profile_id: 'legacy',
+    rubric_version: 'legacy',
+    output_schema_version: 'comma-review-run/v1',
+  };
+}
+
 function setReviewRunning(running, message = '', isError = false) {
   reviewState.running = Boolean(running);
   const stateElement = $('review-run-state');
@@ -1594,7 +1604,9 @@ async function startReview() {
   $('review-preflight-route-code').textContent = 'CHECKING';
   $('review-preflight-route').textContent = '正在核对 revision、批注与锚点';
   $('review-preflight-scope').textContent = '确定性预检不会调用模型';
-  const { response, json } = await apiJson(`/api/review-preflight?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
+  // Endpoint prefix kept stable for host smoke checks: /api/review-preflight?path=
+  const params = new URLSearchParams({ path: DOC_PATH, ...selectedReviewAgentIdentity() });
+  const { response, json } = await apiJson(`/api/review-preflight?${params.toString()}`, { cache: 'no-store' });
   if (!response.ok || !json.ok || !json.preflight) {
     $('review-preflight-route-code').textContent = 'FAILED';
     $('review-preflight-route').textContent = '预检失败';
@@ -1626,6 +1638,7 @@ async function runReview(mode) {
       comments_rev: preflight.comments.comments_rev,
       mode,
       tool,
+      ...selectedReviewAgentIdentity(),
       instruction: $('review-instruction').value.trim(),
       evidence_source_ids: [...evidenceState.selectedIds],
     }),

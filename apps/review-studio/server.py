@@ -135,6 +135,22 @@ _IMPORT_ID_RE = re.compile(r"^import-[a-f0-9]{16}$")
 _EVIDENCE_ID_RE = re.compile(r"^evidence-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
 _ACTIVE_REVIEW_RUNS = {}
+_REVIEW_AGENT_IDENTITY_FIELDS = (
+    "adapter_id", "adapter_version", "profile_id", "rubric_version",
+)
+_REVIEW_AGENT_PERSISTED_FIELDS = (
+    *_REVIEW_AGENT_IDENTITY_FIELDS, "output_schema_version",
+)
+_LEGACY_REVIEW_AGENT_IDENTITY = {
+    "adapter_id": "legacy",
+    "adapter_version": "legacy",
+    "profile_id": "legacy",
+    "rubric_version": "legacy",
+    "output_schema_version": "legacy",
+}
+# Migration rule: stored sessions/runs/comments without these fields belong only
+# to the explicit legacy adapter identity, never to an arbitrary future agent.
+_DEFAULT_OUTPUT_SCHEMA_VERSION = "comma-review-run/v1"
 _OBSERVABILITY_WARNING_COUNTS = {
     "malformed_comment_event_lines": 0,
 }
@@ -2240,7 +2256,7 @@ def _comment_record(payload, *, default_author="June", strict=True):
         value = payload.get(key)
         if isinstance(value, (dict, list)):
             rec[key] = json.loads(json.dumps(value, ensure_ascii=False))
-    for key in ("finding_lineage_id", "finding_lineage_key"):
+    for key in (*_REVIEW_AGENT_PERSISTED_FIELDS, "finding_lineage_id", "finding_lineage_key"):
         value = payload.get(key)
         if value not in (None, ""):
             rec[key] = str(value)
@@ -2556,6 +2572,70 @@ def _new_id(prefix: str, size: int = 12) -> str:
     return prefix + uuid.uuid4().hex[:size]
 
 
+def _clean_review_agent_part(value, default="legacy") -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "-", text)[:96].strip("-")
+    return text or default
+
+
+def _review_agent_identity_from_payload(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    identity = {
+        field: _clean_review_agent_part(payload.get(field), "legacy")
+        for field in _REVIEW_AGENT_IDENTITY_FIELDS
+    }
+    identity["output_schema_version"] = _clean_review_agent_part(
+        payload.get("output_schema_version"), _DEFAULT_OUTPUT_SCHEMA_VERSION)
+    return identity
+
+
+def _review_agent_identity_from_record(record=None):
+    record = record if isinstance(record, dict) else {}
+    return {
+        field: _clean_review_agent_part(
+            record.get(field), _LEGACY_REVIEW_AGENT_IDENTITY[field])
+        for field in _REVIEW_AGENT_PERSISTED_FIELDS
+    }
+
+
+def _review_agent_identity_key(identity) -> tuple:
+    normalized = _review_agent_identity_from_record(identity)
+    return tuple(normalized[field] for field in _REVIEW_AGENT_IDENTITY_FIELDS)
+
+
+def _same_review_agent(left, right) -> bool:
+    return _review_agent_identity_key(left) == _review_agent_identity_key(right)
+
+
+def _review_agent_fields(identity) -> dict:
+    normalized = _review_agent_identity_from_record(identity)
+    return {field: normalized[field] for field in _REVIEW_AGENT_PERSISTED_FIELDS}
+
+
+def _ensure_review_agent_fields(record, identity=None):
+    if not isinstance(record, dict):
+        return record
+    fields = _review_agent_fields(identity or record)
+    for field, value in fields.items():
+        record.setdefault(field, value)
+    for run_key in ("run",):
+        run = record.get(run_key)
+        if isinstance(run, dict):
+            _ensure_review_agent_fields(run, record)
+    for run in record.get("runs") or []:
+        if isinstance(run, dict):
+            _ensure_review_agent_fields(run, record)
+    return record
+
+
+def _review_run_active_key(doc_rel: str, base_rev: str, comments_rev: str, mode: str,
+                           evidence_key: str = "", agent_identity=None) -> tuple:
+    return (
+        doc_rel, base_rev, comments_rev, mode, evidence_key or "",
+        *_review_agent_identity_key(agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY),
+    )
+
+
 def _session_path(session_id: str) -> str:
     if not _SESSION_ID_RE.match(session_id or ""):
         raise ValueError("invalid review session id")
@@ -2572,11 +2652,13 @@ def _load_session(session_id: str):
         raise ValueError("invalid review session")
     if data.get("status") == "ready":
         data["status"] = "preview"
+    _ensure_review_agent_fields(data)
     return data
 
 
 def _save_session(session) -> None:
     os.makedirs(REVIEW_ROOT, exist_ok=True)
+    _ensure_review_agent_fields(session)
     session["updated_at"] = _now()
     _atomic_write(_session_path(session["id"]), json.dumps(
         session, ensure_ascii=False, indent=2))
@@ -2599,6 +2681,7 @@ def _session_summaries(doc_rel: str):
                 "id": session.get("id"),
                 "status": "preview" if session.get("status") == "ready" else session.get("status"),
                 "tool": session.get("tool"),
+                **_review_agent_fields(session),
                 "created_at": session.get("created_at"),
                 "updated_at": session.get("updated_at"),
                 "summary": session.get("summary") or "",
@@ -2623,12 +2706,15 @@ def _session_records(doc_rel=""):
             continue
         if data.get("status") == "ready":
             data["status"] = "preview"
+        _ensure_review_agent_fields(data)
         rows.append(data)
     return rows
 
 
-def _latest_completed_session(doc_rel: str):
+def _latest_completed_session(doc_rel: str, agent_identity=None):
     rows = [row for row in _session_records(doc_rel) if row.get("status") == "completed"]
+    if agent_identity is not None:
+        rows = [row for row in rows if _same_review_agent(row, agent_identity)]
     rows.sort(key=lambda row: (
         row.get("completed_at") or row.get("updated_at") or row.get("created_at") or "",
         row.get("id") or "",
@@ -2682,10 +2768,19 @@ def _load_review_run(run_id: str):
 
 
 def _inflight_review_run(doc_rel: str, base_rev: str, comments_rev: str, mode: str,
-                         evidence_key: str = ""):
-    key = (doc_rel, base_rev, comments_rev, mode, evidence_key) if evidence_key else (
-        doc_rel, base_rev, comments_rev, mode)
+                         evidence_key: str = "", agent_identity=None):
+    key = _review_run_active_key(
+        doc_rel, base_rev, comments_rev, mode, evidence_key, agent_identity)
     run_id = _ACTIVE_REVIEW_RUNS.get(key)
+    if not run_id and _same_review_agent(agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY,
+                                         _LEGACY_REVIEW_AGENT_IDENTITY):
+        legacy_key = (
+            (doc_rel, base_rev, comments_rev, mode, evidence_key)
+            if evidence_key else (doc_rel, base_rev, comments_rev, mode)
+        )
+        run_id = _ACTIVE_REVIEW_RUNS.get(legacy_key)
+        if run_id:
+            key = legacy_key
     if not run_id:
         return None, None
     try:
@@ -2698,6 +2793,8 @@ def _inflight_review_run(doc_rel: str, base_rev: str, comments_rev: str, mode: s
             or inputs.get("document_rev") != base_rev
             or inputs.get("comments_rev") != comments_rev
             or (evidence_key and "|".join(inputs.get("evidence_source_ids") or []) != evidence_key)
+            or not _same_review_agent(session, agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY)
+            or not _same_review_agent(run, agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY)
             or run.get("mode") != mode):
         _ACTIVE_REVIEW_RUNS.pop(key, None)
         return None, None
@@ -2743,14 +2840,16 @@ def _legacy_comment_delta(doc: str, baseline_at: str, comments_by_id: dict):
     return categories
 
 
-def _review_preflight_state(doc: str):
+def _review_preflight_state(doc: str, agent_identity=None):
+    agent_identity = _review_agent_identity_from_record(
+        agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY)
     with _MUTATION_LOCK:
         body, current_rev, _ = _ensure_current_snapshot(doc)
     doc_rel = _doc_rel(doc)
     comments_store = _load_comment_store(doc)
     comments = comments_store["comments"]
     current_snapshot = comment_snapshot(comments)
-    baseline = _latest_completed_session(doc_rel)
+    baseline = _latest_completed_session(doc_rel, agent_identity)
     baseline_rev = str((baseline or {}).get("base_rev") or (baseline or {}).get("document_rev") or "")
     baseline_comments_rev = str((baseline or {}).get("comments_rev") or "")
     baseline_snapshot = (baseline or {}).get("comments_snapshot")
@@ -2842,7 +2941,9 @@ def _review_preflight_state(doc: str):
         "baseline_session": ({
             "id": baseline.get("id"),
             "completed_at": baseline.get("completed_at") or baseline.get("updated_at") or "",
+            **_review_agent_fields(baseline),
         } if baseline else None),
+        "review_agent": _review_agent_fields(agent_identity),
         "comments": {
             "comments_rev": comments_store["comments_rev"],
             "baseline_comments_rev": baseline_comments_rev,
@@ -2868,8 +2969,8 @@ def _review_preflight_state(doc: str):
     }
 
 
-def _review_preflight(doc: str):
-    return _review_preflight_state(doc)[0]
+def _review_preflight(doc: str, agent_identity=None):
+    return _review_preflight_state(doc, agent_identity)[0]
 
 
 def _conversation_path(session_id: str) -> str:
@@ -3595,7 +3696,7 @@ def _lineage_scope_hint(finding) -> str:
     return scope or "unplaced"
 
 
-def _finding_lineage_key(finding) -> str:
+def _finding_lineage_base_key(finding) -> str:
     family = finding.get("issue_family") or (finding.get("finding") or {}).get("issue_family") or "other"
     issue = _normalize_lineage_text(finding.get("issue") or (finding.get("finding") or {}).get("issue") or "")
     action = _normalize_lineage_text(
@@ -3608,11 +3709,34 @@ def _finding_lineage_key(finding) -> str:
     return "|".join((family, "placement", _lineage_scope_hint(finding)))
 
 
+def _lineage_key_has_agent(lineage_key: str) -> bool:
+    return str(lineage_key or "").startswith("agent|")
+
+
+def _agent_lineage_key(agent_identity, lineage_key: str) -> str:
+    if _lineage_key_has_agent(lineage_key):
+        return lineage_key
+    return "|".join((
+        "agent",
+        *_review_agent_identity_key(agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY),
+        lineage_key,
+    ))
+
+
+def _finding_lineage_key(finding, agent_identity=None) -> str:
+    identity = agent_identity or _review_agent_identity_from_record(finding)
+    return _agent_lineage_key(identity, _finding_lineage_base_key(finding))
+
+
 def _finding_lineage_id(doc_rel: str, lineage_key: str) -> str:
     return "FL-" + _hash12(f"{doc_rel}|{lineage_key}")
 
 
-def _apply_five_axis_resolution(finding, body: str, body_rev: str, doc_rel: str, document_map):
+def _apply_five_axis_resolution(finding, body: str, body_rev: str, doc_rel: str,
+                                document_map, agent_identity=None):
+    agent_identity = _review_agent_identity_from_record(
+        agent_identity or finding or _LEGACY_REVIEW_AGENT_IDENTITY)
+    finding.update(_review_agent_fields(agent_identity))
     evidence_inputs = finding.get("evidence_quotes") or []
     if finding.get("no_quote_required"):
         evidence_results = [{
@@ -3662,16 +3786,17 @@ def _apply_five_axis_resolution(finding, body: str, body_rev: str, doc_rel: str,
     finding["location_details"] = detail
     finding["evidence_summary"] = _verified_evidence_summary(evidence_results)
     finding["evidence_occurrences"] = _evidence_occurrences(evidence_results)
-    finding["finding_lineage_key"] = _finding_lineage_key(finding)
+    finding["finding_lineage_key"] = _finding_lineage_key(finding, agent_identity)
     finding["finding_lineage_id"] = _finding_lineage_id(doc_rel, finding["finding_lineage_key"])
     if placement.get("section_title"):
         finding["section"] = placement["section_title"]
     return finding
 
 
-def _anchor_finding(finding, body: str, body_rev: str, doc_rel: str):
+def _anchor_finding(finding, body: str, body_rev: str, doc_rel: str, agent_identity=None):
     document_map = _build_document_map(body, body_rev, doc_rel)
-    _apply_five_axis_resolution(finding, body, body_rev, doc_rel, document_map)
+    _apply_five_axis_resolution(
+        finding, body, body_rev, doc_rel, document_map, agent_identity)
     placement = finding.get("placement") or {}
     first_evidence = next((item for item in finding.get("evidence") or []
                            if item.get("verification_state") != "no_quote_required"), {})
@@ -3700,8 +3825,8 @@ def _anchor_finding(finding, body: str, body_rev: str, doc_rel: str):
     return finding
 
 
-def _reanchor_findings(findings, body: str, body_rev: str, doc_rel: str):
-    return [_anchor_finding(f, body, body_rev, doc_rel) for f in findings]
+def _reanchor_findings(findings, body: str, body_rev: str, doc_rel: str, agent_identity=None):
+    return [_anchor_finding(f, body, body_rev, doc_rel, agent_identity) for f in findings]
 
 
 def _comment_content(finding) -> str:
@@ -3735,6 +3860,7 @@ def _finding_comment_payload(finding):
         "workflow": finding.get("workflow") or {"state": "active"},
         "location_details": finding.get("location_details") or {},
         "evidence_occurrences": finding.get("evidence_occurrences") or [],
+        **_review_agent_fields(finding),
         "finding_lineage_id": finding.get("finding_lineage_id") or "",
         "finding_lineage_key": finding.get("finding_lineage_key") or "",
     }
@@ -4071,12 +4197,29 @@ def _lineage_block_hash_unchanged(existing, proposed) -> bool:
     return _lineage_block_hash_state(existing, proposed) == "unchanged"
 
 
-def _lineage_lookup(comments):
+def _lineage_lookup(comments, agent_identity=None, doc_rel: str = ""):
+    agent_identity = _review_agent_identity_from_record(
+        agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY)
     lookup = {}
     for comment in comments:
         if comment.get("source") != "ai-review":
             continue
-        for key in (comment.get("finding_lineage_key"), comment.get("finding_lineage_id")):
+        if not _same_review_agent(comment, agent_identity):
+            continue
+        comment_identity = _review_agent_identity_from_record(comment)
+        keys = []
+        lineage_key = comment.get("finding_lineage_key") or ""
+        if lineage_key:
+            keys.append(lineage_key)
+            if not _lineage_key_has_agent(lineage_key):
+                migrated_key = _agent_lineage_key(comment_identity, lineage_key)
+                keys.append(migrated_key)
+                if doc_rel:
+                    keys.append(_finding_lineage_id(doc_rel, migrated_key))
+        lineage_id = comment.get("finding_lineage_id") or ""
+        if lineage_id:
+            keys.append(lineage_id)
+        for key in keys:
             if key and key not in lookup:
                 lookup[key] = comment
     return lookup
@@ -4119,8 +4262,10 @@ def _lineage_event(operation, state, proposed=None, extra=None):
     }
 
 
-def _apply_lineage_to_operations(operations, comments, doc_rel):
-    by_lineage = _lineage_lookup(comments)
+def _apply_lineage_to_operations(operations, comments, doc_rel, agent_identity=None):
+    agent_identity = _review_agent_identity_from_record(
+        agent_identity or _LEGACY_REVIEW_AGENT_IDENTITY)
+    by_lineage = _lineage_lookup(comments, agent_identity, doc_rel)
     aggregated = []
     by_key = {}
     for operation in operations:
@@ -4186,7 +4331,8 @@ def _normalize_resolution_review(raw):
     return review if all(review.values()) else None
 
 
-def _normalize_run_operations(rows, body: str, body_rev: str, doc_rel: str, comments):
+def _normalize_run_operations(rows, body: str, body_rev: str, doc_rel: str,
+                              comments, agent_identity=None):
     operations = []
     used_ids = set()
     comments_by_id = {comment.get("id"): comment for comment in comments}
@@ -4212,7 +4358,8 @@ def _normalize_run_operations(rows, body: str, body_rev: str, doc_rel: str, comm
             proposed = _normalize_finding(proposed_raw, finding_id or f"F{index:03d}")
             if proposed:
                 finding_id = finding_id or proposed["id"]
-                proposed = _anchor_finding(proposed, body, body_rev, doc_rel)
+                proposed = _anchor_finding(
+                    proposed, body, body_rev, doc_rel, agent_identity)
         if action in {"create", "update"}:
             if not proposed:
                 action, reason = "blocked", reason or "proposed comment failed validation"
@@ -4243,10 +4390,10 @@ def _normalize_run_operations(rows, body: str, body_rev: str, doc_rel: str, comm
             "resolution_review": resolution_review or {},
             "human_edited_target": bool(target.get("human_edited")),
         })
-    return _apply_lineage_to_operations(operations, comments, doc_rel)
+    return _apply_lineage_to_operations(operations, comments, doc_rel, agent_identity)
 
 
-def _initial_run_operations(findings):
+def _initial_run_operations(findings, agent_identity=None):
     operations = []
     for index, finding in enumerate(findings, 1):
         normal = _finding_enters_normal_review(finding)
@@ -4261,7 +4408,7 @@ def _initial_run_operations(findings):
             "proposed_comment": finding,
             "human_edited_target": False,
         })
-    return _apply_lineage_to_operations(operations, [], "")
+    return _apply_lineage_to_operations(operations, [], "", agent_identity)
 
 
 def _operation_journal_path():
@@ -4972,6 +5119,7 @@ def _set_lineage_workflow(doc_path, comment_id, state, *, actor="June", event_ac
         event_detail = {
             "workflow_state": state,
             "finding_lineage_id": comment.get("finding_lineage_id") or "",
+            **_review_agent_fields(comment),
         }
         comments_rev = _save_comments(doc_path, comments)
         event = _append_comment_event(
@@ -5441,7 +5589,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, **store})
             if route == "/api/review-preflight":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
-                return self._send_json({"ok": True, "preflight": _review_preflight(doc)})
+                agent_identity = _review_agent_identity_from_payload({
+                    field: (qs.get(field) or [""])[0]
+                    for field in _REVIEW_AGENT_PERSISTED_FIELDS
+                })
+                return self._send_json({
+                    "ok": True,
+                    "preflight": _review_preflight(doc, agent_identity),
+                })
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/events$", route)
             if match:
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
@@ -6226,7 +6381,8 @@ class Handler(BaseHTTPRequestHandler):
         doc = _safe_doc_path(payload.get("path"))
         if not os.path.exists(doc):
             raise ValueError("doc not found")
-        completed = _latest_completed_session(_doc_rel(doc))
+        agent_identity = _review_agent_identity_from_payload(payload)
+        completed = _latest_completed_session(_doc_rel(doc), agent_identity)
         if completed:
             return self._send_json({
                 "ok": False,
@@ -6261,6 +6417,7 @@ class Handler(BaseHTTPRequestHandler):
             "doc_path": doc_rel,
             "base_rev": body_rev,
             "document_rev": body_rev,
+            **_review_agent_fields(agent_identity),
             "tool": tool,
             "rubric": rubric,
             "writeback_policy": writeback_policy,
@@ -6290,7 +6447,8 @@ class Handler(BaseHTTPRequestHandler):
             if session["summary"].lower() == "concise chinese review summary":
                 session["summary"] = ""
             assistant_text = _clean_text(parsed.get("assistant_text") or session["summary"], 6000)
-            session["findings"] = _reanchor_findings(findings, body, body_rev, doc_rel)
+            session["findings"] = _reanchor_findings(
+                findings, body, body_rev, doc_rel, agent_identity)
             session["messages"].append({
                 "id": _new_id("msg-", 10), "role": "assistant",
                 "content": assistant_text, "at": _now(),
@@ -6356,6 +6514,7 @@ class Handler(BaseHTTPRequestHandler):
         tool = str(payload.get("tool") or "codex").strip().lower()
         if tool not in AI_TOOLS:
             raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        agent_identity = _review_agent_identity_from_payload(payload)
         rubric = _clean_text(payload.get("rubric") or "scientific peer review and source-check", 2000)
         instruction = _clean_text(payload.get("instruction"), 3000)
         evidence_sources = _normalize_conversation_evidence(
@@ -6365,7 +6524,7 @@ class Handler(BaseHTTPRequestHandler):
         evidence_context = _conversation_evidence_context({
             "doc_path": _doc_rel(doc), "evidence_sources": evidence_sources,
         })
-        preflight, state = _review_preflight_state(doc)
+        preflight, state = _review_preflight_state(doc, agent_identity)
         baseline = state["baseline"]
         baseline_session_id = payload.get("baseline_session_id")
         if baseline_session_id is None:
@@ -6382,11 +6541,13 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in preflight["allowed_modes"]:
             raise ValueError(f"mode {mode} is not allowed by current preflight")
         doc_rel = _doc_rel(doc)
-        active_key = (doc_rel, requested_rev, requested_comments_rev, mode, evidence_key) if evidence_key else (
-            doc_rel, requested_rev, requested_comments_rev, mode)
+        active_key = _review_run_active_key(
+            doc_rel, requested_rev, requested_comments_rev, mode,
+            evidence_key, agent_identity)
         with _MUTATION_LOCK:
             existing_session, existing_run = _inflight_review_run(
-                doc_rel, requested_rev, requested_comments_rev, mode, evidence_key)
+                doc_rel, requested_rev, requested_comments_rev, mode,
+                evidence_key, agent_identity)
             if existing_run:
                 return self._send_json({
                     "ok": True, "idempotent": True,
@@ -6414,6 +6575,7 @@ class Handler(BaseHTTPRequestHandler):
                 "session_id": session_id,
                 "parent_session_id": expected_baseline_id,
                 "mode": mode,
+                **_review_agent_fields(agent_identity),
                 "input": {
                     "document_rev": requested_rev,
                     "comments_rev": requested_comments_rev,
@@ -6435,6 +6597,7 @@ class Handler(BaseHTTPRequestHandler):
                 "doc_path": doc_rel,
                 "base_rev": requested_rev,
                 "document_rev": requested_rev,
+                **_review_agent_fields(agent_identity),
                 "tool": tool,
                 "rubric": rubric,
                 "writeback_policy": "auto-ready" if mode == "initial" else "preview",
@@ -6465,8 +6628,9 @@ class Handler(BaseHTTPRequestHandler):
                 if raw_findings and not findings:
                     raise ValueError("AI findings failed schema/content validation")
                 session["findings"] = _reanchor_findings(
-                    findings, locked_body, requested_rev, doc_rel)
-                run["operations"] = _initial_run_operations(session["findings"])
+                    findings, locked_body, requested_rev, doc_rel, agent_identity)
+                run["operations"] = _initial_run_operations(
+                    session["findings"], agent_identity)
             else:
                 prompt = _run_review_prompt(
                     mode, preflight, state, rubric, instruction, evidence_context)
@@ -6477,7 +6641,7 @@ class Handler(BaseHTTPRequestHandler):
                 parsed = _extract_json(result["output"])
                 run["operations"] = _normalize_run_operations(
                     parsed.get("operations") or [], locked_body, requested_rev,
-                    doc_rel, locked_store["comments"],
+                    doc_rel, locked_store["comments"], agent_identity,
                 )
                 session["findings"] = [
                     operation["proposed_comment"] for operation in run["operations"]
