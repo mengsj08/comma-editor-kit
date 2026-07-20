@@ -263,7 +263,7 @@ Withdraw target sentence is unique.
         self.assertIn("{ action: 'create', label: '新增'", script)
         self.assertIn("{ action: 'update', label: '修改'", script)
         self.assertIn("{ action: 'withdraw', label: '撤回'", script)
-        self.assertIn("{ action: 'keep', label: '不变'", script)
+        self.assertIn("{ action: 'keep', label: '不变（表示本轮未改动，不代表 AI 重新逐条核验）'", script)
         self.assertIn("{ action: 'blocked', label: '阻断'", script)
         self.assertIn("accepted_operation_ids: acceptedOperationIds", script)
         self.assertIn("function acceptAllNonBlockedOperations()", script)
