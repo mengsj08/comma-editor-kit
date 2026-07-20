@@ -3449,6 +3449,11 @@ def _resolve_evidence_quote(evidence, body: str, body_rev: str, doc_rel: str, do
     return result
 
 
+def _same_evidence_quote(left, right):
+    keys = ("quote_text", "context_before", "context_after")
+    return all((left.get(key) or "") == (right.get(key) or "") for key in keys)
+
+
 def _placement_from_evidence(finding, evidence_results, document_map):
     verified = [
         item for item in evidence_results
@@ -3619,12 +3624,30 @@ def _apply_five_axis_resolution(finding, body: str, body_rev: str, doc_rel: str,
             "match_count": 0,
             "locations": [],
         }]
+        placement_inputs = evidence_results
     else:
-        evidence_results = [
-            _resolve_evidence_quote(item, body, body_rev, doc_rel, document_map)
-            for item in evidence_inputs
+        primary_input = None
+        if finding.get("quote_text"):
+            primary_input = {
+                "quote_text": finding.get("quote_text") or "",
+                "context_before": finding.get("context_before") or "",
+                "context_after": finding.get("context_after") or "",
+            }
+        primary_result = (
+            _resolve_evidence_quote(primary_input, body, body_rev, doc_rel, document_map)
+            if primary_input else None
+        )
+        extra_inputs = [
+            item for item in evidence_inputs
+            if not (primary_input and _same_evidence_quote(item, primary_input))
         ]
-    placement, detail = _placement_from_evidence(finding, evidence_results, document_map)
+        extra_results = [
+            _resolve_evidence_quote(item, body, body_rev, doc_rel, document_map)
+            for item in extra_inputs
+        ]
+        evidence_results = ([primary_result] if primary_result else []) + extra_results
+        placement_inputs = [primary_result] if primary_result else evidence_results
+    placement, detail = _placement_from_evidence(finding, placement_inputs, document_map)
     finding["origin"] = finding.get("origin") or {"actor_type": "ai", "actor": "AI Reviewer"}
     finding["finding"] = {
         "issue_family": finding.get("issue_family") or "other",
@@ -5143,6 +5166,17 @@ def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None):
             os.remove(schema_file)
 
 
+def _review_ai_timeout_seconds():
+    raw = os.environ.get("REVIEW_STUDIO_AI_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return 900
+    try:
+        value = int(raw)
+    except ValueError:
+        return 900
+    return min(max(value, 60), 3600)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SpikeDoc/0.1"
 
@@ -6243,7 +6277,10 @@ class Handler(BaseHTTPRequestHandler):
             _save_session(session)
         prompt = _initial_review_prompt(body, doc_rel, body_rev, rubric, instruction)
         try:
-            result = _invoke_ai(tool, prompt, schema=_INITIAL_REVIEW_SCHEMA)
+            result = _invoke_ai(
+                tool, prompt, timeout=_review_ai_timeout_seconds(),
+                schema=_INITIAL_REVIEW_SCHEMA,
+            )
             parsed = _extract_json(result["output"])
             raw_findings = parsed.get("findings") or parsed.get("comments") or []
             findings = _normalize_findings(raw_findings)
@@ -6418,7 +6455,10 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "initial":
                 prompt = _initial_review_prompt(
                     locked_body, doc_rel, requested_rev, rubric, instruction, evidence_context)
-                result = _invoke_ai(tool, prompt, schema=_INITIAL_REVIEW_SCHEMA)
+                result = _invoke_ai(
+                    tool, prompt, timeout=_review_ai_timeout_seconds(),
+                    schema=_INITIAL_REVIEW_SCHEMA,
+                )
                 parsed = _extract_json(result["output"])
                 raw_findings = parsed.get("findings") or parsed.get("comments") or []
                 findings = _normalize_findings(raw_findings)
@@ -6430,7 +6470,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 prompt = _run_review_prompt(
                     mode, preflight, state, rubric, instruction, evidence_context)
-                result = _invoke_ai(tool, prompt, schema=_RUN_REVIEW_SCHEMA)
+                result = _invoke_ai(
+                    tool, prompt, timeout=_review_ai_timeout_seconds(),
+                    schema=_RUN_REVIEW_SCHEMA,
+                )
                 parsed = _extract_json(result["output"])
                 run["operations"] = _normalize_run_operations(
                     parsed.get("operations") or [], locked_body, requested_rev,

@@ -53,6 +53,28 @@ class ReviewResolverTests(unittest.TestCase):
         self.assertEqual(finding["evidence"][0]["verification_state"], "verified_unique")
         self.assertEqual(finding["source_locator"]["block_index"], 1)
 
+    def test_01b_primary_quote_not_supplemental_evidence_controls_anchor(self):
+        body = (
+            "# Results\n\n"
+            "Primary claim sentence appears here.\n\n"
+            "Supplemental table evidence appears there.\n"
+        )
+        finding = _resolve(body, _base_finding(
+            quote_text="Primary claim sentence appears here.",
+            evidence_quotes=[{
+                "quote_text": "Supplemental table evidence appears there.",
+                "context_before": "",
+                "context_after": "",
+            }],
+        ))
+        self.assertEqual(finding["placement"]["scope"], "quote")
+        self.assertEqual(finding["placement"]["state"], "quote_exact")
+        self.assertEqual(finding["source_locator"]["text_index"], body.index("Primary claim"))
+        self.assertEqual(body[finding["source_locator"]["text_index"]:
+                              finding["source_locator"]["text_index"] + len(finding["quote_text"])],
+                         finding["quote_text"])
+        self.assertEqual(len(finding["evidence_occurrences"]), 2)
+
     def test_02_repeated_quote_with_ai_section_but_no_context_is_not_precise(self):
         body = (
             "# Methods\n\nRepeated claim appears here.\n\n"
