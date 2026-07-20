@@ -126,6 +126,71 @@ class ReviewApiTests(unittest.TestCase):
         self.assertIn("未重新计算统计结果", html)
         self.assertNotIn("json.stub", script)
 
+    def test_review_workflow_mutation_routes_append_comment_events(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            body = "# Paper\n\nA controlled sentence for workflow routes.\n"
+            doc = os.path.join(tmp, "paper.md")
+            with open(doc, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")):
+                comment = server._comment_record({
+                    "id": "c-workflow",
+                    "kind": "anchored",
+                    "author": "AI Reviewer",
+                    "content": "A controlled finding.",
+                    "quote_text": "A controlled sentence for workflow routes.",
+                    "source": "ai-review",
+                    "finding_id": "F-WORKFLOW",
+                    "finding_state": "accepted",
+                    "workflow": {"state": "active"},
+                    "finding_lineage_id": "lineage-workflow",
+                    "evidence_occurrences": [{
+                        "id": "occ-workflow",
+                        "progress_state": "open",
+                        "section_title": "Paper",
+                        "source_locator": {"body_rev": server._rev(body), "text_index": 9},
+                    }],
+                }, strict=False)
+                server._save_comments(doc, [comment])
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    muted = self._request(base + "/api/comments/c-workflow/lineage-mute", "POST", {
+                        "path": "paper.md", "actor": "June",
+                    })
+                    self.assertEqual(muted["comment"]["workflow"]["state"], "muted_by_user")
+                    restored = self._request(base + "/api/comments/c-workflow/lineage-restore", "POST", {
+                        "path": "paper.md", "actor": "June",
+                    })
+                    self.assertEqual(restored["comment"]["workflow"]["state"], "active")
+                    progress = self._request(
+                        base + "/api/comments/c-workflow/evidence-occurrences/occ-workflow/progress",
+                        "POST", {"path": "paper.md", "state": "handled", "actor": "June"},
+                    )
+                    self.assertEqual(progress["occurrence"]["progress_state"], "handled")
+                    confirmed = self._request(base + "/api/comments/candidate-resolved/confirm", "POST", {
+                        "path": "paper.md", "comment_ids": ["c-workflow"], "actor": "June",
+                    })
+                    self.assertEqual(confirmed["results"][0]["comment"]["workflow"]["state"], "resolved")
+                    candidate_restored = self._request(base + "/api/comments/candidate-resolved/restore", "POST", {
+                        "path": "paper.md", "comment_ids": ["c-workflow"], "actor": "June",
+                    })
+                    self.assertEqual(candidate_restored["results"][0]["comment"]["workflow"]["state"], "active")
+                    actions = [event["action"] for event in server._load_comment_events(doc)]
+                    self.assertIn("lineage-muted", actions)
+                    self.assertIn("lineage-unmuted", actions)
+                    self.assertIn("evidence-occurrence-progress", actions)
+                    self.assertIn("candidate-resolved-confirmed", actions)
+                    self.assertIn("candidate-resolved-restored", actions)
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
     def test_runtime_capabilities_report_provider_readiness(self):
         statuses = {
             "codex": {

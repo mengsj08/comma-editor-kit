@@ -4998,6 +4998,52 @@ def _restore_candidate_resolved(doc_path, comment_ids, *, actor="June"):
     return results
 
 
+def _set_evidence_occurrence_progress(doc_path, comment_id, occurrence_id, state, *, actor="June"):
+    clean_state = str(state or "").strip()
+    if clean_state not in {"open", "handled", "not_applicable"}:
+        raise ValueError("state must be open, handled, or not_applicable")
+    with _MUTATION_LOCK:
+        comments = _load_comments(doc_path)
+        comment = _comment_by_id(comments, comment_id)
+        occurrences = comment.get("evidence_occurrences") or []
+        occurrence = next((item for item in occurrences if item.get("id") == occurrence_id), None)
+        if not occurrence:
+            raise ValueError("evidence occurrence not found")
+        before = comment.get("content") or ""
+        from_version = int(comment.get("comment_version") or 1)
+        occurrence["progress_state"] = clean_state
+        occurrence["updated_at"] = _now()
+        occurrence["updated_by"] = actor
+        comment["evidence_occurrences"] = occurrences
+        comment["comment_version"] = from_version + 1
+        comment["updated_at"] = _now()
+        details = {
+            "occurrence_id": occurrence_id,
+            "progress_state": clean_state,
+            "finding_lineage_id": comment.get("finding_lineage_id") or "",
+        }
+        comments_rev = _save_comments(doc_path, comments)
+        event = _append_comment_event(
+            doc_path,
+            comment_id=comment["id"],
+            action="evidence-occurrence-progress",
+            actor=actor,
+            from_version=from_version,
+            to_version=comment["comment_version"],
+            content_before_hash=_comment_content_hash(before),
+            content_after_hash=_comment_content_hash(before),
+            lineage_id=comment.get("finding_lineage_id") or "",
+            details=details,
+        )
+    return {
+        "comment": comment,
+        "comments": comments,
+        "comments_rev": comments_rev,
+        "event": event,
+        "occurrence": occurrence,
+    }
+
+
 def _apply_finding_ops(session, ops):
     findings = session.get("findings") or []
     by_id = {f.get("id"): f for f in findings}
@@ -5485,6 +5531,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._create_comment_batch(payload)
             if route == "/api/comments/accept-provisional" and method == "POST":
                 return self._accept_all_provisional(payload)
+            if route == "/api/comments/candidate-resolved/confirm" and method == "POST":
+                return self._confirm_candidate_resolved(payload)
+            if route == "/api/comments/candidate-resolved/restore" and method == "POST":
+                return self._restore_candidate_resolved(payload)
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})$", route)
             if match and method in ("PATCH", "DELETE"):
                 if method == "PATCH":
@@ -5496,6 +5546,18 @@ class Handler(BaseHTTPRequestHandler):
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/accept$", route)
             if match and method == "POST":
                 return self._accept_comment_item(match.group(1), payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/lineage-mute$", route)
+            if match and method == "POST":
+                return self._mute_finding_item(match.group(1), payload)
+            match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/lineage-restore$", route)
+            if match and method == "POST":
+                return self._restore_finding_item(match.group(1), payload)
+            match = re.match(
+                r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/evidence-occurrences/([A-Za-z0-9_.:-]{1,160})/progress$",
+                route,
+            )
+            if match and method == "POST":
+                return self._set_evidence_occurrence_progress(match.group(1), match.group(2), payload)
             match = re.match(r"^/api/comments/([A-Za-z0-9_.:-]{1,160})/replies$", route)
             if match and method == "POST":
                 return self._create_comment_reply(match.group(1), payload)
@@ -5952,6 +6014,51 @@ class Handler(BaseHTTPRequestHandler):
             )
         _append_event(actor, "accept-provisional-comment", doc, comment_id)
         return self._send_comment_mutation(comment, comments_rev, event)
+
+    def _mute_finding_item(self, comment_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        result = _mute_finding_lineage(doc, comment_id, actor=str(payload.get("actor") or "June"))
+        _append_event(payload.get("actor") or "June", "lineage-muted", doc, comment_id)
+        return self._send_json({"ok": True, **result})
+
+    def _restore_finding_item(self, comment_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        result = _restore_finding_lineage(doc, comment_id, actor=str(payload.get("actor") or "June"))
+        _append_event(payload.get("actor") or "June", "lineage-unmuted", doc, comment_id)
+        return self._send_json({"ok": True, **result})
+
+    def _set_evidence_occurrence_progress(self, comment_id, occurrence_id, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        result = _set_evidence_occurrence_progress(
+            doc, comment_id, occurrence_id,
+            str(payload.get("state") or ""),
+            actor=str(payload.get("actor") or "June"),
+        )
+        _append_event(
+            payload.get("actor") or "June", "evidence-occurrence-progress",
+            doc, f"{comment_id}:{occurrence_id}:{payload.get('state') or ''}",
+        )
+        return self._send_json({"ok": True, **result})
+
+    def _confirm_candidate_resolved(self, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        results = _confirm_candidate_resolved(
+            doc, payload.get("comment_ids") or [], actor=str(payload.get("actor") or "June"))
+        _append_event(
+            payload.get("actor") or "June", "candidate-resolved-confirmed",
+            doc, f"{len(results)} comments",
+        )
+        return self._send_json({"ok": True, "results": results})
+
+    def _restore_candidate_resolved(self, payload):
+        doc = _safe_doc_path(payload.get("path"))
+        results = _restore_candidate_resolved(
+            doc, payload.get("comment_ids") or [], actor=str(payload.get("actor") or "June"))
+        _append_event(
+            payload.get("actor") or "June", "candidate-resolved-restored",
+            doc, f"{len(results)} comments",
+        )
+        return self._send_json({"ok": True, "results": results})
 
     def _accept_all_provisional(self, payload):
         doc = _safe_doc_path(payload.get("path"))

@@ -52,8 +52,8 @@ def reset_comments():
             os.remove(path)
 
 
-def write_slice_c_preview(document, comments_rev, human_comment_id, withdraw_comment_id):
-    def proposal(finding_id, quote, issue, action):
+def write_slice_c_preview(document, comments_rev, human_comment_id, withdraw_comment_id, candidate_comment_id):
+    def proposal(finding_id, quote, issue, action, *, placement_scope="quote"):
         return {
             "id": finding_id, "section": "Scientific media fixture",
             "quote_text": quote, "issue": issue, "action": action,
@@ -63,6 +63,18 @@ def write_slice_c_preview(document, comments_rev, human_comment_id, withdraw_com
             "applied_comment_id": "", "applied_signature": "",
             "anchor_state": "ready", "anchor_matches": 1,
             "source_locator": {"task_path": "paper.md", "body_rev": document["rev"]},
+            "origin": {"actor_type": "ai", "actor": "AI Reviewer"},
+            "placement": {"scope": placement_scope, "state": "quote_exact"},
+            "placement_detail": {
+                "downgrade_reason": "browser_fixture",
+                "candidates": [{"section_title": "Scientific media fixture", "block_index": 1}],
+            },
+            "evidence": {"match_count": 1},
+            "evidence_occurrences": [
+                {"id": f"occ-{finding_id.lower()}-1", "progress_state": "open",
+                 "section_title": "Scientific media fixture",
+                 "source_locator": {"body_rev": document["rev"], "text_index": 0}},
+            ],
         }
 
     created = proposal(
@@ -71,6 +83,14 @@ def write_slice_c_preview(document, comments_rev, human_comment_id, withdraw_com
     updated = proposal(
         "F-HUMAN", "Scientific media fixture",
         "The human-edited note has a proposed revision.", "Apply only after explicit confirmation.")
+    unverified = proposal(
+        "F-UNVERIFIED", "Fabricated browser smoke quote",
+        "This quote is intentionally unverified.", "Keep it out of normal review.",
+        placement_scope="evidence_unverified")
+    unverified["placement"]["state"] = "evidence_unverified"
+    unverified["anchor_state"] = "missing"
+    unverified["anchor_matches"] = 0
+    unverified["evidence"]["match_count"] = 0
     operations = [
         {"id": "op-create", "action": "create", "finding_id": "F-CREATE",
          "supersedes_finding_id": "", "target_comment_id": "", "reason": "new finding",
@@ -86,10 +106,28 @@ def write_slice_c_preview(document, comments_rev, human_comment_id, withdraw_com
         {"id": "op-keep", "action": "keep", "finding_id": "F-HUMAN",
          "supersedes_finding_id": "", "target_comment_id": human_comment_id,
          "reason": "lineage stays visible", "proposed_comment": None,
-         "human_edited_target": True},
+         "human_edited_target": True,
+         "resurfacing_notice": {
+             "previous_declined": True, "same_blocks_unchanged": True,
+             "block_hash_state": "unchanged", "mute_available": True,
+             "message": "上轮未采纳；相关原文自上轮未变化；本轮再次提出",
+         }},
+        {"id": "op-resolved", "action": "candidate_resolved", "finding_id": "F-RESOLVED",
+         "supersedes_finding_id": "F-RESOLVED", "target_comment_id": candidate_comment_id,
+         "reason": "explicitly rechecked", "proposed_comment": None,
+         "human_edited_target": False,
+         "resolution_review": {
+             "before_text": "Candidate finding still open.",
+             "after_text": "Candidate finding appears addressed.",
+             "new_evidence": "The current text now narrows the claim.",
+         }},
         {"id": "op-blocked", "action": "blocked", "finding_id": "F-BLOCKED",
          "supersedes_finding_id": "", "target_comment_id": "",
          "reason": "anchor is ambiguous", "proposed_comment": None,
+         "human_edited_target": False},
+        {"id": "op-unverified", "action": "keep", "finding_id": "F-UNVERIFIED",
+         "supersedes_finding_id": "", "target_comment_id": "",
+         "reason": "evidence_unverified", "proposed_comment": unverified,
          "human_edited_target": False},
     ]
     run = {
@@ -276,17 +314,24 @@ def main():
                 "source_key": "review-browser:F-WITHDRAW", "finding_id": "F-WITHDRAW",
                 "finding_state": "accepted",
             })["comment"]
+            candidate_comment = api("/api/comments", "POST", {
+                "path": "paper.md", "kind": "anchored", "actor": "AI Reviewer",
+                "content": "Candidate finding still open.",
+                "quote_text": "Scientific control image", "source": "ai-review",
+                "source_key": "review-browser:F-RESOLVED", "finding_id": "F-RESOLVED",
+                "finding_state": "accepted",
+            })["comment"]
             preview_store = api("/api/comments?path=paper.md")
             write_slice_c_preview(
                 document, preview_store["comments_rev"],
-                human_edited["id"], withdraw_comment["id"],
+                human_edited["id"], withdraw_comment["id"], candidate_comment["id"],
             )
             page.evaluate("""async id => {
               window.__COMMA_REVIEW__.openReviewDrawer();
               await window.__COMMA_REVIEW__.loadReviewSession(id);
             }""", SLICE_C_SESSION_ID)
             page.wait_for_function(
-                "document.querySelectorAll('[data-operation-group]').length === 5")
+                "document.querySelectorAll('[data-operation-group]').length === 4")
             page.locator("#review-accept-all").click()
             bulk_selected = page.locator("[data-operation-accept]:checked").evaluate_all(
                 "nodes => nodes.map(node => node.dataset.operationAccept).sort()")
@@ -298,7 +343,16 @@ def main():
                 "bulkSelected": bulk_selected,
                 "humanHighlighted": page.locator('.operation-card[data-human-edited="true"]').count(),
                 "humanBulkChecked": human_checkbox.is_checked(),
-                "keepDisclaimer": page.locator('[data-operation-group="keep"] > header h4').text_content(),
+                "stateTitles": page.locator("[data-operation-group] > header h4").all_text_contents(),
+                "sourceBadges": page.locator(".operation-card .review-badge.source").all_text_contents(),
+                "placementBadges": page.locator(".operation-card .review-badge.placement").all_text_contents(),
+                "locationDetails": page.locator(".operation-card .location-details").count(),
+                "locationDetailsOpen": page.locator(".operation-card .location-details").evaluate_all(
+                    "nodes => nodes.map(node => node.open)"),
+                "candidateAcceptLabel": page.locator('[data-operation-action="candidate_resolved"] .operation-accept span').text_content(),
+                "unverifiedDisabled": page.locator('[data-operation-id="op-unverified"] [data-operation-accept]').is_disabled(),
+                "muteEntry": page.locator('[data-lineage-mute]').text_content(),
+                "resurfacingNotice": page.locator(".resurfacing-notice").text_content(),
                 "blockedDisabled": page.locator('[data-operation-action="blocked"] [data-operation-accept]').is_disabled(),
                 "blockedReason": page.locator('[data-operation-action="blocked"] .operation-reason').text_content(),
             }
@@ -330,6 +384,7 @@ def main():
                 "updated": len(receipt["updated"]),
                 "withdrawn": len(receipt["withdrawn"]),
                 "kept": len(receipt["kept"]),
+                "candidateResolved": len(receipt["candidate_resolved"]),
                 "blocked": len(receipt["blocked"]),
                 "humanStillMarked": next(
                     item for item in completed_store["comments"]
@@ -337,6 +392,9 @@ def main():
                 "withdrawState": next(
                     item for item in completed_store["comments"]
                     if item["id"] == withdraw_comment["id"])["finding_state"],
+                "candidateWorkflow": next(
+                    item for item in completed_store["comments"]
+                    if item["id"] == candidate_comment["id"])["workflow"]["state"],
             }
             page.locator("#review-close").click()
             reset_comments()
@@ -480,12 +538,21 @@ def main():
         "missingCommentActionAvailable": False,
         "sidebarHidden": True,
     }
-    assert results["operation_preview"]["groups"] == ["create", "update", "withdraw", "keep", "blocked"]
-    assert results["operation_preview"]["counts"] == ["1", "1", "1", "1", "1"]
-    assert results["operation_preview"]["bulkSelected"] == ["op-create", "op-keep", "op-withdraw"]
+    assert results["operation_preview"]["groups"] == ["pending", "candidate-resolved", "system-conflict", "more"]
+    assert results["operation_preview"]["counts"] == ["4", "1", "1", "1"]
+    assert results["operation_preview"]["stateTitles"] == ["待处理", "待确认已解决", "系统冲突", "更多"]
+    assert results["operation_preview"]["bulkSelected"] == ["op-create", "op-keep", "op-resolved", "op-withdraw"]
     assert results["operation_preview"]["humanHighlighted"] == 1
     assert results["operation_preview"]["humanBulkChecked"] is False
-    assert results["operation_preview"]["keepDisclaimer"] == "不变（表示本轮未改动，不代表 AI 重新逐条核验）"
+    assert "AI" in results["operation_preview"]["sourceBadges"]
+    assert "原文" in results["operation_preview"]["placementBadges"]
+    assert "待证" in results["operation_preview"]["placementBadges"]
+    assert results["operation_preview"]["locationDetails"] >= 2
+    assert all(open_state is False for open_state in results["operation_preview"]["locationDetailsOpen"])
+    assert results["operation_preview"]["candidateAcceptLabel"] == "提交为待确认已解决"
+    assert results["operation_preview"]["unverifiedDisabled"] is True
+    assert results["operation_preview"]["muteEntry"] == "不再提示本问题"
+    assert "相关原文自上轮未变化" in results["operation_preview"]["resurfacingNotice"]
     assert results["operation_preview"]["blockedDisabled"] is True
     assert "anchor is ambiguous" in results["operation_preview"]["blockedReason"]
     assert results["operation_preview_narrow"]["drawerScrollWidth"] <= results["operation_preview_narrow"]["drawerWidth"] + 1
@@ -493,14 +560,16 @@ def main():
     assert results["operation_preview_narrow"]["cardOverflow"] is False
     assert results["operation_writeback"] == {
         "status": "completed",
-        "accepted": ["op-create", "op-human", "op-withdraw", "op-keep"],
+        "accepted": ["op-create", "op-human", "op-withdraw", "op-keep", "op-resolved"],
         "created": 1,
         "updated": 1,
         "withdrawn": 1,
         "kept": 1,
+        "candidateResolved": 1,
         "blocked": 1,
         "humanStillMarked": True,
         "withdrawState": "withdrawn",
+        "candidateWorkflow": "candidate_resolved",
     }
     assert results["scientific_layout"]["commentsScrollWidth"] <= results["scientific_layout"]["commentsWidth"] + 1
     assert results["scientific_layout"]["cardScrollWidth"] <= results["scientific_layout"]["cardWidth"] + 1

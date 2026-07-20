@@ -533,6 +533,22 @@ function renderDocumentSummary(summary) {
   syncRuntimeControls();
 }
 
+function renderOverviewReviewThreads() {
+  const section = $('overview-muted-review');
+  const root = $('overview-muted-list');
+  if (!section || !root) return;
+  const comments = arrayField(editor._comments).filter((comment) => (
+    reviewWorkflowState(comment) === 'muted_by_user'
+  ));
+  section.hidden = comments.length === 0;
+  root.innerHTML = comments.map((comment) => `
+    <article class="overview-review-item" data-comment-id="${esc(comment.id || '')}">
+      <header>${reviewBadgeHtml(comment)}<strong>${esc(comment.finding_id || comment.findingId || comment.id || 'AI 建议')}</strong></header>
+      <p>${esc((comment.content || '').slice(0, 220))}</p>
+      <button type="button" data-lineage-restore="${esc(comment.id || '')}">恢复提示</button>
+    </article>`).join('');
+}
+
 async function loadDocumentSummary() {
   const { response, json } = await apiJson(`/api/document-summary?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
   if (!response.ok || !json.ok) {
@@ -544,6 +560,7 @@ async function loadDocumentSummary() {
   }
   overviewState.currentRev = json.current_rev || editor.documentState.rev || '';
   renderDocumentSummary(json.summary || null);
+  renderOverviewReviewThreads();
 }
 
 async function generateDocumentSummary(regenerate = false) {
@@ -588,6 +605,7 @@ async function openOverview() {
   $('overview-content').hidden = true;
   $('overview-state-title').textContent = '正在核对此版本的结构化总览';
   $('overview-state-copy').textContent = '这里只读取本地 summary 台账，不会自动调用 CLI。';
+  renderOverviewReviewThreads();
   await loadDocumentSummary();
 }
 
@@ -1076,6 +1094,7 @@ async function refreshEditorComments() {
     const comments = await editor.refreshComments();
     setReviewCommentTruth(comments);
     if (reviewState.active) renderReviewSession();
+    if ($('overview-drawer').classList.contains('open')) renderOverviewReviewThreads();
     return comments;
   } catch (error) {
     toast(error.message || '批注刷新失败', true);
@@ -1159,13 +1178,18 @@ function renderReviewSession() {
     counts[operation.action] = (counts[operation.action] || 0) + 1;
     return counts;
   }, {});
+  const attention = run
+    ? reviewAttentionSummary(run.operations || [], 'operation')
+    : reviewAttentionSummary(findings, 'finding');
   $('review-stats').innerHTML = [
     `<span class="review-stat">${findings.length} 条 findings</span>`,
     `<span class="review-stat">${accepted} 条人工确认接受</span>`,
-    `<span class="review-stat">${ready} 条锚点可靠</span>`,
     `<span class="review-stat">${applied} 条已写回</span>`,
-    blocked ? `<span class="review-stat">${blocked} 条待定位</span>` : '',
-    run ? `<span class="review-stat">操作：新增 ${operationCounts.create || 0} · 修改 ${operationCounts.update || 0} · 撤回 ${operationCounts.withdraw || 0} · 不变 ${operationCounts.keep || 0} · 阻断 ${operationCounts.blocked || 0}</span>` : '',
+    `<span class="review-stat">待处理 ${attention.pending || 0}</span>`,
+    `<span class="review-stat">待确认已解决 ${attention.candidate_resolved || 0}</span>`,
+    (attention.system_conflict || 0) ? `<span class="review-stat conflict">系统冲突 ${attention.system_conflict}</span>` : '',
+    `<span class="review-stat">更多 ${attention.more || 0}</span>`,
+    run ? `<span class="review-stat">操作：新增 ${operationCounts.create || 0} · 修改 ${operationCounts.update || 0} · 撤回 ${operationCounts.withdraw || 0} · 续接 ${operationCounts.keep || 0} · 冲突 ${operationCounts.blocked || 0}</span>` : '',
   ].join('');
   $('review-ledger-eyebrow').textContent = run ? 'OPERATION PREVIEW' : 'FINDINGS LEDGER';
   $('review-ledger-title').textContent = run ? '操作预览' : '评审清单';
@@ -1175,16 +1199,196 @@ function renderReviewSession() {
   renderReviewMessages(session.messages || []);
 }
 
-const OPERATION_GROUPS = [
-  { action: 'create', label: '新增', code: 'CREATE' },
-  { action: 'update', label: '修改', code: 'UPDATE' },
-  { action: 'withdraw', label: '撤回', code: 'WITHDRAW' },
-  { action: 'keep', label: '不变（表示本轮未改动，不代表 AI 重新逐条核验）', code: 'KEEP' },
-  { action: 'blocked', label: '阻断', code: 'BLOCKED' },
+const REVIEW_ATTENTION_GROUPS = [
+  { state: 'pending', label: '待处理', code: 'PENDING' },
+  { state: 'candidate_resolved', label: '待确认已解决', code: 'RESOLVED?' },
+  { state: 'system_conflict', label: '系统冲突', code: 'CONFLICT', prominent: true },
+  { state: 'more', label: '更多', code: 'MORE' },
 ];
+
+const MORE_STATE_LABEL = {
+  evidence_unverified: '待证建议',
+  muted: '已屏蔽',
+  resolved: '已解决',
+  audit: '审计记录',
+};
+
+const OPERATION_ACTION_LABEL = {
+  create: '新增', update: '修改', withdraw: '撤回',
+  keep: '续接', blocked: '系统冲突', candidate_resolved: '可能解决',
+};
+
+const KEEP_REVERIFICATION_DISCLAIMER = '不变（表示本轮未改动，不代表 AI 重新逐条核验）';
 
 function operationField(operation, camel, snake) {
   return operation?.[camel] ?? operation?.[snake] ?? '';
+}
+
+function arrayField(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function proposedComment(operation) {
+  return operation?.proposed_comment || operation?.proposedComment || {};
+}
+
+function reviewWorkflowState(record) {
+  return (record?.workflow || {}).state || record?.workflow_state || '';
+}
+
+function reviewPlacementScope(record) {
+  const placement = record?.placement || {};
+  if (placement.scope) return placement.scope;
+  if (record?.anchorState === 'ready' || record?.anchor_state === 'ready') return 'quote';
+  if (record?.kind === 'overall') return 'document';
+  return 'quote';
+}
+
+function sourceBadgeLabel(record, operation = null) {
+  const origin = record?.origin || operation?.origin || {};
+  const actorType = origin.actor_type || record?.actor_type || '';
+  const source = record?.source || operation?.source || '';
+  if (actorType === 'human' || source === 'manual') return '人工';
+  if (actorType === 'ai' || source === 'ai-review' || source === 'selection-conversation') return 'AI';
+  return operation ? 'AI' : '人工';
+}
+
+function placementBadgeLabel(record) {
+  const scope = reviewPlacementScope(record);
+  if (scope === 'quote') return '原文';
+  if (scope === 'section') return '本节';
+  if (scope === 'document') return '全文';
+  if (scope === 'evidence_unverified') return '待证';
+  return '原文';
+}
+
+function reviewItemAttentionState(item, kind = 'finding') {
+  const record = kind === 'operation' ? proposedComment(item) : item;
+  const workflow = reviewWorkflowState(record);
+  const reason = String(item?.reason || '').toLowerCase();
+  const scope = reviewPlacementScope(record);
+  if (kind === 'operation' && item.action === 'blocked') return 'system_conflict';
+  if (kind === 'operation' && item.action === 'candidate_resolved') return 'candidate_resolved';
+  if (workflow === 'candidate_resolved') return 'candidate_resolved';
+  if (workflow === 'muted_by_user') return 'muted';
+  if (workflow === 'resolved') return 'resolved';
+  if (scope === 'evidence_unverified' || workflow === 'evidence_unverified' || reason === 'evidence_unverified') {
+    return 'evidence_unverified';
+  }
+  if (kind === 'finding' && (item.anchorState || item.anchor_state) === 'missing') return 'evidence_unverified';
+  return 'pending';
+}
+
+function groupReviewItems(items, kind = 'finding') {
+  const groups = REVIEW_ATTENTION_GROUPS.map((group) => ({ ...group, items: [] }));
+  const byState = Object.fromEntries(groups.map((group) => [group.state, group]));
+  items.forEach((item) => {
+    const state = reviewItemAttentionState(item, kind);
+    if (state === 'pending' || state === 'candidate_resolved' || state === 'system_conflict') {
+      byState[state].items.push(item);
+    } else {
+      byState.more.items.push({ ...item, _moreState: state });
+    }
+  });
+  return groups.filter((group) => !(group.state === 'system_conflict' && !group.items.length));
+}
+
+function reviewAttentionSummary(items, kind = 'finding') {
+  return groupReviewItems(items, kind).reduce((counts, group) => {
+    counts[group.state] = group.items.length;
+    return counts;
+  }, { pending: 0, candidate_resolved: 0, system_conflict: 0, more: 0 });
+}
+
+function evidenceProgress(record) {
+  const occurrences = arrayField(record?.evidence_occurrences || record?.evidenceOccurrences);
+  if (!occurrences.length) return null;
+  const done = occurrences.filter((item) => ['handled', 'not_applicable'].includes(item.progress_state)).length;
+  return { done, total: occurrences.length, label: `${done}/${occurrences.length}` };
+}
+
+function locatorPayload(locator) {
+  try {
+    return encodeURIComponent(JSON.stringify(locator || {}));
+  } catch {
+    return '';
+  }
+}
+
+function decodeLocatorPayload(value) {
+  try {
+    return JSON.parse(decodeURIComponent(value || ''));
+  } catch {
+    return {};
+  }
+}
+
+function reviewBadgeHtml(record, operation = null) {
+  const source = sourceBadgeLabel(record, operation);
+  const placement = placementBadgeLabel(record);
+  return `<span class="review-badge source">${esc(source)}</span><span class="review-badge placement">${esc(placement)}</span>`;
+}
+
+function evidenceProgressHtml(record, commentId = '') {
+  const progress = evidenceProgress(record);
+  const occurrences = arrayField(record?.evidence_occurrences || record?.evidenceOccurrences);
+  if (!progress || !occurrences.length) return '';
+  const rows = occurrences.map((occurrence, index) => {
+    const checked = occurrence.progress_state === 'handled';
+    const locator = occurrence.source_locator || occurrence.sourceLocator || {};
+    const quote = record.quote_text || record.quoteText || '';
+    const disabled = commentId ? '' : 'disabled';
+    return `<li>
+      <button type="button" data-occurrence-jump data-quote="${esc(quote)}" data-source-locator="${locatorPayload(locator)}">跳转 ${index + 1}</button>
+      <label><input type="checkbox" data-occurrence-progress="${esc(occurrence.id || '')}" data-comment-id="${esc(commentId)}" ${checked ? 'checked' : ''} ${disabled}> 已处理</label>
+      <span>${esc(occurrence.section_title || occurrence.sectionTitle || '未标章节')}</span>
+    </li>`;
+  }).join('');
+  return `<details class="occurrence-details">
+    <summary>证据进度 ${esc(progress.label)}</summary>
+    <ol>${rows}</ol>
+  </details>`;
+}
+
+function locationDetailsHtml(record, operation = null) {
+  const evidence = record?.evidence || {};
+  const placementDetail = record?.placement_detail || record?.placementDetail || {};
+  const placement = record?.placement || {};
+  const candidates = [
+    ...arrayField(placementDetail.candidates),
+    ...arrayField(evidence.candidates),
+  ];
+  const matchCount = evidence.match_count ?? record?.anchor_matches ?? record?.anchorMatches ?? '';
+  const fallbackReason = placementDetail.downgrade_reason
+    || evidence.fallback_reason
+    || placement.state
+    || operation?.reason
+    || '';
+  const rows = [];
+  if (fallbackReason) rows.push(`<p><span class="finding-label">原因</span>${esc(fallbackReason)}</p>`);
+  if (matchCount !== '') rows.push(`<p><span class="finding-label">match count</span>${esc(String(matchCount))}</p>`);
+  if (candidates.length) {
+    rows.push(`<ol>${candidates.slice(0, 8).map((candidate, index) => (
+      `<li>${index + 1}. ${esc(candidate.section_title || candidate.sectionTitle || candidate.section_id || candidate.sectionId || '候选位置')} · block ${esc(String(candidate.block_index ?? candidate.blockIndex ?? ''))}</li>`
+    )).join('')}</ol>`);
+  }
+  if (!rows.length) return '';
+  return `<details class="location-details"><summary>定位详情</summary>${rows.join('')}</details>`;
+}
+
+function resolutionReviewHtml(operation) {
+  const review = operation?.resolution_review || operation?.resolutionReview || {};
+  if (!review.before_text && !review.after_text && !review.new_evidence) return '';
+  return `<details class="ai-interpretation"><summary>AI 推测：解决复核依据</summary>
+    ${review.before_text ? `<p><span class="finding-label">修改前</span>${esc(review.before_text)}</p>` : ''}
+    ${review.after_text ? `<p><span class="finding-label">修改后</span>${esc(review.after_text)}</p>` : ''}
+    ${review.new_evidence ? `<p><span class="finding-label">新文本依据</span>${esc(review.new_evidence)}</p>` : ''}
+  </details>`;
+}
+
+function operationSelectable(operation) {
+  const state = reviewItemAttentionState(operation, 'operation');
+  return !['system_conflict', 'evidence_unverified', 'muted', 'resolved', 'audit'].includes(state);
 }
 
 function updateOperationSelectionControls() {
@@ -1223,27 +1427,37 @@ function renderOperationPreview(run) {
   root.textContent = '';
   root.className = 'review-findings operation-preview';
   const operations = run.operations || [];
-  OPERATION_GROUPS.forEach((group) => {
+  groupReviewItems(operations, 'operation').forEach((group) => {
     const section = document.createElement('section');
-    section.className = `operation-group operation-group-${group.action}`;
-    section.dataset.operationGroup = group.action;
-    const grouped = operations.filter((operation) => operation.action === group.action);
-    section.innerHTML = `<header><span>${group.code}</span><h4>${group.label}</h4><b>${grouped.length}</b></header><div class="operation-group-list"></div>`;
+    section.className = `operation-group operation-group-${group.state}${group.prominent && group.items.length ? ' prominent' : ''}`;
+    section.dataset.operationGroup = group.state.replace(/_/g, '-');
+    const candidateTargets = group.items
+      .filter((operation) => operation.action === 'candidate_resolved')
+      .map((operation) => operationField(operation, 'targetCommentId', 'target_comment_id'))
+      .filter(Boolean);
+    const bulkResolved = group.state === 'candidate_resolved' && run.status === 'completed' && candidateTargets.length
+      ? `<div class="operation-group-actions">
+          <button type="button" data-candidate-resolved-confirm="${esc(candidateTargets.join(','))}">批量确认已解决</button>
+          <button type="button" data-candidate-resolved-restore="${esc(candidateTargets.join(','))}">恢复为待处理</button>
+        </div>` : '';
+    section.innerHTML = `<header><span>${group.code}</span><h4>${group.label}</h4><b>${group.items.length}</b></header>${bulkResolved}<div class="operation-group-list"></div>`;
     const list = section.querySelector('.operation-group-list');
-    if (!grouped.length) {
+    if (!group.items.length) {
       list.innerHTML = '<div class="history-empty">本组无操作。</div>';
     }
-    grouped.forEach((operation) => {
-      const proposed = operation.proposed_comment || operation.proposedComment || {};
+    group.items.forEach((operation) => {
+      const proposed = proposedComment(operation);
       const appliedState = trueFindingState(proposed);
-      const humanEdited = group.action === 'update'
+      const humanEdited = operation.action === 'update'
         && Boolean(operationField(operation, 'humanEditedTarget', 'human_edited_target'));
-      const blocked = group.action === 'blocked';
+      const blocked = operation.action === 'blocked';
+      const selectable = operationSelectable(operation);
       const checked = reviewState.acceptedOperationIds.has(operation.id);
       const card = document.createElement('article');
       card.className = `operation-card${humanEdited ? ' human-edited' : ''}`;
       card.dataset.operationId = operation.id;
-      card.dataset.operationAction = group.action;
+      card.dataset.operationAction = operation.action;
+      card.dataset.attentionState = reviewItemAttentionState(operation, 'operation').replace(/_/g, '-');
       if (humanEdited) card.dataset.humanEdited = 'true';
       const targetId = operationField(operation, 'targetCommentId', 'target_comment_id');
       const findingId = operationField(operation, 'findingId', 'finding_id');
@@ -1251,9 +1465,16 @@ function renderOperationPreview(run) {
       const issue = proposed.issue || '';
       const action = proposed.action || '';
       const reason = operation.reason || (blocked ? '未提供阻断原因' : '');
+      const resurfacing = operation.resurfacing_notice || operation.resurfacingNotice || {};
+      const moreLabel = operation._moreState ? MORE_STATE_LABEL[operation._moreState] || '审计记录' : '';
+      const progress = evidenceProgress(proposed);
       card.innerHTML = `<div class="operation-card-head">
           <span class="operation-id">${esc(operation.id)}</span>
           <span class="operation-finding">${esc(findingId || '无 finding id')}</span>
+          <span class="operation-action">${esc(OPERATION_ACTION_LABEL[operation.action] || operation.action || '操作')}</span>
+          ${moreLabel ? `<span class="operation-action more">${esc(moreLabel)}</span>` : ''}
+          ${reviewBadgeHtml(proposed, operation)}
+          ${progress ? `<span class="evidence-progress">证据 ${esc(progress.label)}</span>` : ''}
           <span class="finding-state ${esc(appliedState || 'suggested')}">${esc(findingStateLabel(appliedState))}</span>
           ${targetId ? `<span class="operation-target">target ${esc(targetId)}</span>` : ''}
         </div>
@@ -1263,13 +1484,19 @@ function renderOperationPreview(run) {
           ${action ? `<p><span class="finding-label">建议</span>${esc(action)}</p>` : ''}
           ${reason ? `<p class="operation-reason"><span class="finding-label">原因</span>${esc(reason)}</p>` : ''}
         </div>
+        ${resurfacing.message ? `<p class="resurfacing-notice">${esc(resurfacing.message)}</p>` : ''}
+        ${operation.action === 'keep' ? `<p class="operation-keep-disclaimer">${KEEP_REVERIFICATION_DISCLAIMER}</p>` : ''}
+        ${resurfacing.mute_available && targetId ? `<button class="lineage-mute" type="button" data-lineage-mute="${esc(targetId)}">不再提示本问题</button>` : ''}
+        ${resolutionReviewHtml(operation)}
+        ${evidenceProgressHtml(proposed, targetId)}
+        ${locationDetailsHtml(proposed, operation)}
         ${humanEdited ? '<p class="human-edit-warning">该目标批注含人工编辑。批量接受不会选中此项；只有本项复选框的显式确认才允许覆盖。</p>' : ''}
-        <label class="operation-accept${blocked ? ' blocked' : ''}">
-          <input type="checkbox" data-operation-accept="${esc(operation.id)}" ${checked ? 'checked' : ''} ${blocked || run.status !== 'preview' ? 'disabled' : ''}>
-          <span>${blocked ? '保持阻断 · 不可接受' : humanEdited ? '显式接受这次覆盖' : '接受此项'}</span>
+        <label class="operation-accept${!selectable ? ' blocked' : ''}">
+          <input type="checkbox" data-operation-accept="${esc(operation.id)}" ${checked ? 'checked' : ''} ${!selectable || run.status !== 'preview' ? 'disabled' : ''}>
+          <span>${!selectable ? '不进入正常评审区' : humanEdited ? '显式接受这次覆盖' : operation.action === 'candidate_resolved' ? '提交为待确认已解决' : '接受此项'}</span>
         </label>`;
       const checkbox = card.querySelector('[data-operation-accept]');
-      if (!blocked && run.status === 'preview') {
+      if (selectable && run.status === 'preview') {
         checkbox.onchange = () => {
           if (checkbox.checked) reviewState.acceptedOperationIds.add(operation.id);
           else reviewState.acceptedOperationIds.delete(operation.id);
@@ -1285,7 +1512,7 @@ function renderOperationPreview(run) {
 function acceptAllNonBlockedOperations() {
   const operations = reviewState.activeRun?.operations || [];
   reviewState.acceptedOperationIds = new Set(operations.filter((operation) => (
-    operation.action !== 'blocked'
+    operationSelectable(operation)
     && !(operation.action === 'update'
       && Boolean(operationField(operation, 'humanEditedTarget', 'human_edited_target')))
   )).map((operation) => operation.id));
@@ -1301,30 +1528,48 @@ function renderFindings(findings) {
     root.innerHTML = '<div class="history-empty">这一轮没有生成可锚定的 findings。</div>';
     return;
   }
-  findings.forEach((finding) => {
-    const state = trueFindingState(finding);
-    const card = document.createElement('article');
-    card.className = `finding-card priority-${esc(finding.priority || 'P2')}${state === 'withdrawn' ? ' rejected' : ''}`;
-    const anchorText = finding.anchorState === 'ready' ? '锚点可靠' : finding.anchorState === 'ambiguous' ? '锚点重复' : '锚点缺失';
-    card.innerHTML = `<div class="finding-head">
-        <span class="finding-id">${esc(finding.id)}</span>
-        <span class="finding-priority">${esc(finding.priority)}</span>
-        <span class="finding-section">${esc(finding.section || '未标章节')}</span>
-        <span class="anchor-chip ${esc(finding.anchorState)}">${anchorText}</span>
-        <span class="finding-state ${esc(state || 'suggested')}">${esc(findingStateLabel(state))}</span>
-      </div>
-      <button type="button" class="finding-quote">「${esc(finding.quoteText.slice(0, 220))}」</button>
-      <p class="finding-issue"><span class="finding-label">问题</span>${esc(finding.issue)}</p>
-      <p class="finding-action"><span class="finding-label">建议</span>${esc(finding.action)}</p>
-      ${finding.evidenceRequirement ? `<p class="finding-action"><span class="finding-label">证据</span>${esc(finding.evidenceRequirement)}</p>` : ''}
-      <div class="finding-actions">
-        ${findingComment(finding) ? '<span class="finding-applied">✓ 已写回批注</span>' : '<span class="finding-applied">模型建议尚未成为批注</span>'}
-      </div>`;
-    card.querySelector('.finding-quote').onclick = () => {
-      editor.jumpToQuote(finding.quoteText, finding.sourceLocator || {});
-      closeReviewDrawer();
-    };
-    root.appendChild(card);
+  groupReviewItems(findings, 'finding').forEach((group) => {
+    const section = document.createElement('section');
+    section.className = `operation-group finding-group-${group.state}${group.prominent && group.items.length ? ' prominent' : ''}`;
+    section.dataset.operationGroup = group.state.replace(/_/g, '-');
+    section.innerHTML = `<header><span>${group.code}</span><h4>${group.label}</h4><b>${group.items.length}</b></header><div class="operation-group-list"></div>`;
+    const list = section.querySelector('.operation-group-list');
+    if (!group.items.length) list.innerHTML = '<div class="history-empty">本组无记录。</div>';
+    group.items.forEach((finding) => {
+      const state = trueFindingState(finding);
+      const card = document.createElement('article');
+      card.className = `finding-card priority-${esc(finding.priority || 'P2')}${state === 'withdrawn' ? ' rejected' : ''}`;
+      card.dataset.attentionState = reviewItemAttentionState(finding, 'finding').replace(/_/g, '-');
+      const anchorText = finding.anchorState === 'ready' ? '锚点可靠' : finding.anchorState === 'ambiguous' ? '锚点重复' : '锚点缺失';
+      const progress = evidenceProgress(finding);
+      const comment = findingComment(finding);
+      card.innerHTML = `<div class="finding-head">
+          <span class="finding-id">${esc(finding.id)}</span>
+          <span class="finding-priority">${esc(finding.priority)}</span>
+          <span class="finding-section">${esc(finding.section || '未标章节')}</span>
+          ${reviewBadgeHtml(finding)}
+          ${progress ? `<span class="evidence-progress">证据 ${esc(progress.label)}</span>` : ''}
+          <span class="anchor-chip ${esc(finding.anchorState)}">${anchorText}</span>
+          <span class="finding-state ${esc(state || 'suggested')}">${esc(findingStateLabel(state))}</span>
+        </div>
+        <button type="button" class="finding-quote">「${esc((finding.quoteText || finding.quote_text || '').slice(0, 220))}」</button>
+        <p class="finding-issue"><span class="finding-label">问题</span>${esc(finding.issue)}</p>
+        <details class="ai-interpretation"><summary>AI 推测：解读与建议</summary>
+          <p class="finding-action"><span class="finding-label">建议</span>${esc(finding.action)}</p>
+          ${finding.evidenceRequirement ? `<p class="finding-action"><span class="finding-label">证据</span>${esc(finding.evidenceRequirement)}</p>` : ''}
+        </details>
+        ${evidenceProgressHtml(finding, comment?.id || '')}
+        ${locationDetailsHtml(finding)}
+        <div class="finding-actions">
+          ${comment ? '<span class="finding-applied">✓ 已写回批注</span>' : '<span class="finding-applied">模型建议尚未成为批注</span>'}
+        </div>`;
+      card.querySelector('.finding-quote').onclick = () => {
+        editor.jumpToQuote(finding.quoteText || finding.quote_text || '', finding.sourceLocator || finding.source_locator || {});
+        closeReviewDrawer();
+      };
+      list.appendChild(card);
+    });
+    root.appendChild(section);
   });
 }
 
@@ -1464,6 +1709,65 @@ async function decideFinding(findingId, decision) {
   if (!json.ok) return toast(json.error || '更新 finding 失败', true);
   activateReviewSession(json.session);
   renderReviewSession();
+}
+
+async function muteFindingLineage(commentId) {
+  if (!commentId) return;
+  const { response, json } = await apiJson(`/api/comments/${encodeURIComponent(commentId)}/lineage-mute`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.error || json.message || '屏蔽失败', true);
+  await refreshEditorComments();
+  toast('本问题后续不再提示；可在文章总览恢复。');
+}
+
+async function restoreFindingLineage(commentId) {
+  if (!commentId) return;
+  const { response, json } = await apiJson(`/api/comments/${encodeURIComponent(commentId)}/lineage-restore`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.error || json.message || '恢复失败', true);
+  await refreshEditorComments();
+  toast('该问题已恢复到正常提示。');
+}
+
+async function confirmCandidateResolved(commentIds) {
+  const ids = commentIds.filter(Boolean);
+  if (!ids.length) return;
+  const { response, json } = await apiJson('/api/comments/candidate-resolved/confirm', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, comment_ids: ids, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.error || json.message || '确认已解决失败', true);
+  await refreshEditorComments();
+  toast(`已确认 ${ids.length} 条 finding 已解决。`);
+}
+
+async function restoreCandidateResolved(commentIds) {
+  const ids = commentIds.filter(Boolean);
+  if (!ids.length) return;
+  const { response, json } = await apiJson('/api/comments/candidate-resolved/restore', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, comment_ids: ids, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.error || json.message || '恢复待处理失败', true);
+  await refreshEditorComments();
+  toast(`已恢复 ${ids.length} 条 finding 到待处理。`);
+}
+
+async function setOccurrenceProgress(commentId, occurrenceId, state) {
+  if (!commentId || !occurrenceId) return;
+  const { response, json } = await apiJson(
+    `/api/comments/${encodeURIComponent(commentId)}/evidence-occurrences/${encodeURIComponent(occurrenceId)}/progress`,
+    {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: DOC_PATH, state, actor: 'June' }),
+    },
+  );
+  if (!response.ok || !json.ok) return toast(json.error || json.message || '证据进度更新失败', true);
+  await refreshEditorComments();
 }
 
 function resetReviewComposer() {
@@ -1807,6 +2111,10 @@ $('import-file').onchange = () => stageImportFile($('import-file').files?.[0]);
 $('import-commit').onclick = commitStagedImport;
 $('overview-close').onclick = closeOverview;
 $('overview-scrim').onclick = closeOverview;
+$('overview-muted-list').onclick = (event) => {
+  const restore = event.target.closest('[data-lineage-restore]');
+  if (restore) restoreFindingLineage(restore.dataset.lineageRestore);
+};
 $('overview-generate').onclick = () => generateDocumentSummary(false);
 $('overview-regenerate').onclick = () => {
   const current = overviewState.summary?.base_rev === editor.documentState.rev;
@@ -1863,6 +2171,30 @@ $('review-new').onclick = resetReviewComposer;
 $('review-accept-all').onclick = acceptAllNonBlockedOperations;
 $('review-writeback').onclick = syncReview;
 $('review-send').onclick = continueReview;
+$('review-findings').onclick = (event) => {
+  const mute = event.target.closest('[data-lineage-mute]');
+  if (mute) return muteFindingLineage(mute.dataset.lineageMute);
+  const restore = event.target.closest('[data-lineage-restore]');
+  if (restore) return restoreFindingLineage(restore.dataset.lineageRestore);
+  const confirm = event.target.closest('[data-candidate-resolved-confirm]');
+  if (confirm) return confirmCandidateResolved(confirm.dataset.candidateResolvedConfirm.split(','));
+  const restoreResolved = event.target.closest('[data-candidate-resolved-restore]');
+  if (restoreResolved) return restoreCandidateResolved(restoreResolved.dataset.candidateResolvedRestore.split(','));
+  const jump = event.target.closest('[data-occurrence-jump]');
+  if (jump) {
+    editor.jumpToQuote(jump.dataset.quote || '', decodeLocatorPayload(jump.dataset.sourceLocator || ''));
+    closeReviewDrawer();
+  }
+};
+$('review-findings').onchange = (event) => {
+  const checkbox = event.target.closest('[data-occurrence-progress]');
+  if (!checkbox) return;
+  setOccurrenceProgress(
+    checkbox.dataset.commentId,
+    checkbox.dataset.occurrenceProgress,
+    checkbox.checked ? 'handled' : 'open',
+  );
+};
 $('review-message').addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); continueReview(); }
 });
@@ -1928,6 +2260,8 @@ window.__COMMA_REVIEW__ = {
   overviewState, loadDocumentSummary, generateDocumentSummary, acceptAllProvisionalComments,
   importState, openImportDialog, closeImportDialog, stageImportFile, commitStagedImport,
   evidenceState, openEvidenceDrawer, closeEvidenceDrawer, loadEvidenceSources, attachEvidenceFile,
+  reviewItemAttentionState, groupReviewItems, reviewAttentionSummary,
+  muteFindingLineage, restoreFindingLineage, confirmCandidateResolved, restoreCandidateResolved,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 
