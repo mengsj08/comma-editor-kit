@@ -11,7 +11,7 @@ The editor is **not** an MCP server and **not** a Skill. It exposes a document a
 - `src/core/`: revision, block mapping, comment-anchor, and model contracts.
 - `src/element/`: the `<comma-editor>` Web Component.
 - `src/adapters/`: memory, browser storage, and HTTP host adapters.
-- `apps/review-studio/`: local Python reference host with multi-turn structured AI review, revision-locked comment writeback, recoverable document history, and Markdown/ZIP/DOCX/PDF exports.
+- `apps/review-studio/`: local Python reference host with staged Word/Markdown intake, page-provenanced PDF EvidenceSources, multi-turn structured AI review, revision-locked comment writeback, recoverable document history, and Markdown/ZIP/DOCX/PDF exports.
 - `standalone/`: a real local demo using browser local storage.
 - `chrome-extension/`: Manifest V3 Side Panel wrapper with explicit current-page capture.
 - `release/chrome-extension/`: generated installable unpacked-extension directory after `npm run build:chrome`.
@@ -190,6 +190,15 @@ Codex/Claude discussion with reply comments and branch lineage. Each assistant
 message offers an explicit, editable `write back as comment` gate. Conversation
 history is not document history and stays in the host under
 `data/conversations/`; editor-core only emits the selected quote contract.
+
+Review Studio's `导入主稿` action stages a local UTF-8 Markdown or DOCX, shows
+the conversion receipt, and creates a new no-overwrite canonical Markdown only
+after confirmation. DOCX conversion is a pinned Mammoth → sanitized HTML →
+Turndown/GFM pipeline inside a no-network macOS sandbox. `参考资料` stores a PDF
+as a separate page-provenanced EvidenceSource; it enters a new discussion or AI
+Review only when explicitly checked. See
+[docs/SCIENTIFIC_IMPORT_V0.md](docs/SCIENTIFIC_IMPORT_V0.md) for the threat
+model, storage contract, extraction thresholds, and remaining product gates.
 
 ## Chrome extension
 

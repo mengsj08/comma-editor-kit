@@ -15,6 +15,8 @@
       <span id="doc-meta" class="doc-meta"></span>
     </div>
     <div class="doc-actions">
+      <button id="btn-import" class="primary-action" type="button" title="从 Word 或 Markdown 创建新的评审主稿">导入主稿</button>
+      <button id="btn-evidence" type="button" title="管理与主稿分离的 PDF 参考资料">参考资料 <span id="evidence-count">0</span></button>
       <div class="cli-status-wrap">
         <button id="cli-status" class="cli-status checking" type="button" aria-label="查看本机 CLI 状态" aria-haspopup="dialog" aria-expanded="false">
           <i aria-hidden="true"></i><span>CLI · 检测中</span>
@@ -31,6 +33,69 @@
       <button id="btn-review-history" type="button">评审记录</button>
     </div>
   </header>
+
+  <section id="import-modal" class="import-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="import-title" hidden>
+    <header class="import-head">
+      <div><div class="eyebrow">MANUSCRIPT INTAKE</div><h2 id="import-title">导入科研主稿</h2></div>
+      <button id="import-close" class="icon-button" type="button" aria-label="关闭导入">×</button>
+    </header>
+    <div class="import-policy">
+      <span>一次性进入</span>
+      <div><strong>创建后，Markdown 是唯一工作主稿</strong><p>原文件保留为不可变来源；此流程不覆盖现有文档，也不与 Word 双向同步。</p></div>
+    </div>
+    <section id="import-picker" class="import-picker">
+      <input id="import-file" type="file" accept=".docx,.md,.markdown" hidden>
+      <div class="import-picker-mark" aria-hidden="true">↥</div>
+      <h3>选择本地 Word 或 Markdown</h3>
+      <p>DOCX 会先做宏、外链、ZIP 与修订检查，再在禁网沙箱中转换；UTF-8 Markdown 会原样归档后进入预览。</p>
+      <button id="import-choose" type="button">选择文件</button>
+    </section>
+    <section id="import-preview" class="import-preview" hidden>
+      <div class="import-source-row">
+        <div><span>SOURCE</span><strong id="import-source-name">—</strong><small id="import-source-meta"></small></div>
+        <b id="import-stage-status">STAGED</b>
+      </div>
+      <label class="import-target-label" for="import-target"><span>NEW CANONICAL MARKDOWN</span>新主稿文件名</label>
+      <input id="import-target" type="text" maxlength="200" spellcheck="false">
+      <div id="import-normalizations" class="import-normalizations" hidden></div>
+      <pre id="import-preview-content" aria-label="导入预览"></pre>
+    </section>
+    <div id="import-error" class="import-error" hidden></div>
+    <footer class="import-actions">
+      <button id="import-another" type="button" hidden>另选文件</button>
+      <span id="import-progress">选择文件后只会暂存和预览，不会立即创建主稿。</span>
+      <button id="import-commit" class="primary" type="button" disabled>确认创建主稿</button>
+    </footer>
+  </section>
+  <div id="import-scrim" class="import-scrim" hidden></div>
+
+  <aside id="evidence-drawer" class="evidence-drawer" aria-hidden="true" aria-label="参考资料">
+    <header class="evidence-head">
+      <div><div class="eyebrow">EVIDENCE SOURCES</div><h2>参考资料</h2></div>
+      <button id="evidence-close" class="icon-button" type="button" aria-label="关闭参考资料">×</button>
+    </header>
+    <section class="evidence-boundary">
+      <strong>PDF 不会并入 Markdown</strong>
+      <p>逐页文本和页码只在本地提取。添加后也不会自动发送给 AI；只有在某次讨论中显式勾选，才进入那一轮上下文。</p>
+    </section>
+    <section class="evidence-upload">
+      <input id="evidence-file" type="file" accept=".pdf,application/pdf" hidden>
+      <div><span>ADD LOCAL PDF</span><strong>添加上下文 PDF</strong><small>支持带文本层 PDF；v0 不做 OCR。</small></div>
+      <button id="evidence-choose" type="button">选择 PDF</button>
+    </section>
+    <section class="evidence-summary-policy">
+      <label>AI 摘要工具
+        <select id="evidence-summary-tool"><option value="codex">Codex</option><option value="claude">Claude</option></select>
+      </label>
+      <p>添加 PDF 时不调用 AI。只有逐份点击“生成摘要”并确认后，提取出的 PDF 文本才会交给所选 CLI/provider。</p>
+    </section>
+    <div id="evidence-upload-state" class="evidence-upload-state" hidden></div>
+    <section class="evidence-list-section">
+      <div class="archive-section-title"><span>ATTACHED TO THIS MANUSCRIPT</span><strong>已添加资料</strong></div>
+      <div id="evidence-list" class="evidence-list"><p class="archive-loading">正在读取参考资料…</p></div>
+    </section>
+  </aside>
+  <div id="evidence-scrim" class="evidence-scrim" hidden></div>
 
   <main class="doc-main comma-host-main">
     <section class="doc-pane comma-host-pane">
@@ -255,6 +320,7 @@
           <label><input type="radio" name="conversation-tool" value="claude"><span>Claude</span></label>
           <label><input type="radio" name="conversation-tool" value="codex" checked><span>Codex</span></label>
         </div>
+        <button id="conversation-evidence-open" class="conversation-evidence-open" type="button">+ 参考资料</button>
         <div id="conversation-history" class="conversation-history"></div>
       </div>
       <div id="conversation-empty" class="conversation-empty">

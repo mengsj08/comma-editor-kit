@@ -20,6 +20,8 @@ const conversationState = {
   active: null, sessions: [], sourceQuote: null, running: false,
   composerMode: 'root', parentMessageId: '', writebackMessageId: '', quickSource: null,
 };
+const importState = { record: null, busy: false };
+const evidenceState = { sources: [], selectedIds: new Set(), loading: false, uploading: false };
 let runtimeCapabilities = null;
 let runtimeLoading = null;
 let toastTimer = null;
@@ -50,6 +52,274 @@ async function apiJson(url, init = {}) {
   let json = null;
   try { json = await response.json(); } catch { json = null; }
   return { response, json: json || { ok: false, error: `HTTP ${response.status}` } };
+}
+
+function setImportError(message = '') {
+  const element = $('import-error');
+  element.textContent = message;
+  element.hidden = !message;
+}
+
+function setImportBusy(busy, message = '') {
+  importState.busy = busy;
+  $('import-choose').disabled = busy;
+  $('import-another').disabled = busy;
+  $('import-target').disabled = busy;
+  $('import-commit').disabled = busy || !importState.record;
+  if (message) $('import-progress').textContent = message;
+}
+
+function resetImportDialog() {
+  importState.record = null;
+  importState.busy = false;
+  $('import-file').value = '';
+  $('import-picker').hidden = false;
+  $('import-preview').hidden = true;
+  $('import-another').hidden = true;
+  $('import-target').value = '';
+  $('import-preview-content').textContent = '';
+  $('import-normalizations').hidden = true;
+  $('import-normalizations').textContent = '';
+  $('import-progress').textContent = '选择文件后只会暂存和预览，不会立即创建主稿。';
+  $('import-commit').disabled = true;
+  setImportError('');
+}
+
+function openImportDialog() {
+  resetImportDialog();
+  $('import-modal').hidden = false;
+  $('import-modal').setAttribute('aria-hidden', 'false');
+  $('import-scrim').hidden = false;
+  document.body.style.overflow = 'hidden';
+}
+
+async function discardStagedImport() {
+  const record = importState.record;
+  if (!record || record.status !== 'staged') return;
+  await apiJson(`/api/imports/${encodeURIComponent(record.id)}`, { method: 'DELETE' });
+  importState.record = null;
+}
+
+async function closeImportDialog() {
+  if (importState.busy) return;
+  await discardStagedImport();
+  $('import-modal').hidden = true;
+  $('import-modal').setAttribute('aria-hidden', 'true');
+  $('import-scrim').hidden = true;
+  document.body.style.overflow = '';
+  resetImportDialog();
+}
+
+function renderStagedImport(record) {
+  importState.record = record;
+  $('import-picker').hidden = true;
+  $('import-preview').hidden = false;
+  $('import-another').hidden = false;
+  $('import-source-name').textContent = record.source?.filename || '未命名文件';
+  const kib = Math.max(1, Math.round((record.source?.byte_count || 0) / 1024));
+  const hash = String(record.source?.sha256 || '').replace('sha256:', '').slice(0, 16);
+  const components = record.converter?.components || {};
+  const converter = Object.entries(components).filter(([, version]) => version)
+    .map(([name, version]) => `${name.replaceAll('_', '-')} ${version}`).join(' · ');
+  $('import-source-meta').textContent = `${kib} KB · sha256 ${hash}…${converter ? ` · ${converter}` : ''}`;
+  $('import-stage-status').textContent = String(record.status || 'staged').toUpperCase();
+  $('import-target').value = record.candidate?.suggested_target || '';
+  $('import-preview-content').textContent = record.preview || '';
+  const notes = [
+    ...(Array.isArray(record.normalizations) ? record.normalizations.map((item) => `处理：${item}`) : []),
+    ...(Array.isArray(record.warnings) ? record.warnings.map((item) => `复核：${item}`) : []),
+  ];
+  $('import-normalizations').hidden = !notes.length;
+  $('import-normalizations').textContent = notes.join('；');
+  $('import-progress').textContent = record.preview_truncated
+    ? '预览已截断；确认时仍会创建完整 Markdown。'
+    : '已暂存并完成 hash 校验；确认前尚未创建主稿。';
+  $('import-commit').disabled = false;
+}
+
+async function stageImportFile(file) {
+  if (!file || importState.busy) return;
+  const extension = file.name.toLowerCase().split('.').pop();
+  if (!['docx', 'md', 'markdown'].includes(extension)) {
+    return setImportError('主稿导入只接受 .docx、.md 或 .markdown。');
+  }
+  if (importState.record?.status === 'staged') await discardStagedImport();
+  setImportError('');
+  setImportBusy(true, '正在隔离暂存、计算 hash 并生成预览…');
+  const params = new URLSearchParams({ kind: 'manuscript', filename: file.name });
+  try {
+    const { response, json } = await apiJson(`/api/imports?${params}`, {
+      method: 'POST', headers: { 'Content-Type': file.type || 'text/markdown' }, body: file,
+    });
+    if (!response.ok || !json.ok) throw new Error(json.error || `HTTP ${response.status}`);
+    renderStagedImport(json.import);
+  } catch (error) {
+    importState.record = null;
+    setImportError(error.message || '导入暂存失败');
+    $('import-progress').textContent = '没有创建主稿；可修正文件后重试。';
+  } finally {
+    setImportBusy(false);
+  }
+}
+
+async function commitStagedImport() {
+  if (!importState.record || importState.busy) return;
+  const targetName = $('import-target').value.trim();
+  if (!targetName) return setImportError('请填写新的 Markdown 文件名。');
+  setImportError('');
+  setImportBusy(true, '正在校验来源与候选 hash，并原子创建新主稿…');
+  const { response, json } = await apiJson(`/api/imports/${encodeURIComponent(importState.record.id)}/commit`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_name: targetName, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) {
+    setImportBusy(false, '主稿尚未创建；请处理上方问题后重试。');
+    return setImportError(json.message || json.error || `HTTP ${response.status}`);
+  }
+  importState.record = json.import;
+  $('import-stage-status').textContent = 'COMMITTED';
+  $('import-progress').textContent = json.reused ? '该导入已创建过，正在打开原目标。' : '已创建主稿和首个版本，正在打开。';
+  const next = new URL(location.href);
+  next.searchParams.set('doc', json.import.target.path);
+  location.assign(next.toString());
+}
+
+function evidenceStatusLabel(source) {
+  if (source.extraction_status === 'usable' && source.full_text_confirmed) return '全文 PDF · 文本可用';
+  if (source.extraction_status === 'usable') return '文本可用 · 待确认全文';
+  if (source.extraction_status === 'partial') return '部分文本可用';
+  if (source.extraction_status === 'image_only') return '无可用文本层';
+  return '提取失败';
+}
+
+function renderEvidenceSources() {
+  const root = $('evidence-list');
+  $('evidence-count').textContent = String(evidenceState.sources.length);
+  const validIds = new Set(evidenceState.sources
+    .filter((source) => ['usable', 'partial'].includes(source.extraction_status))
+    .map((source) => source.id));
+  evidenceState.selectedIds = new Set([...evidenceState.selectedIds].filter((id) => validIds.has(id)));
+  if (!evidenceState.sources.length) {
+    root.innerHTML = '<div class="evidence-empty">还没有参考资料。添加 PDF 不会改动当前 Markdown。</div>';
+    return;
+  }
+  root.innerHTML = evidenceState.sources.map((source) => {
+    const metrics = source.metrics || {};
+    const selectable = ['usable', 'partial'].includes(source.extraction_status);
+    const selected = evidenceState.selectedIds.has(source.id);
+    const warnings = (source.warnings || []).slice(0, 2);
+    const summary = (source.summaries || []).filter((item) => item.status === 'ready').at(-1);
+    return `<article class="evidence-card ${esc(source.extraction_status)}" data-evidence-id="${esc(source.id)}">
+      <header><div><h3>${esc(source.source?.filename || 'reference.pdf')}</h3><small>${esc(String(source.source?.sha256 || '').replace('sha256:', '').slice(0, 16))}…</small></div><span class="evidence-card-status">${esc(evidenceStatusLabel(source))}</span></header>
+      <div class="evidence-metrics"><span>${Number(metrics.page_count || 0)} 页</span><span>${Number(metrics.total_non_whitespace_chars || 0).toLocaleString()} 字符</span><span>${Math.round(Number(metrics.text_usable_ratio || 0) * 100)}% 页可用</span></div>
+      ${warnings.length ? `<div class="evidence-warning">${warnings.map(esc).join('<br>')}</div>` : ''}
+      ${summary ? `<div class="evidence-summary"><strong>${esc(String(summary.tool || '').toUpperCase())} 摘要</strong><ol>${(summary.summary_3_6 || []).map((item) => `<li>${esc(item)}</li>`).join('')}</ol></div>` : ''}
+      <div class="evidence-card-actions">
+        <a href="/api/evidence-sources/${encodeURIComponent(source.id)}/file?path=${encodeURIComponent(DOC_PATH)}" target="_blank" rel="noopener">打开 PDF</a>
+        ${source.extraction_status === 'usable' && !source.full_text_confirmed ? '<button type="button" data-evidence-action="confirm">确认这是全文</button>' : ''}
+        ${selectable ? `<button type="button" data-evidence-action="summary">${summary ? '重新查看摘要' : '生成摘要'}</button>` : ''}
+        ${selectable ? `<label><input type="checkbox" data-evidence-action="select" ${selected ? 'checked' : ''}> 用于下一次讨论/评审</label>` : ''}
+      </div>
+    </article>`;
+  }).join('');
+}
+
+async function loadEvidenceSources() {
+  if (evidenceState.loading) return;
+  evidenceState.loading = true;
+  $('evidence-list').innerHTML = '<p class="archive-loading">正在读取参考资料…</p>';
+  const { response, json } = await apiJson(`/api/evidence-sources?path=${encodeURIComponent(DOC_PATH)}`, { cache: 'no-store' });
+  evidenceState.loading = false;
+  if (!response.ok || !json.ok) {
+    $('evidence-list').innerHTML = `<div class="evidence-empty">${esc(json.error || '参考资料读取失败')}</div>`;
+    return;
+  }
+  evidenceState.sources = Array.isArray(json.sources) ? json.sources : [];
+  renderEvidenceSources();
+}
+
+function openEvidenceDrawer() {
+  $('evidence-drawer').classList.add('open');
+  $('evidence-drawer').setAttribute('aria-hidden', 'false');
+  $('evidence-scrim').hidden = false;
+  loadEvidenceSources();
+}
+
+function closeEvidenceDrawer() {
+  $('evidence-drawer').classList.remove('open');
+  $('evidence-drawer').setAttribute('aria-hidden', 'true');
+  $('evidence-scrim').hidden = true;
+}
+
+function setEvidenceUploadState(message = '', isError = false) {
+  const element = $('evidence-upload-state');
+  element.textContent = message;
+  element.hidden = !message;
+  element.classList.toggle('error', isError);
+}
+
+async function attachEvidenceFile(file) {
+  if (!file || evidenceState.uploading) return;
+  if (!file.name.toLowerCase().endsWith('.pdf')) return setEvidenceUploadState('参考资料只接受 PDF。', true);
+  evidenceState.uploading = true;
+  $('evidence-choose').disabled = true;
+  setEvidenceUploadState('正在本地逐页提取文本并统计覆盖率；此步骤不会调用 AI。');
+  const params = new URLSearchParams({ path: DOC_PATH, filename: file.name });
+  const { response, json } = await apiJson(`/api/evidence-sources?${params}`, {
+    method: 'POST', headers: { 'Content-Type': file.type || 'application/pdf' }, body: file,
+  });
+  evidenceState.uploading = false;
+  $('evidence-choose').disabled = false;
+  $('evidence-file').value = '';
+  if (!response.ok || !json.ok) return setEvidenceUploadState(json.error || 'PDF 添加失败', true);
+  setEvidenceUploadState(json.reused ? '这份 PDF 已经添加过，没有创建重复资料。' : `已添加：${evidenceStatusLabel(json.source)}。`);
+  await loadEvidenceSources();
+}
+
+async function confirmEvidenceFullText(evidenceId) {
+  const source = evidenceState.sources.find((item) => item.id === evidenceId);
+  if (!source || !window.confirm(`确认“${source.source?.filename || '这份 PDF'}”是你认可的全文文件？\n\n这只确认文件身份；文本提取质量仍由独立指标表示。`)) return;
+  const { response, json } = await apiJson(`/api/evidence-sources/${encodeURIComponent(evidenceId)}/confirm-full-text`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: DOC_PATH, confirmed: true, actor: 'June' }),
+  });
+  if (!response.ok || !json.ok) return toast(json.error || '全文确认失败', true);
+  evidenceState.sources = evidenceState.sources.map((item) => item.id === evidenceId ? json.source : item);
+  renderEvidenceSources();
+}
+
+async function generateEvidenceSummary(evidenceId) {
+  const source = evidenceState.sources.find((item) => item.id === evidenceId);
+  if (!source) return;
+  const tool = $('evidence-summary-tool').value;
+  const existing = (source.summaries || []).filter((item) => item.status === 'ready' && item.tool === tool).at(-1);
+  if (existing) {
+    toast(`${tool.toUpperCase()} 摘要已显示在资料卡中；同一来源会复用已有记录。`);
+    return;
+  }
+  if (!await requireRuntimeTool(tool, 'structured_review')) return;
+  const confirmed = window.confirm(
+    `确认用 ${tool.toUpperCase()} 生成这份 PDF 的 3–6 句摘要？\n\n将发送：本地提取的逐页 PDF 文本与页码。\n不会发送：原始 PDF 二进制、其他未勾选资料或 Markdown 正文。`,
+  );
+  if (!confirmed) return;
+  setEvidenceUploadState(`正在把这份 PDF 的提取文本交给 ${tool.toUpperCase()}；不会改动正文或批注。`);
+  const { response, json } = await apiJson(`/api/evidence-sources/${encodeURIComponent(evidenceId)}/summary`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: DOC_PATH, tool, confirmed_data_transfer: true, actor: 'June',
+    }),
+  });
+  if (!response.ok || !json.ok) return setEvidenceUploadState(json.error || 'PDF 摘要生成失败', true);
+  evidenceState.sources = evidenceState.sources.map((item) => item.id === evidenceId ? json.source : item);
+  setEvidenceUploadState(json.reused ? '已复用同一来源与 provider 的摘要。' : '摘要已记录；原 PDF 和页码级文本仍保留在本地 EvidenceSource。');
+  renderEvidenceSources();
+}
+
+function normalizeHostConversationSession(raw) {
+  return {
+    ...normalizeConversationSession(raw),
+    evidenceSources: Array.isArray(raw?.evidence_sources) ? raw.evidence_sources : [],
+  };
 }
 
 function runtimeTool(tool) {
@@ -1112,6 +1382,7 @@ async function runReview(mode) {
       mode,
       tool,
       instruction: $('review-instruction').value.trim(),
+      evidence_source_ids: [...evidenceState.selectedIds],
     }),
   });
   if (!json.ok) return setReviewRunning(false, json.message || json.error || `${modeLabel}失败`, true);
@@ -1266,7 +1537,7 @@ async function loadConversationSessions(loadLatest = false) {
 async function loadConversationSession(id) {
   const { json } = await apiJson(`/api/conversations/${encodeURIComponent(id)}`);
   if (!json.ok) return toast(json.error || '讨论记录读取失败', true);
-  conversationState.active = normalizeConversationSession(json.session);
+  conversationState.active = normalizeHostConversationSession(json.session);
   setConversationSource(conversationState.active.sourceQuote);
   syncConversationTool(conversationState.active.tool, true);
   conversationState.composerMode = 'followup';
@@ -1408,7 +1679,8 @@ function renderConversation() {
     return;
   }
   syncConversationTool(session.tool, true);
-  $('conversation-status').textContent = `${session.tool.toUpperCase()} · ${session.messages.length} 条消息 · rev ${session.baseRev}`;
+  const evidenceLabel = session.evidenceSources?.length ? ` · ${session.evidenceSources.length} 份参考资料` : '';
+  $('conversation-status').textContent = `${session.tool.toUpperCase()} · ${session.messages.length} 条消息${evidenceLabel} · rev ${session.baseRev}`;
   const notesByMessage = new Map();
   const branchStarts = new Map();
   for (const message of session.messages) {
@@ -1444,6 +1716,7 @@ async function sendConversationMessage() {
     body = {
       path: DOC_PATH, base_rev: editor.documentState.rev, tool: selectedConversationTool(),
       source_quote: sourceQuotePayload(conversationState.sourceQuote), message: content,
+      evidence_source_ids: [...evidenceState.selectedIds],
     };
   } else if (mode === 'note') {
     url = `/api/conversations/${encodeURIComponent(conversationState.active.id)}/notes`;
@@ -1459,7 +1732,7 @@ async function sendConversationMessage() {
     setConversationRunning(false, json.message || json.error || '讨论失败');
     return toast(json.message || json.error || '讨论失败', true);
   }
-  conversationState.active = normalizeConversationSession(json.session);
+  conversationState.active = normalizeHostConversationSession(json.session);
   setConversationSource(conversationState.active.sourceQuote);
   $('conversation-message').value = '';
   setConversationRunning(false, json.branch_created ? '新分支已建立' : mode === 'note' ? '评论已记录' : '回复完成');
@@ -1490,13 +1763,48 @@ async function writebackConversationMessage() {
     setConversationRunning(false, json.message || json.error || '写回失败');
     return toast(json.message || json.error || '写回失败', true);
   }
-  conversationState.active = normalizeConversationSession(json.session);
+  conversationState.active = normalizeHostConversationSession(json.session);
   setConversationRunning(false, json.action === 'created' ? '已写回为原文批注' : json.action === 'updated' ? '批注已更新' : '这条回复已经写回');
   await refreshEditorComments();
   renderConversation();
 }
 
 $('btn-review-history').onclick = async () => { openReviewDrawer(); if (!reviewState.active) await loadReviewSessions(true); };
+$('btn-import').onclick = openImportDialog;
+$('btn-evidence').onclick = openEvidenceDrawer;
+$('conversation-evidence-open').onclick = openEvidenceDrawer;
+$('evidence-close').onclick = closeEvidenceDrawer;
+$('evidence-scrim').onclick = closeEvidenceDrawer;
+$('evidence-choose').onclick = () => $('evidence-file').click();
+$('evidence-file').onchange = () => attachEvidenceFile($('evidence-file').files?.[0]);
+$('evidence-list').onclick = (event) => {
+  const button = event.target.closest('button[data-evidence-action]');
+  if (!button) return;
+  const evidenceId = button.closest('[data-evidence-id]')?.dataset.evidenceId;
+  if (button.dataset.evidenceAction === 'confirm') confirmEvidenceFullText(evidenceId);
+  if (button.dataset.evidenceAction === 'summary') generateEvidenceSummary(evidenceId);
+};
+$('evidence-list').onchange = (event) => {
+  const checkbox = event.target.closest('input[data-evidence-action="select"]');
+  if (!checkbox) return;
+  const evidenceId = checkbox.closest('[data-evidence-id]')?.dataset.evidenceId;
+  if (!evidenceId) return;
+  if (checkbox.checked) evidenceState.selectedIds.add(evidenceId);
+  else evidenceState.selectedIds.delete(evidenceId);
+  const count = evidenceState.selectedIds.size;
+  setEvidenceUploadState(count ? `已选择 ${count} 份资料；只会用于下一次新建的讨论或评审。` : '当前没有资料会进入下一次讨论或评审。');
+};
+$('import-close').onclick = closeImportDialog;
+$('import-scrim').onclick = closeImportDialog;
+$('import-choose').onclick = () => $('import-file').click();
+$('import-another').onclick = async () => {
+  if (importState.busy) return;
+  await discardStagedImport();
+  resetImportDialog();
+  $('import-file').click();
+};
+$('import-file').onchange = () => stageImportFile($('import-file').files?.[0]);
+$('import-commit').onclick = commitStagedImport;
 $('overview-close').onclick = closeOverview;
 $('overview-scrim').onclick = closeOverview;
 $('overview-generate').onclick = () => generateDocumentSummary(false);
@@ -1602,6 +1910,9 @@ $('cli-redetect').onclick = async () => {
 document.addEventListener('click', (event) => {
   if (!event.target.closest('.cli-status-wrap')) closeRuntimePopover();
 });
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('import-modal').hidden) closeImportDialog();
+});
 document.querySelectorAll('input[name="review-tool"], input[name="conversation-tool"]').forEach((input) => {
   input.addEventListener('change', syncRuntimeControls);
 });
@@ -1615,6 +1926,8 @@ window.__COMMA_REVIEW__ = {
   openArchive, closeArchive, createCheckpoint, restoreVersion, restoreDraft,
   openOverview, closeOverview, renderReviewPreflight, closeReviewPreflight,
   overviewState, loadDocumentSummary, generateDocumentSummary, acceptAllProvisionalComments,
+  importState, openImportDialog, closeImportDialog, stageImportFile, commitStagedImport,
+  evidenceState, openEvidenceDrawer, closeEvidenceDrawer, loadEvidenceSources, attachEvidenceFile,
 };
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 
@@ -1622,3 +1935,4 @@ loadRuntimeCapabilities();
 loadVersions();
 loadReviewSessions(false);
 loadConversationSessions(false);
+loadEvidenceSources();
