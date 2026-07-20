@@ -1087,12 +1087,16 @@ function selectedReviewTool() {
 
 function selectedReviewAgentIdentity() {
   return {
-    adapter_id: 'legacy',
-    adapter_version: 'legacy',
-    profile_id: 'legacy',
-    rubric_version: 'legacy',
-    output_schema_version: 'comma-review-run/v1',
+    adapter_id: 'academic-paper-review',
+    adapter_version: 'internal-gate3',
+    profile_id: 'primary',
+    rubric_version: 'sha256:3b247cac76feb8508445cb3b1eaa8d68f4bbb57a8eed74f47e4c512185352a48',
+    output_schema_version: 'academic-paper-review-result/v1',
   };
+}
+
+function isAcademicPaperReviewRun(run) {
+  return run?.adapter_id === 'academic-paper-review';
 }
 
 function setReviewRunning(running, message = '', isError = false) {
@@ -1166,6 +1170,8 @@ async function pollReviewRun(runId, mode = '') {
   if (mode === 'initial' && run.status === 'completed') {
     await refreshEditorComments();
     setReviewRunning(false, '首评完成：唯一可靠的 findings 已作为 provisional 批注写入，尚未视为已接受。');
+  } else if (run.status === 'preview' && isAcademicPaperReviewRun(run)) {
+    setReviewRunning(false, 'Academic Paper Review 已生成预览；勾选后可加入主评审。');
   } else if (run.status === 'preview') {
     setReviewRunning(false, '复审完成：操作停在 preview，批注未发生写入。');
   } else if (run.status === 'needs_rebase') {
@@ -1463,7 +1469,7 @@ function updateOperationSelectionControls() {
   }
   acceptAll.hidden = run.status !== 'preview';
   confirm.hidden = run.status !== 'preview';
-  confirm.textContent = '确认写回已选操作';
+  confirm.textContent = isAcademicPaperReviewRun(run) ? '加入主评审已选项' : '确认写回已选操作';
   syncRuntimeControls();
 }
 
@@ -1688,6 +1694,8 @@ async function runReview(mode) {
     pollReviewRun(json.run.id, mode);
   } else if (mode === 'initial' && json.writeback?.ok) {
     setReviewRunning(false, '首评完成：唯一可靠的 findings 已作为 provisional 批注写入，尚未视为已接受。');
+  } else if (json.run?.status === 'preview' && isAcademicPaperReviewRun(json.run)) {
+    setReviewRunning(false, 'Academic Paper Review 已生成预览；勾选后可加入主评审。');
   } else if (json.run?.status === 'needs_rebase') {
     setReviewRunning(false, '模型运行期间正文或批注发生变化；操作已保留，但需要重新预检。', true);
   } else {

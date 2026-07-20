@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+from review_executor import ReviewExecutor
 import review_slice_b
 import server
 
@@ -19,10 +20,13 @@ class SliceBTests(unittest.TestCase):
     def _host(self, tmp, *, invoke_ai=None):
         review_root = os.path.join(tmp, "review-sessions")
         events = os.path.join(tmp, "events.jsonl")
+        executor = ReviewExecutor(os.path.join(tmp, "executor-traces"))
         patches = [
             mock.patch.object(server, "DATA_ROOT", tmp),
             mock.patch.object(server, "REVIEW_ROOT", review_root),
             mock.patch.object(server, "EVENTS_PATH", events),
+            mock.patch.object(server, "_REVIEW_EXECUTOR", executor),
+            mock.patch.object(server, "_ACTIVE_REVIEW_RUNS", {}),
         ]
         if invoke_ai is not None:
             patches.append(mock.patch.object(server, "_invoke_ai", side_effect=invoke_ai))
@@ -357,7 +361,8 @@ METHODS-SHOULD-NOT-BE-SENT-IN-INCREMENTAL-PROMPT.
                     "baseline_session_id": "", "comments_rev": preflight["comments"]["comments_rev"],
                     "mode": "initial", "tool": "codex", "rubric": "", "instruction": "",
                 })
-                self.assertEqual(response["run"]["status"], "completed")
+                self.assertEqual(response["run"]["status"], "completed",
+                                 response["run"].get("error"))
                 comments = self._request(base, "/api/comments?path=paper.md")["comments"]
                 self.assertEqual(len(comments), 1)
                 self.assertEqual(comments[0]["finding_state"], "provisional")

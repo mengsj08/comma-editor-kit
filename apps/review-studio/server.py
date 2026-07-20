@@ -96,6 +96,13 @@ from review_executor import (
     sha256_path as executor_sha256_path,
     sha256_text as executor_sha256_text,
 )
+from review_agents import (
+    ACADEMIC_ADAPTER_ID,
+    default_registry,
+    derive_result_markdown,
+    stable_json_hash as review_agent_stable_json_hash,
+    validate_review_agent_result,
+)
 from review_slice_b import (
     anchor_health,
     comment_snapshot,
@@ -145,6 +152,7 @@ _EVIDENCE_ID_RE = re.compile(r"^evidence-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
 _ACTIVE_REVIEW_RUNS = {}
 _REVIEW_EXECUTOR = ReviewExecutor(EXECUTOR_TRACE_ROOT)
+_REVIEW_AGENT_REGISTRY = default_registry()
 _REVIEW_AGENT_IDENTITY_FIELDS = (
     "adapter_id", "adapter_version", "profile_id", "rubric_version",
 )
@@ -5336,9 +5344,96 @@ def _review_run_input_manifest(session, run, *, prompt: str) -> dict:
     }
 
 
+def _review_input_contract(doc: str, body: str, body_rev: str,
+                           evidence_sources: list[dict]) -> dict:
+    doc_rel = _doc_rel(doc)
+    conversion_receipts = []
+    original_materials = []
+    for receipt in _matching_import_receipts(doc_rel):
+        receipt_hash = review_agent_stable_json_hash(receipt)
+        conversion_receipts.append({
+            "id": receipt.get("id") or "",
+            "schema_version": receipt.get("schema_version") or "",
+            "status": receipt.get("status") or "",
+            "sha256": receipt_hash,
+            "target_path": (receipt.get("target") or {}).get("path") or "",
+        })
+        source = receipt.get("source") or {}
+        if source:
+            original_materials.append({
+                "kind": "import_source",
+                "receipt_id": receipt.get("id") or "",
+                "filename": source.get("filename") or "",
+                "media_type": source.get("media_type") or "",
+                "sha256": source.get("sha256") or "",
+                "archive_path": source.get("archive_path") or "",
+                "conversion_receipt_sha256": receipt_hash,
+            })
+    for source in evidence_sources:
+        source_meta = source.get("source") or {}
+        original_materials.append({
+            "kind": "evidence_source",
+            "id": source.get("id") or "",
+            "filename": source_meta.get("filename") or "",
+            "media_type": source_meta.get("media_type") or "application/pdf",
+            "sha256": source_meta.get("sha256") or "",
+            "archive_path": source_meta.get("archive_path") or "",
+            "extraction_status": source.get("extraction_status") or "",
+            "full_text_confirmed": bool(source.get("full_text_confirmed")),
+        })
+    return {
+        "schema_version": "comma-review-input/v1",
+        "canonical_document": {
+            "path": doc_rel,
+            "revision": body_rev,
+            "sha256": _sha256_bytes(body.encode("utf-8")),
+            "media_type": "text/markdown",
+            "byte_count": len(body.encode("utf-8")),
+        },
+        "original_materials": original_materials,
+        "conversion_receipts": conversion_receipts,
+    }
+
+
+def _is_academic_review_agent(identity) -> bool:
+    return (identity or {}).get("adapter_id") == ACADEMIC_ADAPTER_ID
+
+
+def _resolve_review_agent_identity(identity) -> dict:
+    if not _is_academic_review_agent(identity):
+        return _review_agent_fields(identity)
+    manifest = _REVIEW_AGENT_REGISTRY.get(ACADEMIC_ADAPTER_ID).manifest
+    return _review_agent_fields({
+        "adapter_id": manifest["adapter_id"],
+        "adapter_version": manifest["adapter_version"],
+        "profile_id": manifest["profile_id"],
+        "rubric_version": manifest["rubric_version"],
+        "output_schema_version": manifest["output_schema_version"],
+    })
+
+
+def _prepare_review_agent_request(agent_identity, *, body: str, doc_path: str,
+                                  body_rev: str, instruction: str,
+                                  evidence_sources: list[dict]):
+    if not _is_academic_review_agent(agent_identity):
+        return None
+    adapter = _REVIEW_AGENT_REGISTRY.get(ACADEMIC_ADAPTER_ID)
+    return adapter.prepare_review_request(
+        document_body=body,
+        document_path=doc_path,
+        document_rev=body_rev,
+        instruction=instruction,
+        review_input=_review_input_contract(
+            _safe_doc_path(doc_path), body, body_rev, evidence_sources),
+        evidence_sources=evidence_sources,
+    )
+
+
 def _review_run_receipt_metadata(session, run, *, tool: str, prompt: str,
                                  mode: str, queued_at: str) -> dict:
     agent = _review_agent_fields(session)
+    manifest = session.get("adapter_manifest") if isinstance(session.get("adapter_manifest"), dict) else {}
+    rubric_source = manifest.get("rubric_source") if isinstance(manifest.get("rubric_source"), dict) else {}
     return {
         "run_id": run.get("id") or "",
         "trace_root": os.path.join(_executor_trace_root(), run.get("id") or _new_id("run-trace-", 8)),
@@ -5355,10 +5450,10 @@ def _review_run_receipt_metadata(session, run, *, tool: str, prompt: str,
             "rubric_version": agent["rubric_version"],
         },
         "skill": {
-            "id": "comma-review-studio-structured-review",
-            "version": "comma-review-run/v1",
-            "path": os.path.abspath(__file__),
-            "sha256": executor_sha256_path(__file__),
+            "id": manifest.get("adapter_id") or "comma-review-studio-structured-review",
+            "version": manifest.get("adapter_version") or "comma-review-run/v1",
+            "path": rubric_source.get("path") or os.path.abspath(__file__),
+            "sha256": rubric_source.get("sha256") or executor_sha256_path(__file__),
             "mode": mode,
         },
         "provider": {"tool": tool, "transport": f"{tool}_cli"},
@@ -5400,7 +5495,36 @@ def _complete_review_run(session, run, result):
     parsed = _extract_json(result.get("output") or "")
     mode = run.get("mode") or "initial"
     agent_identity = _review_agent_fields(session)
-    if mode == "initial":
+    is_review_agent = _is_academic_review_agent(session)
+    if is_review_agent:
+        agent_result = validate_review_agent_result(parsed)
+        raw_findings = agent_result["findings"]
+        findings = _normalize_findings(raw_findings)
+        if raw_findings and not findings:
+            raise ValueError("AI findings failed schema/content validation")
+        session["findings"] = _reanchor_findings(
+            findings, body, body_rev, session.get("doc_path") or "", agent_identity)
+        run["operations"] = _initial_run_operations(session["findings"], agent_identity)
+        session["summary"] = agent_result["summary"]
+        result_markdown = derive_result_markdown(agent_result)
+        derived_artifact = {
+            "kind": "result.md",
+            "media_type": "text/markdown",
+            "sha256": executor_sha256_text(result_markdown),
+            "content": result_markdown,
+        }
+        run["review_agent_result"] = {
+            "schema_version": agent_result["schema_version"],
+            "summary": agent_result["summary"],
+            "recommendation": agent_result["recommendation"],
+            "confidence": agent_result["confidence"],
+            "structured_sections": agent_result["structured_sections"],
+            "metrics": agent_result["metrics"],
+            "derived_artifacts": [*agent_result["derived_artifacts"], derived_artifact],
+        }
+        run["derived_artifacts"] = run["review_agent_result"]["derived_artifacts"]
+        assistant_text = _clean_text(agent_result["summary"], 6000)
+    elif mode == "initial":
         raw_findings = parsed.get("findings") or parsed.get("comments") or []
         findings = _normalize_findings(raw_findings)
         if raw_findings and not findings:
@@ -5415,8 +5539,9 @@ def _complete_review_run(session, run, result):
             operation["proposed_comment"] for operation in run["operations"]
             if isinstance(operation.get("proposed_comment"), dict)
         ]
-    session["summary"] = _clean_text(parsed.get("summary"), 4000)
-    assistant_text = _clean_text(parsed.get("assistant_text") or session["summary"], 6000)
+    if not is_review_agent:
+        session["summary"] = _clean_text(parsed.get("summary"), 4000)
+        assistant_text = _clean_text(parsed.get("assistant_text") or session["summary"], 6000)
     if assistant_text:
         session["messages"].append({
             "id": _new_id("msg-", 10), "role": "assistant",
@@ -5438,7 +5563,7 @@ def _complete_review_run(session, run, result):
         run["status"] = "needs_rebase"
         session["status"] = "needs_rebase"
         session["document_rev"] = _rev(latest_body)
-    elif mode == "initial":
+    elif mode == "initial" and not is_review_agent:
         writeback = _writeback_session(session, doc)
         run["writeback_receipt_id"] = writeback.get("id") or ""
         run["status"] = "completed"
@@ -6558,7 +6683,8 @@ class Handler(BaseHTTPRequestHandler):
         doc = _safe_doc_path(payload.get("path"))
         if not os.path.exists(doc):
             raise ValueError("doc not found")
-        agent_identity = _review_agent_identity_from_payload(payload)
+        agent_identity = _resolve_review_agent_identity(
+            _review_agent_identity_from_payload(payload))
         completed = _latest_completed_session(_doc_rel(doc), agent_identity)
         if completed:
             return self._send_json({
@@ -6790,9 +6916,43 @@ class Handler(BaseHTTPRequestHandler):
                 "created_at": now,
                 "updated_at": now,
             }
+            prepared = _prepare_review_agent_request(
+                agent_identity,
+                body=locked_body,
+                doc_path=doc_rel,
+                body_rev=requested_rev,
+                instruction=instruction,
+                evidence_sources=evidence_sources,
+            )
+            if prepared:
+                run.update(_review_agent_fields({
+                    "adapter_id": prepared.adapter_id,
+                    "adapter_version": prepared.adapter_version,
+                    "profile_id": prepared.profile_id,
+                    "rubric_version": prepared.rubric_version,
+                    "output_schema_version": prepared.output_schema_version,
+                }))
+                run["input"]["review_input"] = prepared.review_input
+                run["prepared_review_request"] = {
+                    "schema_version": "comma-prepared-review-request/v1",
+                    "adapter_id": prepared.adapter_id,
+                    "adapter_version": prepared.adapter_version,
+                    "profile_id": prepared.profile_id,
+                    "rubric_version": prepared.rubric_version,
+                    "output_schema_version": prepared.output_schema_version,
+                    "input_requirements": prepared.manifest.get("reviews") or {},
+                    "rubric_source": prepared.manifest.get("rubric_source") or {},
+                    "prompt_hash": executor_sha256_text(prepared.prompt),
+                }
+                session.update(_review_agent_fields(run))
+                session["adapter_manifest"] = prepared.manifest
+                session["writeback_policy"] = prepared.manifest.get("writeback_default") or "preview"
             _save_session(session)
             _ACTIVE_REVIEW_RUNS[active_key] = run["id"]
-        if mode == "initial":
+        if prepared:
+            prompt = prepared.prompt
+            schema = prepared.output_schema
+        elif mode == "initial":
             prompt = _initial_review_prompt(
                 locked_body, doc_rel, requested_rev, rubric, instruction, evidence_context)
             schema = _INITIAL_REVIEW_SCHEMA
