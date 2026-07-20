@@ -15,6 +15,7 @@ import html
 import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -25,7 +26,7 @@ ABS_URL = f"https://arxiv.org/abs/{ARXIV_ID}"
 SOURCE_URL = f"https://arxiv.org/e-print/{ARXIV_ID}"
 PDF_URL = f"https://arxiv.org/pdf/{ARXIV_ID}"
 CONVERTER_NAME = "scripts/convert_attention_arxiv.py"
-CONVERTER_VERSION = "0.2.0"
+CONVERTER_VERSION = "0.3.0"
 MATH_GUARD_TOKENS = ["sqrt", "frac", "sum", "mathrm", "cdot"]
 
 
@@ -196,7 +197,24 @@ def convert_table(raw: str) -> tuple[str, dict]:
     return "\n".join(out), {"caption": caption, "rows": len(rows), "columns": width}
 
 
-def copy_asset(source_dir: Path, output_dir: Path, asset: str) -> str:
+def tool_version(command: str) -> str:
+    path = shutil.which(command)
+    if not path:
+        return ""
+    result = subprocess.run([path, "--version"], check=False, capture_output=True, text=True)
+    return (result.stdout or result.stderr).strip().splitlines()[0] if (result.stdout or result.stderr).strip() else command
+
+
+def rasterize_pdf_asset(src: Path, dest: Path) -> dict:
+    sips = shutil.which("sips")
+    if not sips:
+        raise RuntimeError("No PDF rasterizer available: expected macOS sips")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([sips, "-s", "format", "png", str(src), "--out", str(dest)], check=True, capture_output=True, text=True)
+    return {"tool": "sips", "version": tool_version("sips"), "format": "png"}
+
+
+def copy_asset(source_dir: Path, output_dir: Path, asset: str) -> tuple[str, dict]:
     src = source_dir / asset
     if not src.exists() and not src.suffix:
         for suffix in [".png", ".pdf", ".jpg", ".jpeg"]:
@@ -207,7 +225,16 @@ def copy_asset(source_dir: Path, output_dir: Path, asset: str) -> str:
     dest = output_dir / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
-    return rel.as_posix()
+    if src.suffix.lower() == ".pdf":
+        raster_rel = rel.with_suffix(".png")
+        raster_detail = rasterize_pdf_asset(src, output_dir / raster_rel)
+        return raster_rel.as_posix(), {
+            "copied_source_path": rel.as_posix(),
+            "copied_source_sha256": sha256(dest),
+            "rasterized_from": rel.as_posix(),
+            "rasterizer": raster_detail,
+        }
+    return rel.as_posix(), {}
 
 
 def convert_figure(raw: str, source_dir: Path, output_dir: Path) -> tuple[str, dict]:
@@ -216,8 +243,8 @@ def convert_figure(raw: str, source_dir: Path, output_dir: Path) -> tuple[str, d
     for match in re.finditer(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", raw):
         asset = match.group(1)
         try:
-            rel = copy_asset(source_dir, output_dir, asset)
-            assets.append({"source": asset, "markdown_path": rel, "sha256": sha256(output_dir / rel)})
+            rel, detail = copy_asset(source_dir, output_dir, asset)
+            assets.append({"source": asset, "markdown_path": rel, "sha256": sha256(output_dir / rel), **detail})
         except FileNotFoundError:
             assets.append({"source": asset, "missing": True})
     lines = []
@@ -387,7 +414,8 @@ def make_loss_report(manifest: dict, public: bool) -> str:
         + ", ".join(f"`\\{token}`" for token in MATH_GUARD_TOKENS)
         + ".",
         f"- Tables: transformed from LaTeX tabular to Markdown pipe tables when parseable; count={manifest['counts']['tables']}.",
-        f"- Figures: source package assets copied and referenced by relative paths; count={manifest['counts']['figures']}, assets={manifest['counts']['figure_assets']}.",
+        f"- Figures: source package assets copied and referenced by relative paths; count={manifest['counts']['figures']}, assets={manifest['counts']['figure_assets']}, rasterized_pdf_assets={manifest['counts']['figure_rasterized_assets']}.",
+        f"- PDF figure rasterizer: `{manifest['conversion']['rasterizer']['tool']}` {manifest['conversion']['rasterizer']['version'] or 'unavailable'}; Markdown references the generated PNG while the copied source PDF remains listed in the manifest.",
         f"- Footnotes: detected and listed in manifest; count={manifest['counts']['footnotes']}.",
         f"- References: bibliography keys preserved; count={manifest['counts']['references']}.",
         "",
@@ -398,7 +426,7 @@ def make_loss_report(manifest: dict, public: bool) -> str:
         "- LaTeX labels/cross-references are not resolved to final section, table, equation, or figure numbers.",
         "- Table typography from `booktabs`, `multirow`, `multicolumn`, spacing, and alignment is downgraded to Markdown table text.",
         "- Figure layout options, subfigure grouping, page placement, and original PDF pagination are not preserved.",
-        "- PDF figure assets from the source package are copied but not rasterized because no PDF image conversion tool is available in this environment.",
+        "- PDF vector figure assets are rasterized to PNG for browser display; vector editability and exact PDF-level rendering are not preserved in Markdown.",
         "- Bibliography is flattened to Markdown list entries; citation links are not resolved bidirectionally.",
         "- Author affiliation layout and title footnote markers are simplified.",
         "",
@@ -483,6 +511,12 @@ def main() -> None:
         if path.is_file():
             source_files.append({"path": path.relative_to(source_dir).as_posix(), "sha256": sha256(path)})
     figure_assets = sum(len(fig.get("assets", [])) for fig in elements["figures"])
+    rasterized_assets = sum(
+        1
+        for fig in elements["figures"]
+        for asset in fig.get("assets", [])
+        if asset.get("rasterized_from")
+    )
     manifest = {
         "arxiv_id": ARXIV_ID,
         "version": VERSION,
@@ -499,6 +533,7 @@ def main() -> None:
             "tables": len(elements["tables"]),
             "figures": len(elements["figures"]),
             "figure_assets": figure_assets,
+            "figure_rasterized_assets": rasterized_assets,
             "footnotes": len(elements["footnotes"]),
             "references": len(elements["references"]),
             "inline_math_spans": len(re.findall(r"(?<!\\)\$(?!\$).*?(?<!\\)\$", expanded, re.S)),
@@ -520,6 +555,7 @@ def main() -> None:
                 "version": CONVERTER_VERSION,
                 "python_version": ".".join(map(str, __import__("sys").version_info[:3])),
             },
+            "rasterizer": {"tool": "sips", "version": tool_version("sips"), "fallback": "pdftoppm not used"},
             "strategy": "recursive TeX input expansion with partial LaTeX-to-Markdown transforms; official PDF retained for audit.",
         },
     }

@@ -22,13 +22,19 @@
     "converter": {
       "name": "scripts/convert_attention_arxiv.py",
       "python_version": "3.13.12",
-      "version": "0.2.0"
+      "version": "0.3.0"
+    },
+    "rasterizer": {
+      "fallback": "pdftoppm not used",
+      "tool": "sips",
+      "version": "sips-316"
     },
     "strategy": "recursive TeX input expansion with partial LaTeX-to-Markdown transforms; official PDF retained for audit."
   },
   "counts": {
     "equations": 3,
     "figure_assets": 8,
+    "figure_rasterized_assets": 5,
     "figures": 5,
     "footnotes": 5,
     "heading_levels": [
