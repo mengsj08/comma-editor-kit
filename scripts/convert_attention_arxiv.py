@@ -25,7 +25,8 @@ ABS_URL = f"https://arxiv.org/abs/{ARXIV_ID}"
 SOURCE_URL = f"https://arxiv.org/e-print/{ARXIV_ID}"
 PDF_URL = f"https://arxiv.org/pdf/{ARXIV_ID}"
 CONVERTER_NAME = "scripts/convert_attention_arxiv.py"
-CONVERTER_VERSION = "0.1.0"
+CONVERTER_VERSION = "0.2.0"
+MATH_GUARD_TOKENS = ["sqrt", "frac", "sum", "mathrm", "cdot"]
 
 
 def sha256(path: Path) -> str:
@@ -87,7 +88,27 @@ def expand_inputs(source_dir: Path, filename: str, seen: set[str] | None = None)
     return "".join(chunks), segments
 
 
+def protect_inline_math(text: str) -> tuple[str, dict[str, str]]:
+    protected: dict[str, str] = {}
+
+    def repl(match: re.Match) -> str:
+        token = f"@@MATH_{len(protected)}@@"
+        protected[token] = match.group(0)
+        return token
+
+    # Protect single-dollar math before running any prose-oriented macro cleanup.
+    # Display math is handled separately by convert_equation().
+    return re.sub(r"(?<!\\)\$(?!\$).*?(?<!\\)\$", repl, text, flags=re.S), protected
+
+
+def restore_inline_math(text: str, protected: dict[str, str]) -> str:
+    for token, math in protected.items():
+        text = text.replace(token, math)
+    return text
+
+
 def clean_inline(text: str) -> str:
+    text, protected_math = protect_inline_math(text)
     replacements = {
         r"\dmodel": r"d_{\text{model}}",
         r"\dff": r"d_{\text{ff}}",
@@ -113,7 +134,7 @@ def clean_inline(text: str) -> str:
     text = re.sub(r"\\label\{[^{}]*\}", "", text)
     text = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?\{([^{}]*)\}", r"\1", text)
     text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+    return restore_inline_math(text, protected_math).strip()
 
 
 def extract_envs(text: str, env_names: list[str]) -> tuple[str, list[dict]]:
@@ -151,9 +172,8 @@ def convert_table(raw: str) -> tuple[str, dict]:
     if tabular:
         body = tabular.group(1)
         body = re.sub(r"\\(toprule|midrule|bottomrule|hline)", "", body)
-        body = body.replace("\\\\", "\n")
-        for line in body.splitlines():
-            line = line.strip()
+        for line in re.split(r"\\\\", body):
+            line = re.sub(r"\s+", " ", line).strip()
             if not line:
                 continue
             line = re.sub(r"\\multicolumn\{[^{}]+\}\{[^{}]+\}\{([^{}]*)\}", r"\1", line)
@@ -215,6 +235,28 @@ def convert_equation(raw: str) -> tuple[str, dict]:
     body = re.sub(r"^\\begin\{[^}]+\}", "", raw.strip())
     body = re.sub(r"\\end\{[^}]+\}$", "", body.strip())
     return "$$\n" + body.strip() + "\n$$", {"sample": body.strip()[:160]}
+
+
+def math_token_counts(text: str) -> dict[str, int]:
+    return {token: len(re.findall(rf"\\{token}(?![A-Za-z])", text)) for token in MATH_GUARD_TOKENS}
+
+
+def build_math_guard(expanded_tex: str, markdown: str) -> dict:
+    tex_counts = math_token_counts(expanded_tex)
+    md_counts = math_token_counts(markdown)
+    deltas = {token: md_counts[token] - tex_counts[token] for token in MATH_GUARD_TOKENS}
+    failures = [
+        {"token": token, "tex": tex_counts[token], "markdown": md_counts[token], "delta": deltas[token]}
+        for token in MATH_GUARD_TOKENS
+        if deltas[token] != 0
+    ]
+    guard = {"tokens": MATH_GUARD_TOKENS, "tex_counts": tex_counts, "markdown_counts": md_counts, "deltas": deltas, "failures": failures}
+    if failures:
+        table = "\n".join(
+            f"{item['token']}: tex={item['tex']} markdown={item['markdown']} delta={item['delta']}" for item in failures
+        )
+        raise RuntimeError(f"math token guard failed:\n{table}")
+    return guard
 
 
 def convert_bibliography(raw: str) -> tuple[str, list[dict]]:
@@ -340,7 +382,10 @@ def make_loss_report(manifest: dict, public: bool) -> str:
         "## Element Status",
         "",
         f"- Sections: preserved as Markdown headings; count={manifest['counts']['sections']}.",
-        f"- Equations: transformed to Markdown display math with TeX bodies retained; count={manifest['counts']['equations']}.",
+        f"- Equations: transformed to Markdown display math with raw TeX bodies retained; count={manifest['counts']['equations']}.",
+        "- Inline math: single-dollar spans are protected before prose cleanup; guard verified zero token-count delta for "
+        + ", ".join(f"`\\{token}`" for token in MATH_GUARD_TOKENS)
+        + ".",
         f"- Tables: transformed from LaTeX tabular to Markdown pipe tables when parseable; count={manifest['counts']['tables']}.",
         f"- Figures: source package assets copied and referenced by relative paths; count={manifest['counts']['figures']}, assets={manifest['counts']['figure_assets']}.",
         f"- Footnotes: detected and listed in manifest; count={manifest['counts']['footnotes']}.",
@@ -349,6 +394,7 @@ def make_loss_report(manifest: dict, public: bool) -> str:
         "## Known Losses And Downgrades",
         "",
         "- TeX macro expansion is partial; unknown macros are preserved or simplified and require manual check.",
+        "- The math-token guard checks command counts, not semantic equivalence of rendered mathematics.",
         "- LaTeX labels/cross-references are not resolved to final section, table, equation, or figure numbers.",
         "- Table typography from `booktabs`, `multirow`, `multicolumn`, spacing, and alignment is downgraded to Markdown table text.",
         "- Figure layout options, subfigure grouping, page placement, and original PDF pagination are not preserved.",
@@ -387,6 +433,7 @@ def redacted_manifest(manifest: dict) -> dict:
         "input_hashes_sha256": manifest["input_hashes_sha256"],
         "source_package_files": manifest["source_package_files"],
         "counts": manifest["counts"],
+        "math_token_guard": manifest["math_token_guard"],
         "conversion": manifest["conversion"],
         "private_outputs": manifest["private_outputs"],
         "redaction_note": "No manuscript body, long captions, images, PDF, or source package content is committed.",
@@ -409,6 +456,7 @@ def main() -> None:
     expanded, segments = expand_inputs(source_dir, "ms.tex")
     (output_dir / "expanded-ms.tex").write_text(expanded, encoding="utf-8")
     md, elements = convert_body(expanded, source_dir, output_dir)
+    math_guard = build_math_guard(expanded, md)
     source_md = output_dir / "attention-is-all-you-need-source.md"
     source_md.write_text(md, encoding="utf-8")
     stress_md = output_dir / "attention-is-all-you-need-renderer-stress.md"
@@ -456,6 +504,7 @@ def main() -> None:
             "inline_math_spans": len(re.findall(r"(?<!\\)\$(?!\$).*?(?<!\\)\$", expanded, re.S)),
             "inline_citation_commands": len(re.findall(r"\\cite[tp]?\{", expanded)),
         },
+        "math_token_guard": math_guard,
         "abs_metadata": abs_metadata,
         "elements": elements,
         "expanded_source_segments": segments,

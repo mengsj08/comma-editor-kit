@@ -22,7 +22,7 @@
     "converter": {
       "name": "scripts/convert_attention_arxiv.py",
       "python_version": "3.13.12",
-      "version": "0.1.0"
+      "version": "0.2.0"
     },
     "strategy": "recursive TeX input expansion with partial LaTeX-to-Markdown transforms; official PDF retained for audit."
   },
@@ -47,6 +47,37 @@
     "abs_html": "3ae4cd73c30cd6ffb79ccda0f7b3e2c3be36c2ebbe8af42b096ba6a64bef6e84",
     "pdf": "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
     "source_tar": "2e7a7d9ee2520d22eb23dae0cb148e167be02a30d6cb3f11b1c67723194339c6"
+  },
+  "math_token_guard": {
+    "deltas": {
+      "cdot": 0,
+      "frac": 0,
+      "mathrm": 0,
+      "sqrt": 0,
+      "sum": 0
+    },
+    "failures": [],
+    "markdown_counts": {
+      "cdot": 27,
+      "frac": 3,
+      "mathrm": 12,
+      "sqrt": 5,
+      "sum": 1
+    },
+    "tex_counts": {
+      "cdot": 27,
+      "frac": 3,
+      "mathrm": 12,
+      "sqrt": 5,
+      "sum": 1
+    },
+    "tokens": [
+      "sqrt",
+      "frac",
+      "sum",
+      "mathrm",
+      "cdot"
+    ]
   },
   "private_outputs": {
     "assets_dir": "apps/review-studio/data/arxiv-1706.03762v7/converted/assets",
