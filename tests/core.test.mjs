@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { marked } from 'marked';
 import {
@@ -9,6 +10,7 @@ import {
 } from '../src/core/anchors.js';
 import { replaceBlock, segmentMarkdown } from '../src/core/blocks.js';
 import { previewCommentBatch } from '../src/core/comment-batch.js';
+import { buildSectionIndex, sectionForBlock } from '../src/core/section-index.js';
 import { revisionOf } from '../src/core/revision.js';
 import {
   isCommentVisible,
@@ -50,6 +52,32 @@ test('block segmentation reconstructs source byte-for-byte', () => {
   const target = blocks.find((block) => block.type === 'paragraph');
   const changed = replaceBlock(source, target, target.raw.replace('Paragraph', 'Edited paragraph'));
   assert.equal(changed, source.slice(0, target.start) + target.raw.replace('Paragraph', 'Edited paragraph') + source.slice(target.end));
+});
+
+test('section index derives deterministic heading ranges without semantic guessing', () => {
+  const source = '# Abstract\n\nIntro.\n\n## Method\n\nA.\n\nA repeated phrase.\n\n## Method\n\nB.\n';
+  const blocks = segmentMarkdown(marked.lexer, source);
+  const sections = buildSectionIndex(blocks);
+  assert.deepEqual(sections.map((section) => section.id), ['sec-abstract', 'sec-method', 'sec-method-2']);
+  assert.deepEqual(sections.map((section) => [section.startBlockIndex, section.endBlockIndex]), [[0, 1], [2, 4], [5, 6]]);
+  assert.equal(sectionForBlock(sections, 3).id, 'sec-method');
+  assert.equal(sectionForBlock(sections, 6).id, 'sec-method-2');
+});
+
+test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contract', () => {
+  const componentCss = readFileSync(new URL('../src/element/comma-editor.css', import.meta.url), 'utf8');
+  const hostCss = readFileSync(new URL('../apps/review-studio/static/editor.css', import.meta.url), 'utf8');
+  assert.match(componentCss, /@media \(min-width: 1600px\)/);
+  assert.match(componentCss, /grid-template-columns:\s*clamp\(180px,\s*11vw,\s*240px\)\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
+  assert.match(componentCss, /@media \(min-width: 1100px\) and \(max-width: 1599px\)/);
+  assert.match(componentCss, /@media \(min-width: 821px\) and \(max-width: 1099px\)/);
+  assert.match(componentCss, /@media \(max-width: 820px\)/);
+  assert.match(componentCss, /\.ce-outline-item/);
+  assert.match(componentCss, /\.ce-block\.ce-breakout[\s\S]*width:\s*min\(1300px,\s*100cqi\)/);
+  assert.match(componentCss, /\.ce-table-scroll[\s\S]*overflow-x:\s*auto/);
+  assert.match(componentCss, /\.ce-code-copy/);
+  assert.match(hostCss, /overflow-x:\s*clip/);
+  assert.match(hostCss, /width:\s*min\(1792px,\s*calc\(100% - 64px\)\)/);
 });
 
 test('anchors resolve unique, contextual, ambiguous, and missing quotes', () => {

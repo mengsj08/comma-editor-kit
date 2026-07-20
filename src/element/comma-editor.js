@@ -5,6 +5,7 @@ import { createSourceLocator, normalizeQuoteText, resolveQuote } from '../core/a
 import { normalizeSavePolicy, resolveAdapterCapabilities } from '../core/adapter-contract.js';
 import { replaceBlock, segmentMarkdown } from '../core/blocks.js';
 import { previewCommentBatch as buildCommentBatchPreview } from '../core/comment-batch.js';
+import { buildSectionIndex, sectionForBlock } from '../core/section-index.js';
 import {
   isCommentVisible,
   normalizeComment,
@@ -120,6 +121,11 @@ export class CommaEditorElement extends HTMLElement {
     this._commentBatchPreview = null;
     this._loading = false;
     this._connected = false;
+    this._sectionIndex = [];
+    this._activeSectionId = '';
+    this._outlineOpen = false;
+    this._commentsOpen = false;
+    this._syncActiveSectionBound = () => this._syncActiveSection();
   }
 
   connectedCallback() {
@@ -127,7 +133,15 @@ export class CommaEditorElement extends HTMLElement {
     this._connected = true;
     this._renderShell();
     this._bind();
+    window.addEventListener('scroll', this._syncActiveSectionBound, { passive: true });
+    window.addEventListener('resize', this._syncActiveSectionBound, { passive: true });
     if (this._adapter) this.load();
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener('scroll', this._syncActiveSectionBound);
+    window.removeEventListener('resize', this._syncActiveSectionBound);
+    this._connected = false;
   }
 
   attributeChangedCallback() {
@@ -241,9 +255,16 @@ export class CommaEditorElement extends HTMLElement {
 
   toggleComments(force) {
     if (!this._capabilities.comments.list) return false;
-    const sidebar = this._el('sidebar');
-    sidebar.hidden = typeof force === 'boolean' ? !force : !sidebar.hidden;
-    return !sidebar.hidden;
+    this._commentsOpen = typeof force === 'boolean' ? force : !this._commentsOpen;
+    this._el('shell').classList.toggle('comments-open', this._commentsOpen);
+    this._el('sidebar').hidden = false;
+    return this._commentsOpen;
+  }
+
+  toggleOutline(force) {
+    this._outlineOpen = typeof force === 'boolean' ? force : !this._outlineOpen;
+    this._el('shell').classList.toggle('outline-open', this._outlineOpen);
+    return this._outlineOpen;
   }
 
   jumpToComment(id) {
@@ -422,7 +443,7 @@ export class CommaEditorElement extends HTMLElement {
   _renderShell() {
     this.shadowRoot.innerHTML = `
       <style>${katexCss}\n${highlightCss}\n${componentCss}</style>
-      <section class="ce-shell" aria-label="Comma Markdown editor">
+      <section class="ce-shell" data-el="shell" aria-label="Comma Markdown editor">
         <header class="ce-header">
           <div class="ce-identity">
             <div class="ce-kicker">Comma Editor</div>
@@ -430,6 +451,7 @@ export class CommaEditorElement extends HTMLElement {
             <div class="ce-meta" data-el="meta">No document loaded</div>
           </div>
           <div class="ce-actions">
+            <button class="ce-button ce-outline-toggle" type="button" data-action="toggle-outline" data-el="outline-toggle">目录</button>
             <span class="ce-toolbar-primary" data-el="toolbar-primary"></span>
             <button class="ce-button primary" type="button" data-action="explicit-save" data-el="explicit-save" hidden>Save</button>
             <details class="ce-toolbar-overflow" data-el="toolbar-overflow" hidden>
@@ -439,6 +461,7 @@ export class CommaEditorElement extends HTMLElement {
           </div>
         </header>
         <div class="ce-grid">
+          <aside class="ce-outline" data-el="outline" aria-label="Document outline"></aside>
           <main class="ce-document">
             <div class="ce-preview" data-el="preview"></div>
             <div class="ce-source-pane" data-el="source-pane" hidden>
@@ -536,6 +559,8 @@ export class CommaEditorElement extends HTMLElement {
     if (action) {
       if (action !== 'toggle-review-item') event.preventDefault();
       if (action === 'toolbar-action') this._runToolbarAction(event.target.closest('[data-toolbar-action]')?.dataset.toolbarAction);
+      if (action === 'toggle-outline') this.toggleOutline();
+      if (action === 'outline-jump') this._jumpToSection(event.target.closest('[data-section-id]')?.dataset.sectionId);
       if (action === 'comment-action') this._runCommentAction(
         event.target.closest('[data-comment-action]')?.dataset.commentAction,
         event.target.closest('[data-comment-id]')?.dataset.commentId,
@@ -560,6 +585,7 @@ export class CommaEditorElement extends HTMLElement {
       if (action === 'close-review') this._closeReviewQueue();
       if (action === 'toggle-review-item') this._toggleReviewItem(event.target.dataset.proposalId, event.target.checked);
       if (action === 'apply-review') await this._applyCommentBatch();
+      if (action === 'copy-code') await this._copyCode(event.target.closest('pre'));
       if (action === 'close-lightbox') this._closeImageLightbox();
       return;
     }
@@ -584,6 +610,8 @@ export class CommaEditorElement extends HTMLElement {
     this._el('preview').hidden = false;
     this._renderPreview();
     this._renderComments();
+    this._renderOutline();
+    queueMicrotask(() => this._syncActiveSection());
   }
 
   _renderMeta() {
@@ -599,6 +627,8 @@ export class CommaEditorElement extends HTMLElement {
     this._el('explicit-save').hidden = this.savePolicy !== 'explicit' || !writable;
     this._el('explicit-save').disabled = !this._dirty;
     this._el('sidebar').hidden = !this._capabilities.comments.list;
+    this._el('shell').classList.toggle('comments-open', this._commentsOpen);
+    this._el('shell').classList.toggle('outline-open', this._outlineOpen);
     this._renderToolbarActions();
   }
 
@@ -607,6 +637,8 @@ export class CommaEditorElement extends HTMLElement {
     preview.replaceChildren();
     this._activeBlock = null;
     this._blocks = segmentMarkdown((source) => this._renderer.lexer(source), this._document.body);
+    this._sectionIndex = buildSectionIndex(this._blocks);
+    this._activeSectionId = this._sectionIndex[0]?.id || '';
     if (!this._blocks.length) {
       preview.innerHTML = '<div class="ce-empty"><p>This document is empty.</p><p>Open Source mode to begin writing.</p></div>';
       return;
@@ -622,6 +654,8 @@ export class CommaEditorElement extends HTMLElement {
       wrapper.className = 'ce-block';
       wrapper.dataset.blockIndex = String(block.index);
       wrapper.dataset.blockType = block.type;
+      const section = sectionForBlock(this._sectionIndex, block.index);
+      if (section?.id) wrapper.dataset.sectionId = section.id;
       wrapper.innerHTML = this._renderer.render(block.raw, { resolveAsset });
       if (writable) {
         const editButton = document.createElement('button');
@@ -647,6 +681,7 @@ export class CommaEditorElement extends HTMLElement {
       scroller.className = 'ce-table-scroll';
       table.replaceWith(scroller);
       scroller.appendChild(table);
+      table.closest('.ce-block')?.classList.add('ce-breakout', 'ce-breakout-table');
     });
 
     const images = Array.from(preview.querySelectorAll('img'));
@@ -654,6 +689,7 @@ export class CommaEditorElement extends HTMLElement {
       image.dataset.originalSrc = image.dataset.originalSrc || image.getAttribute('src') || '';
       image.dataset.assetState = 'loading';
       this._promoteImageFigure(image);
+      image.closest('.ce-block')?.classList.add('ce-breakout', 'ce-breakout-figure');
       if (image.complete) {
         if (image.naturalWidth > 0) image.dataset.assetState = 'ready';
         else this._replaceImageWithFallback(image);
@@ -661,6 +697,33 @@ export class CommaEditorElement extends HTMLElement {
         image.addEventListener('load', () => { image.dataset.assetState = 'ready'; }, { once: true });
       }
     }
+
+    preview.querySelectorAll('.ce-math-block').forEach((math) => {
+      math.closest('.ce-block')?.classList.add('ce-breakout', 'ce-breakout-math');
+    });
+    preview.querySelectorAll('pre').forEach((pre) => {
+      const language = this._codeLanguage(pre);
+      pre.classList.add('ce-code-frame');
+      pre.closest('.ce-block')?.classList.add('ce-breakout', 'ce-breakout-code');
+      if (pre.querySelector(':scope > .ce-code-copy')) return;
+      if (language) pre.dataset.language = language;
+      const label = document.createElement('span');
+      label.className = 'ce-code-language';
+      label.textContent = language || 'code';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'ce-code-copy';
+      button.dataset.action = 'copy-code';
+      button.textContent = 'Copy';
+      pre.prepend(label, button);
+    });
+  }
+
+  _codeLanguage(pre) {
+    const code = pre.querySelector('code');
+    const classes = String(code?.className || pre.className || '');
+    const match = /(?:^|\s)language-([A-Za-z0-9_+-]+)/.exec(classes);
+    return String(pre.dataset.language || match?.[1] || '').trim();
   }
 
   _promoteImageFigure(image) {
@@ -1048,6 +1111,7 @@ export class CommaEditorElement extends HTMLElement {
     this._renderToolbarActions();
     if (!visibleComments.length) {
       root.innerHTML = '<div class="ce-comment-empty">Select a sentence to leave a margin note. The note keeps a quote snapshot if the source later moves.</div>';
+      this._renderOutline();
       return;
     }
     root.innerHTML = visibleComments.map((comment) => {
@@ -1070,6 +1134,91 @@ export class CommaEditorElement extends HTMLElement {
         ${this._renderCommentDetails(comment)}
       </article>`;
     }).join('');
+    this._renderOutline();
+  }
+
+  _sectionFindingCounts() {
+    const counts = new Map();
+    const visibleComments = this._comments.filter((comment) => isCommentVisible(comment, {
+      showWithdrawn: this._showWithdrawnComments,
+    }));
+    for (const comment of visibleComments) {
+      let section = null;
+      if (comment.kind !== 'overall') {
+        const resolution = this._resolveComment(comment);
+        if (Number.isInteger(resolution.blockIndex) && resolution.blockIndex >= 0) {
+          section = sectionForBlock(this._sectionIndex, resolution.blockIndex);
+        }
+      }
+      if (!section && comment.section) {
+        section = this._sectionIndex.find((candidate) => candidate.title === comment.section);
+      }
+      if (!section) continue;
+      counts.set(section.id, (counts.get(section.id) || 0) + 1);
+    }
+    return counts;
+  }
+
+  _renderOutline() {
+    if (!this._connected) return;
+    const root = this._el('outline');
+    if (!root) return;
+    const counts = this._sectionFindingCounts();
+    const active = this._activeSectionId || this._sectionIndex[0]?.id || '';
+    root.innerHTML = `<div class="ce-outline-head">
+        <strong>Sections</strong>
+        <button class="ce-outline-close" type="button" data-action="toggle-outline" aria-label="Close document outline">×</button>
+      </div>
+      <nav class="ce-outline-list">${this._sectionIndex.map((section) => {
+        const count = counts.get(section.id) || 0;
+        const level = Math.min(Math.max(section.level || 1, 1), 6);
+        return `<button type="button" data-action="outline-jump" data-section-id="${escapeHtml(section.id)}" data-level="${level}" class="ce-outline-item ce-outline-level-${level} ${section.id === active ? 'active' : ''}">
+          <span class="ce-outline-title">${escapeHtml(section.title)}</span>
+          ${count ? `<b class="ce-outline-count">${count}</b>` : ''}
+        </button>`;
+      }).join('')}</nav>`;
+    this._el('outline-toggle').textContent = `目录${this._sectionIndex.length ? ` ${this._sectionIndex.length}` : ''}`;
+  }
+
+  _jumpToSection(sectionId) {
+    const section = this._sectionIndex.find((item) => item.id === sectionId);
+    if (!section) return false;
+    const block = this._el('preview').querySelector(`[data-block-index="${section.blockIndex}"]`);
+    if (!block) return false;
+    this._activeSectionId = section.id;
+    this._outlineOpen = false;
+    this._el('shell').classList.remove('outline-open');
+    block.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    this._renderOutline();
+    return true;
+  }
+
+  _syncActiveSection() {
+    if (!this._connected || !this._sectionIndex.length) return;
+    const blocks = Array.from(this._el('preview').querySelectorAll('.ce-block[data-section-id]'));
+    if (!blocks.length) return;
+    const threshold = 118;
+    let current = blocks[0];
+    for (const block of blocks) {
+      if (block.getBoundingClientRect().top <= threshold) current = block;
+      else break;
+    }
+    const sectionId = current.dataset.sectionId || '';
+    if (sectionId && sectionId !== this._activeSectionId) {
+      this._activeSectionId = sectionId;
+      this._renderOutline();
+    }
+  }
+
+  async _copyCode(pre) {
+    const code = pre?.querySelector('code')?.textContent || '';
+    if (!code) return;
+    try {
+      await navigator.clipboard?.writeText(code);
+      this._setStatus('saved', 'Code copied');
+    } catch {
+      this._setStatus('error', 'Code copy unavailable');
+    }
   }
 
   _renderCommentMenu(comment, reply = null) {
