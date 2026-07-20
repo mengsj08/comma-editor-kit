@@ -69,6 +69,7 @@ Data model:
 """
 import hashlib
 import html
+import inspect
 import io
 import json
 import difflib
@@ -88,6 +89,13 @@ import zipfile
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from review_executor import (
+    ACTIVE_STATES as EXECUTOR_ACTIVE_STATES,
+    ReviewExecutor,
+    invoke_provider,
+    sha256_path as executor_sha256_path,
+    sha256_text as executor_sha256_text,
+)
 from review_slice_b import (
     anchor_health,
     comment_snapshot,
@@ -106,6 +114,7 @@ KIT_DIST_ROOT = os.path.realpath(os.path.join(ROOT, "..", "..", "dist"))
 EVENTS_PATH = os.path.join(DATA_ROOT, "edits.events.jsonl")
 REVIEW_ROOT = os.path.join(DATA_ROOT, "review-sessions")
 CONVERSATION_ROOT = os.path.join(DATA_ROOT, "conversations")
+EXECUTOR_TRACE_ROOT = os.path.join(DATA_ROOT, ".comma-review", "executor-traces")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("COMMA_REVIEW_PORT", os.environ.get("SPIKE_PORT", "8891")))
 
@@ -135,6 +144,7 @@ _IMPORT_ID_RE = re.compile(r"^import-[a-f0-9]{16}$")
 _EVIDENCE_ID_RE = re.compile(r"^evidence-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
 _ACTIVE_REVIEW_RUNS = {}
+_REVIEW_EXECUTOR = ReviewExecutor(EXECUTOR_TRACE_ROOT)
 _REVIEW_AGENT_IDENTITY_FIELDS = (
     "adapter_id", "adapter_version", "profile_id", "rubric_version",
 )
@@ -2736,15 +2746,27 @@ def _fail_stale_running_reviews():
             changed = False
             candidates = [session.get("run"), *(session.get("runs") or [])]
             for run in candidates:
-                if not isinstance(run, dict) or run.get("status") != "running":
+                if not isinstance(run, dict) or run.get("status") not in EXECUTOR_ACTIVE_STATES:
                     continue
+                previous_status = run.get("status")
                 run["status"] = "failed"
                 run["error"] = "host restarted while model invocation was running"
                 run["failed_at"] = _now()
                 run["updated_at"] = run["failed_at"]
+                run["model_receipt"] = {
+                    **(run.get("model_receipt") or {}),
+                    "schema_version": "comma-review-run-receipt/v1",
+                    "status": "failed",
+                    "run_id": run.get("id") or "",
+                    "recovery": {
+                        "recovered": True,
+                        "reason": f"host_restart_from_{previous_status}",
+                    },
+                    "error": run["error"],
+                }
                 report["runs_failed"] += 1
                 changed = True
-            if session.get("status") == "running":
+            if session.get("status") in EXECUTOR_ACTIVE_STATES:
                 session["status"] = "failed"
                 session["error"] = "host restarted while model invocation was running"
                 report["sessions_failed"] += 1
@@ -2789,7 +2811,7 @@ def _inflight_review_run(doc_rel: str, base_rev: str, comments_rev: str, mode: s
         _ACTIVE_REVIEW_RUNS.pop(key, None)
         return None, None
     inputs = run.get("input") or {}
-    if (session.get("doc_path") != doc_rel or run.get("status") != "running"
+    if (session.get("doc_path") != doc_rel or run.get("status") not in EXECUTOR_ACTIVE_STATES
             or inputs.get("document_rev") != base_rev
             or inputs.get("comments_rev") != comments_rev
             or (evidence_key and "|".join(inputs.get("evidence_source_ids") or []) != evidence_key)
@@ -5249,69 +5271,219 @@ def _apply_finding_ops(session, ops):
     session["findings"] = findings
 
 
-def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None):
+def _executor_trace_root() -> str:
+    root = os.path.join(DATA_ROOT, ".comma-review", "executor-traces")
+    _REVIEW_EXECUTOR.trace_root = root
+    return root
+
+
+def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None, metadata=None):
     if tool not in AI_TOOLS:
         raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
     binpath = _require_cli(tool)
-    last_msg_file = None
-    schema_file = None
-    if tool == "claude":
-        argv = [
-            binpath,
-            "--safe-mode",                 # no hooks/plugins/MCP for a pure review turn
-            "--no-chrome",
-            "--no-session-persistence",    # do not duplicate the document in CLI history
-            "--disable-slash-commands",
-            "--tools", "",                # the reviewer needs inference, not computer access
-            "--permission-mode", "dontAsk",
-        ]
-        if schema:
-            argv += ["--output-format", "json", "--json-schema",
-                     json.dumps(schema, ensure_ascii=False, separators=(",", ":"))]
-        argv += ["--print", prompt]
-    else:
-        fd, last_msg_file = tempfile.mkstemp(suffix=".codexmsg")
-        os.close(fd)
-        argv = [
-            binpath, "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-            "--ephemeral", "--ignore-rules", "--ignore-user-config",
-            "--color", "never", "-C", DATA_ROOT,
-            "--output-last-message", last_msg_file, prompt,
-        ]
-        if schema:
-            fd, schema_file = tempfile.mkstemp(suffix=".schema.json")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(schema, fh, ensure_ascii=False)
-            argv[-1:-1] = ["--output-schema", schema_file]
-    _assert_no_dangerous_flags(argv)
-    t0 = time.time()
+    metadata = metadata if isinstance(metadata, dict) else {}
+    trace_root = metadata.get("trace_root") or tempfile.mkdtemp(
+        prefix=f"{tool}-", dir=_executor_trace_root())
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL, env=_cli_env(binpath),
+        return invoke_provider(
+            tool,
+            prompt,
+            timeout=timeout,
+            schema=schema,
+            executable=binpath,
+            cwd=DATA_ROOT,
+            metadata={
+                "run_id": metadata.get("run_id") or "",
+                "trace_root": trace_root,
+                "queued_at": metadata.get("queued_at") or _now(),
+                "adapter": metadata.get("adapter") or {},
+                "profile": metadata.get("profile") or {},
+                "skill": metadata.get("skill") or {},
+                "provider": metadata.get("provider") or {},
+                "input_manifest": metadata.get("input_manifest") or {},
+                "prompt_template_hash": metadata.get("prompt_template_hash") or "",
+                "prompt_hash": metadata.get("prompt_hash") or executor_sha256_text(prompt),
+                "sandbox": {"mode": "read-only", "ephemeral": tool == "codex"},
+                "web_policy": {"mode": "disabled", "web_search_used": False},
+                "recovery": {"recovered": False, "reason": ""},
+            },
         )
-        elapsed_ms = round((time.time() - t0) * 1000)
-        output = proc.stdout.strip()
-        if tool == "codex" and last_msg_file and os.path.exists(last_msg_file):
-            with open(last_msg_file, encoding="utf-8") as fh:
-                clean = fh.read().strip()
-            if clean:
-                output = clean
-        if proc.returncode != 0:
-            raise CliUnavailableError(
-                f"{AI_TOOLS[tool]['label']} 执行失败（exit {proc.returncode}）；"
-                "请从右上角 CLI 状态检查登录后重试。"
-            )
-        output = output or proc.stderr.strip()
-        return {"tool": tool, "output": output, "returncode": proc.returncode,
-                "elapsed_ms": elapsed_ms}
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError(f"{tool} timed out ({timeout}s)") from exc
-    finally:
-        if last_msg_file and os.path.exists(last_msg_file):
-            os.remove(last_msg_file)
-        if schema_file and os.path.exists(schema_file):
-            os.remove(schema_file)
+    except Exception as exc:
+        if isinstance(exc, CliUnavailableError):
+            raise
+        raise ValueError(str(exc)) from exc
+
+
+def _review_prompt_template_hash(mode: str) -> str:
+    fn = _initial_review_prompt if mode == "initial" else _run_review_prompt
+    return executor_sha256_text(inspect.getsource(fn))
+
+
+def _review_run_input_manifest(session, run, *, prompt: str) -> dict:
+    inputs = run.get("input") or {}
+    return {
+        "document": {
+            "path": session.get("doc_path") or "",
+            "revision": inputs.get("document_rev") or session.get("document_rev") or "",
+        },
+        "comments": {
+            "revision": inputs.get("comments_rev") or "",
+            "changed_block_ids": list(inputs.get("changed_block_ids") or []),
+            "affected_comment_ids": list(inputs.get("affected_comment_ids") or []),
+        },
+        "evidence_source_ids": list(inputs.get("evidence_source_ids") or []),
+        "prompt_hash": executor_sha256_text(prompt),
+    }
+
+
+def _review_run_receipt_metadata(session, run, *, tool: str, prompt: str,
+                                 mode: str, queued_at: str) -> dict:
+    agent = _review_agent_fields(session)
+    return {
+        "run_id": run.get("id") or "",
+        "trace_root": os.path.join(_executor_trace_root(), run.get("id") or _new_id("run-trace-", 8)),
+        "queued_at": queued_at,
+        "adapter": {
+            "id": agent["adapter_id"],
+            "version": agent["adapter_version"],
+            "profile_id": agent["profile_id"],
+            "rubric_version": agent["rubric_version"],
+            "output_schema_version": agent["output_schema_version"],
+        },
+        "profile": {
+            "id": agent["profile_id"],
+            "rubric_version": agent["rubric_version"],
+        },
+        "skill": {
+            "id": "comma-review-studio-structured-review",
+            "version": "comma-review-run/v1",
+            "path": os.path.abspath(__file__),
+            "sha256": executor_sha256_path(__file__),
+            "mode": mode,
+        },
+        "provider": {"tool": tool, "transport": f"{tool}_cli"},
+        "input_manifest": _review_run_input_manifest(session, run, prompt=prompt),
+        "prompt_template_hash": _review_prompt_template_hash(mode),
+        "prompt_hash": executor_sha256_text(prompt),
+    }
+
+
+def _review_run_provider(run_id: str, tool: str, prompt: str, schema, metadata: dict):
+    return lambda: _invoke_ai(
+        tool,
+        prompt,
+        timeout=_review_ai_timeout_seconds(),
+        schema=schema,
+        metadata=metadata,
+    )
+
+
+def _mark_review_run_failed(session, run, message: str, receipt=None, *, status="failed"):
+    run["status"] = status
+    run["error"] = message[:500]
+    run["updated_at"] = _now()
+    if receipt:
+        run["model_receipt"] = receipt
+    session["status"] = status
+    session["error"] = message[:500]
+    _save_session(session)
+
+
+def _complete_review_run(session, run, result):
+    doc = _safe_doc_path(session.get("doc_path"))
+    body = _version_body_for_rev(doc, (run.get("input") or {}).get("document_rev") or "")
+    if body is None:
+        body = _read_doc(doc)
+    body_rev = (run.get("input") or {}).get("document_rev") or _rev(body)
+    comments_store = _load_comment_store(doc)
+    comments_for_lineage = comments_store["comments"]
+    parsed = _extract_json(result.get("output") or "")
+    mode = run.get("mode") or "initial"
+    agent_identity = _review_agent_fields(session)
+    if mode == "initial":
+        raw_findings = parsed.get("findings") or parsed.get("comments") or []
+        findings = _normalize_findings(raw_findings)
+        if raw_findings and not findings:
+            raise ValueError("AI findings failed schema/content validation")
+        session["findings"] = _reanchor_findings(findings, body, body_rev, session.get("doc_path") or "", agent_identity)
+        run["operations"] = _initial_run_operations(session["findings"], agent_identity)
+    else:
+        run["operations"] = _normalize_run_operations(
+            parsed.get("operations") or [], body, body_rev,
+            session.get("doc_path") or "", comments_for_lineage, agent_identity)
+        session["findings"] = [
+            operation["proposed_comment"] for operation in run["operations"]
+            if isinstance(operation.get("proposed_comment"), dict)
+        ]
+    session["summary"] = _clean_text(parsed.get("summary"), 4000)
+    assistant_text = _clean_text(parsed.get("assistant_text") or session["summary"], 6000)
+    if assistant_text:
+        session["messages"].append({
+            "id": _new_id("msg-", 10), "role": "assistant",
+            "content": assistant_text, "at": _now(),
+        })
+    receipt = result.get("receipt") or {}
+    run["model_receipt"] = {
+        **receipt,
+        "tool": result.get("tool") or session.get("tool") or "",
+        "elapsed_ms": result.get("elapsed_ms"),
+        "returncode": result.get("returncode"),
+    }
+    session["model_meta"] = dict(run["model_receipt"])
+    latest_body = _read_doc(doc)
+    latest_store = _load_comment_store(doc)
+    writeback = None
+    if (_rev(latest_body) != (run.get("input") or {}).get("document_rev")
+            or latest_store["comments_rev"] != (run.get("input") or {}).get("comments_rev")):
+        run["status"] = "needs_rebase"
+        session["status"] = "needs_rebase"
+        session["document_rev"] = _rev(latest_body)
+    elif mode == "initial":
+        writeback = _writeback_session(session, doc)
+        run["writeback_receipt_id"] = writeback.get("id") or ""
+        run["status"] = "completed"
+        session["status"] = "completed"
+        session["completed_at"] = _now()
+        completed_store = _load_comment_store(doc)
+        session["comments_rev"] = completed_store["comments_rev"]
+        session["comments_snapshot"] = comment_snapshot(completed_store["comments"])
+    else:
+        run["status"] = "preview"
+        session["status"] = "preview"
+    run["updated_at"] = _now()
+    _save_session(session)
+    return writeback
+
+
+def _sync_review_run_executor_result(session, run):
+    if run.get("status") not in EXECUTOR_ACTIVE_STATES:
+        return None
+    snapshot = _REVIEW_EXECUTOR.snapshot(run["id"])
+    if snapshot.get("state") in {"queued", "running", "cancelling"}:
+        run["status"] = snapshot["state"]
+        run["updated_at"] = _now()
+        session["status"] = snapshot["state"]
+        _save_session(session)
+        return None
+    result = snapshot.get("result") or {}
+    try:
+        if snapshot.get("state") == "completed":
+            writeback = _complete_review_run(session, run, result)
+            _ACTIVE_REVIEW_RUNS.pop(_review_run_active_key(
+                session.get("doc_path") or "",
+                (run.get("input") or {}).get("document_rev") or "",
+                (run.get("input") or {}).get("comments_rev") or "",
+                run.get("mode") or "",
+                "|".join((run.get("input") or {}).get("evidence_source_ids") or []),
+                session,
+            ), None)
+            return writeback
+        status = "cancelled" if snapshot.get("state") == "cancelled" else "failed"
+        receipt = (result.get("receipt") if isinstance(result, dict) else None) or {}
+        _mark_review_run_failed(session, run, snapshot.get("error") or status, receipt, status=status)
+    except Exception as exc:
+        _mark_review_run_failed(session, run, str(exc), (result.get("receipt") if isinstance(result, dict) else None))
+    return None
 
 
 def _review_ai_timeout_seconds():
@@ -5613,6 +5785,8 @@ class Handler(BaseHTTPRequestHandler):
             match = re.match(r"^/api/review-runs/(run-[a-f0-9]{12})$", route)
             if match:
                 session, run = _load_review_run(match.group(1))
+                with _MUTATION_LOCK:
+                    _sync_review_run_executor_result(session, run)
                 return self._send_json({"ok": True, "run": run, "session": session})
             if route == "/api/conversations":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
@@ -5763,6 +5937,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._start_review(payload)
             if route == "/api/review-runs" and method == "POST":
                 return self._start_review_run(payload)
+            match = re.match(r"^/api/review-runs/(run-[a-f0-9]{12})/cancel$", route)
+            if match and method == "POST":
+                return self._cancel_review_run(match.group(1), payload)
             match = re.match(r"^/api/review-runs/(run-[a-f0-9]{12})/writeback$", route)
             if match and method == "POST":
                 result = _confirm_review_run_writeback(match.group(1), payload)
@@ -6549,6 +6726,7 @@ class Handler(BaseHTTPRequestHandler):
                 doc_rel, requested_rev, requested_comments_rev, mode,
                 evidence_key, agent_identity)
             if existing_run:
+                _sync_review_run_executor_result(existing_session, existing_run)
                 return self._send_json({
                     "ok": True, "idempotent": True,
                     "run": existing_run, "session": existing_session,
@@ -6588,7 +6766,7 @@ class Handler(BaseHTTPRequestHandler):
                 "operations": [],
                 "model_receipt": {},
                 "writeback_receipt_id": "",
-                "status": "running",
+                "status": "queued",
                 "created_at": now,
                 "updated_at": now,
             }
@@ -6601,7 +6779,7 @@ class Handler(BaseHTTPRequestHandler):
                 "tool": tool,
                 "rubric": rubric,
                 "writeback_policy": "auto-ready" if mode == "initial" else "preview",
-                "status": "running",
+                "status": "queued",
                 "summary": "",
                 "findings": [],
                 "messages": [],
@@ -6614,95 +6792,57 @@ class Handler(BaseHTTPRequestHandler):
             }
             _save_session(session)
             _ACTIVE_REVIEW_RUNS[active_key] = run["id"]
-        try:
-            if mode == "initial":
-                prompt = _initial_review_prompt(
-                    locked_body, doc_rel, requested_rev, rubric, instruction, evidence_context)
-                result = _invoke_ai(
-                    tool, prompt, timeout=_review_ai_timeout_seconds(),
-                    schema=_INITIAL_REVIEW_SCHEMA,
-                )
-                parsed = _extract_json(result["output"])
-                raw_findings = parsed.get("findings") or parsed.get("comments") or []
-                findings = _normalize_findings(raw_findings)
-                if raw_findings and not findings:
-                    raise ValueError("AI findings failed schema/content validation")
-                session["findings"] = _reanchor_findings(
-                    findings, locked_body, requested_rev, doc_rel, agent_identity)
-                run["operations"] = _initial_run_operations(
-                    session["findings"], agent_identity)
-            else:
-                prompt = _run_review_prompt(
-                    mode, preflight, state, rubric, instruction, evidence_context)
-                result = _invoke_ai(
-                    tool, prompt, timeout=_review_ai_timeout_seconds(),
-                    schema=_RUN_REVIEW_SCHEMA,
-                )
-                parsed = _extract_json(result["output"])
-                run["operations"] = _normalize_run_operations(
-                    parsed.get("operations") or [], locked_body, requested_rev,
-                    doc_rel, locked_store["comments"], agent_identity,
-                )
-                session["findings"] = [
-                    operation["proposed_comment"] for operation in run["operations"]
-                    if isinstance(operation.get("proposed_comment"), dict)
-                ]
-            session["summary"] = _clean_text(parsed.get("summary"), 4000)
-            assistant_text = _clean_text(
-                parsed.get("assistant_text") or session["summary"], 6000)
-            session["messages"].append({
-                "id": _new_id("msg-", 10), "role": "assistant",
-                "content": assistant_text, "at": _now(),
-            })
-            run["model_receipt"] = {
-                "tool": result.get("tool") or tool,
-                "elapsed_ms": result.get("elapsed_ms"),
-                "returncode": result.get("returncode"),
-            }
-            session["model_meta"] = dict(run["model_receipt"])
-            writeback = None
-            with _MUTATION_LOCK:
-                latest_body = _read_doc(doc)
-                latest_store = _load_comment_store(doc)
-                if (_rev(latest_body) != run["input"]["document_rev"]
-                        or latest_store["comments_rev"] != run["input"]["comments_rev"]):
-                    run["status"] = "needs_rebase"
-                    session["status"] = "needs_rebase"
-                    session["document_rev"] = _rev(latest_body)
-                elif mode == "initial":
-                    writeback = _writeback_session(session, doc)
-                    run["writeback_receipt_id"] = writeback.get("id") or ""
-                    run["status"] = "completed"
-                    session["status"] = "completed"
-                    session["completed_at"] = _now()
-                    completed_store = _load_comment_store(doc)
-                    session["comments_rev"] = completed_store["comments_rev"]
-                    session["comments_snapshot"] = comment_snapshot(completed_store["comments"])
-                else:
-                    run["status"] = "preview"
-                    session["status"] = "preview"
-                run["updated_at"] = _now()
-                _save_session(session)
-            _append_event(
-                tool, "review-run", doc,
-                f"{run['id']}: mode={mode} operations={len(run['operations'])} status={run['status']}",
-            )
-            return self._send_json({
-                "ok": True, "idempotent": False,
-                "run": run, "session": session, "writeback": writeback,
-            })
-        except Exception as exc:
-            with _MUTATION_LOCK:
-                run["status"] = "failed"
-                run["updated_at"] = _now()
-                session["status"] = "failed"
-                session["error"] = str(exc)[:500]
-                _save_session(session)
-            raise
-        finally:
-            with _MUTATION_LOCK:
-                if _ACTIVE_REVIEW_RUNS.get(active_key) == run["id"]:
-                    _ACTIVE_REVIEW_RUNS.pop(active_key, None)
+        if mode == "initial":
+            prompt = _initial_review_prompt(
+                locked_body, doc_rel, requested_rev, rubric, instruction, evidence_context)
+            schema = _INITIAL_REVIEW_SCHEMA
+        else:
+            prompt = _run_review_prompt(
+                mode, preflight, state, rubric, instruction, evidence_context)
+            schema = _RUN_REVIEW_SCHEMA
+        metadata = _review_run_receipt_metadata(
+            session, run, tool=tool, prompt=prompt, mode=mode, queued_at=now)
+        _REVIEW_EXECUTOR.submit(
+            run["id"],
+            _review_run_provider(run["id"], tool, prompt, schema, metadata),
+            metadata,
+        )
+        snapshot = _REVIEW_EXECUTOR.wait(run["id"], timeout=0.2)
+        writeback = None
+        with _MUTATION_LOCK:
+            session, run = _load_review_run(run["id"])
+            writeback = _sync_review_run_executor_result(session, run)
+        _append_event(
+            tool, "review-run", doc,
+            f"{run['id']}: mode={mode} operations={len(run['operations'])} status={run['status']} executor={snapshot['state']}",
+        )
+        return self._send_json({
+            "ok": True, "idempotent": False,
+            "run": run, "session": session, "writeback": writeback,
+        })
+
+    def _cancel_review_run(self, run_id, payload):
+        actor = _clean_text(payload.get("actor") or "June", 120)
+        with _MUTATION_LOCK:
+            session, run = _load_review_run(run_id)
+            if run.get("status") not in EXECUTOR_ACTIVE_STATES:
+                return self._send_json({"ok": True, "run": run, "session": session})
+            run["status"] = "cancelling"
+            run["cancel_requested_at"] = _now()
+            run["cancel_requested_by"] = actor
+            session["status"] = "cancelling"
+            _save_session(session)
+        snapshot = _REVIEW_EXECUTOR.cancel(run_id)
+        with _MUTATION_LOCK:
+            session, run = _load_review_run(run_id)
+            _sync_review_run_executor_result(session, run)
+        _append_event(actor, "review-run-cancel", _safe_doc_path(session.get("doc_path")), run_id)
+        return self._send_json({
+            "ok": True,
+            "run": run,
+            "session": session,
+            "executor": {key: snapshot.get(key) for key in ("id", "state", "error")},
+        })
 
     def _continue_review(self, session_id, payload):
         message = _clean_text(payload.get("message"), 6000)

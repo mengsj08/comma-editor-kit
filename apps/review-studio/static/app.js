@@ -776,8 +776,9 @@ editor.addEventListener('comma-comment-action', async (event) => {
 });
 
 const REVIEW_STATUS = {
-  running: '评审中', ready: '操作预览', preview: '操作预览', completed: '已完成',
-  needs_attention: '部分需确认', needs_rebase: '原文已变化', failed: '运行失败',
+  queued: '排队中', running: '评审中', cancelling: '取消中',
+  ready: '操作预览', preview: '操作预览', completed: '已完成',
+  cancelled: '已取消', needs_attention: '部分需确认', needs_rebase: '原文已变化', failed: '运行失败',
 };
 
 function openReviewDrawer() {
@@ -800,6 +801,10 @@ function activateReviewSession(rawSession, rawRun = null) {
   if (!nextRun || nextRun.id !== previousRunId || nextRun.status === 'completed') {
     reviewState.acceptedOperationIds = new Set(nextRun?.accepted_operation_ids || []);
   }
+}
+
+function reviewRunActive(run) {
+  return ['queued', 'running', 'cancelling'].includes(run?.status || '');
 }
 
 function openReviewPreflight() {
@@ -1143,6 +1148,36 @@ async function loadReviewSession(id) {
   if (!json.ok) return toast(json.error || '评审记录读取失败', true);
   activateReviewSession(json.session);
   renderReviewSession();
+}
+
+async function pollReviewRun(runId, mode = '') {
+  while (reviewState.activeRun?.id === runId && reviewRunActive(reviewState.activeRun)) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { json } = await apiJson(`/api/review-runs/${encodeURIComponent(runId)}`, { cache: 'no-store' });
+    if (!json.ok) {
+      setReviewRunning(false, json.error || '评审状态读取失败', true);
+      return;
+    }
+    activateReviewSession(json.session, json.run);
+    renderReviewSession();
+  }
+  const run = reviewState.activeRun;
+  if (!run || run.id !== runId) return;
+  if (mode === 'initial' && run.status === 'completed') {
+    await refreshEditorComments();
+    setReviewRunning(false, '首评完成：唯一可靠的 findings 已作为 provisional 批注写入，尚未视为已接受。');
+  } else if (run.status === 'preview') {
+    setReviewRunning(false, '复审完成：操作停在 preview，批注未发生写入。');
+  } else if (run.status === 'needs_rebase') {
+    setReviewRunning(false, '模型运行期间正文或批注发生变化；操作已保留，但需要重新预检。', true);
+  } else if (run.status === 'cancelled') {
+    setReviewRunning(false, '评审已取消。', true);
+  } else if (run.status === 'failed') {
+    setReviewRunning(false, run.error || '评审运行失败。', true);
+  } else {
+    setReviewRunning(false, REVIEW_STATUS[run.status] || '评审状态已更新。');
+  }
+  await loadReviewSessions(false);
 }
 
 function renderReviewHistory() {
@@ -1645,8 +1680,12 @@ async function runReview(mode) {
   });
   if (!json.ok) return setReviewRunning(false, json.message || json.error || `${modeLabel}失败`, true);
   activateReviewSession(json.session, json.run);
-  if (json.run?.status === 'running') {
-    setReviewRunning(false, '相同 revision 的评审已在运行；已复用该 run，不会重复调用模型。');
+  if (reviewRunActive(json.run)) {
+    setReviewRunning(true, json.idempotent
+      ? '相同 revision 的评审已在运行；已复用该 run，不会重复调用模型。'
+      : `${tool.toUpperCase()} 已进入后台执行；完成后会自动刷新结果。`);
+    renderReviewSession();
+    pollReviewRun(json.run.id, mode);
   } else if (mode === 'initial' && json.writeback?.ok) {
     setReviewRunning(false, '首评完成：唯一可靠的 findings 已作为 provisional 批注写入，尚未视为已接受。');
   } else if (json.run?.status === 'needs_rebase') {
