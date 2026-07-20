@@ -123,6 +123,9 @@ _VERSION_ID_RE = re.compile(r"^version-[a-f0-9]{16}$")
 _DRAFT_ID_RE = re.compile(r"^draft-[a-f0-9]{16}$")
 _MUTATION_LOCK = threading.RLock()
 _ACTIVE_REVIEW_RUNS = {}
+_OBSERVABILITY_WARNING_COUNTS = {
+    "malformed_comment_event_lines": 0,
+}
 _PRIORITIES = {"P0", "P1", "P2", "P3"}
 _DECISIONS = {"accepted", "proposed", "rejected"}
 _LIFECYCLE_STATES = {"active", "withdrawn"}
@@ -217,12 +220,26 @@ def _cli_status(tool):
     }
 
 
+def observability_warning_counts():
+    with _MUTATION_LOCK:
+        return dict(_OBSERVABILITY_WARNING_COUNTS)
+
+
+def _record_observability_warning(name: str, message: str) -> int:
+    with _MUTATION_LOCK:
+        count = int(_OBSERVABILITY_WARNING_COUNTS.get(name, 0)) + 1
+        _OBSERVABILITY_WARNING_COUNTS[name] = count
+    sys.stderr.write(f"[warning] {message}; count={count}\n")
+    return count
+
+
 def runtime_capability_manifest():
     tools = [_cli_status(tool) for tool in ("codex", "claude")]
     return {
         "ok": True,
         "schema_version": "comma-review-runtime-capabilities/v1",
         "gateway": {"ok": True, "host": HOST},
+        "warning_counts": observability_warning_counts(),
         "tools": [
             {
                 **item,
@@ -1217,8 +1234,12 @@ def _append_comment_event(doc_path: str, *, comment_id: str, action: str,
             record[key] = str(value)
     path = _comment_events_path(doc_path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    with open(path, "ab", buffering=0) as fh:
+        written = fh.write(line)
+        if written != len(line):
+            raise OSError(f"incomplete comment-event append: {written}/{len(line)} bytes")
+        os.fsync(fh.fileno())
     return record
 
 
@@ -1228,10 +1249,14 @@ def _load_comment_events(doc_path: str, comment_id=""):
         return []
     rows = []
     with open(path, encoding="utf-8") as fh:
-        for line in fh:
+        for line_number, line in enumerate(fh, start=1):
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
+                _record_observability_warning(
+                    "malformed_comment_event_lines",
+                    f"malformed comment-event JSONL line {line_number} skipped",
+                )
                 continue
             if isinstance(item, dict) and (not comment_id or item.get("comment_id") == comment_id):
                 rows.append(item)

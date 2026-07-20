@@ -227,7 +227,7 @@ def main():
                 { id: 'comments', label: 'Forbidden count', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
               ];
               fixture.commentActions = [
-                { id: 'edit', label: 'Forbidden edit', appliesTo: { capability: 'update', target: 'comment' } },
+                { id: 'edit', label: 'Forbidden edit without appliesTo' },
               ];
               fixture.adapter = {
                 capabilities: {
@@ -245,6 +245,11 @@ def main():
                 toolbarActions: Array.from(root.querySelectorAll('[data-toolbar-action]')).map(button => button.dataset.toolbarAction),
                 commentCountNodes: root.querySelectorAll('[data-comment-count]').length,
                 commentActionNodes: root.querySelectorAll('[data-comment-action]').length,
+                normalizedCommentAppliesTo: fixture.commentActions[0]?.appliesTo,
+                missingCommentActionAvailable: fixture._commentActionAvailable(
+                  fixture.commentActions[0],
+                  { lifecycleState: 'active', findingState: '', kind: 'overall' },
+                ),
                 sidebarHidden: root.querySelector('[data-el=sidebar]').hidden,
               };
               fixture.remove();
@@ -293,6 +298,7 @@ def main():
                 "bulkSelected": bulk_selected,
                 "humanHighlighted": page.locator('.operation-card[data-human-edited="true"]').count(),
                 "humanBulkChecked": human_checkbox.is_checked(),
+                "keepDisclaimer": page.locator('[data-operation-group="keep"] > header h4').text_content(),
                 "blockedDisabled": page.locator('[data-operation-action="blocked"] [data-operation-accept]').is_disabled(),
                 "blockedReason": page.locator('[data-operation-action="blocked"] .operation-reason').text_content(),
             }
@@ -470,6 +476,8 @@ def main():
         "toolbarActions": ["document-info"],
         "commentCountNodes": 0,
         "commentActionNodes": 0,
+        "normalizedCommentAppliesTo": "comments.list",
+        "missingCommentActionAvailable": False,
         "sidebarHidden": True,
     }
     assert results["operation_preview"]["groups"] == ["create", "update", "withdraw", "keep", "blocked"]
@@ -477,6 +485,7 @@ def main():
     assert results["operation_preview"]["bulkSelected"] == ["op-create", "op-keep", "op-withdraw"]
     assert results["operation_preview"]["humanHighlighted"] == 1
     assert results["operation_preview"]["humanBulkChecked"] is False
+    assert results["operation_preview"]["keepDisclaimer"] == "不变（表示本轮未改动，不代表 AI 重新逐条核验）"
     assert results["operation_preview"]["blockedDisabled"] is True
     assert "anchor is ambiguous" in results["operation_preview"]["blockedReason"]
     assert results["operation_preview_narrow"]["drawerScrollWidth"] <= results["operation_preview_narrow"]["drawerWidth"] + 1

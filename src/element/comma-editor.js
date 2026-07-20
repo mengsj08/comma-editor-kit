@@ -201,7 +201,7 @@ export class CommaEditorElement extends HTMLElement {
       id: String(action?.id || '').trim(),
       label: String(action?.label || action?.id || '').trim(),
       title: String(action?.title || '').trim(),
-      appliesTo: structuredClone(action?.appliesTo ?? null),
+      appliesTo: structuredClone(action?.appliesTo ?? 'comments.list'),
     })).filter((action) => action.id && action.label);
     if (this._connected) this._renderComments();
   }

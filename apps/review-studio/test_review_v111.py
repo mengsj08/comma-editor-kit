@@ -400,6 +400,65 @@ class ScientificReviewV111Tests(unittest.TestCase):
         self.assertIn("appliedSignature: String(first(input, 'appliedSignature', 'applied_signature')", models)
         self.assertIn("appliedOperationId: String(first(input, 'appliedOperationId', 'applied_operation_id')", models)
 
+    def test_10_comment_event_append_fsyncs_complete_line(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            doc = self._write_doc(os.path.realpath(raw_tmp), "# Synthetic\n")
+            with mock.patch.object(server.os, "fsync", wraps=server.os.fsync) as fsync:
+                event = server._append_comment_event(
+                    doc, comment_id="c-fsync", action="create", actor="June",
+                    from_version=0, to_version=1,
+                )
+            self.assertEqual(fsync.call_count, 1)
+            with open(server._comment_events_path(doc), "rb") as handle:
+                raw = handle.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(json.loads(raw), event)
+
+    def test_11_bad_comment_event_line_warns_and_preserves_later_good_line(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            doc = self._write_doc(os.path.realpath(raw_tmp), "# Synthetic\n")
+            path = server._comment_events_path(doc)
+            rows = [
+                {"event_id": "ce-before", "comment_id": "c-one", "action": "create"},
+                {"event_id": "ce-after", "comment_id": "c-two", "action": "edit"},
+            ]
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(rows[0]) + "\n")
+                handle.write('{"event_id":"ce-broken"\n')
+                handle.write(json.dumps(rows[1]) + "\n")
+            before = server.observability_warning_counts()["malformed_comment_event_lines"]
+            stderr = io.StringIO()
+            with mock.patch.object(server.sys, "stderr", stderr):
+                loaded = server._load_comment_events(doc)
+            after = server.observability_warning_counts()["malformed_comment_event_lines"]
+            self.assertEqual([item["event_id"] for item in loaded], ["ce-before", "ce-after"])
+            self.assertEqual(after, before + 1)
+            self.assertIn("line 2 skipped", stderr.getvalue())
+            self.assertNotIn("ce-broken", stderr.getvalue())
+
+    def test_12_keep_preview_copy_disclaims_ai_reverification(self):
+        script = self._read_text(os.path.join(server.STATIC_ROOT, "app.js"))
+        self.assertIn("不变（表示本轮未改动，不代表 AI 重新逐条核验）", script)
+
+    def test_13_public_comment_create_reassigns_duplicate_caller_id(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            with self._host(tmp) as base:
+                doc = self._write_doc(tmp, "# Synthetic\n")
+                existing = server._comment_record({
+                    "id": "c-existing", "kind": "overall", "content": "Existing note.",
+                    "actor": "June", "source": "manual",
+                })
+                server._save_comments(doc, [existing])
+                _, response = self._request(base, "/api/comments", "POST", {
+                    "path": "paper.md", "kind": "overall", "content": "New note.",
+                    "actor": "June", "source": "manual", "id": "c-existing",
+                })
+                self.assertNotEqual(response["comment"]["id"], "c-existing")
+                stored_ids = [item["id"] for item in server._load_comments(doc)]
+                self.assertEqual(len(stored_ids), len(set(stored_ids)))
+                self.assertIn("c-existing", stored_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

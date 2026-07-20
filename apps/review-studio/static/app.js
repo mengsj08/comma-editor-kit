@@ -909,7 +909,7 @@ const OPERATION_GROUPS = [
   { action: 'create', label: '新增', code: 'CREATE' },
   { action: 'update', label: '修改', code: 'UPDATE' },
   { action: 'withdraw', label: '撤回', code: 'WITHDRAW' },
-  { action: 'keep', label: '不变', code: 'KEEP' },
+  { action: 'keep', label: '不变（表示本轮未改动，不代表 AI 重新逐条核验）', code: 'KEEP' },
   { action: 'blocked', label: '阻断', code: 'BLOCKED' },
 ];
 
