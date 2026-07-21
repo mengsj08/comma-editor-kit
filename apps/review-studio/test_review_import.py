@@ -220,6 +220,42 @@ class ReviewImportTests(unittest.TestCase):
                 finally:
                     self._stop_server(httpd, thread)
 
+    def test_docx_tiff_image_is_converted_or_placeholdered_without_rejecting_manuscript(self):
+        if not server._docx_converter_status()["ready"]:
+            self.skipTest(server._docx_converter_status()["detail"])
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")):
+                httpd, thread, base = self._start_server()
+                try:
+                    staged = self._stage(
+                        base, "tiff-study.docx",
+                        self._synthetic_docx(include_image=True, image_extension="tiff"),
+                    )["import"]
+                    self.assertEqual(staged["status"], "staged")
+                    conversions = staged["candidate"]["asset_conversions"]
+                    self.assertEqual(conversions[0]["source_media_type"], "image/tiff")
+                    if conversions[0]["status"] == "converted":
+                        self.assertEqual(staged["candidate"]["assets"][0]["media_type"], "image/png")
+                        self.assertIn(".png", staged["preview"])
+                    else:
+                        self.assertEqual(conversions[0]["status"], "placeholder")
+                        self.assertIn("Image omitted", staged["preview"])
+
+                    fallback = self._stage(
+                        base, "broken-tiff.docx",
+                        self._synthetic_docx(
+                            include_image=True, image_extension="tiff", image_bytes=b"not a real tiff"),
+                    )["import"]
+                    self.assertEqual(fallback["status"], "staged")
+                    self.assertEqual(
+                        fallback["candidate"]["asset_conversions"][0]["status"], "placeholder")
+                    self.assertIn("Image omitted", fallback["preview"])
+                    self.assertIn("replaced DOCX TIFF image", " ".join(fallback["warnings"]))
+                finally:
+                    self._stop_server(httpd, thread)
+
     @staticmethod
     def _start_server():
         httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -245,7 +281,18 @@ class ReviewImportTests(unittest.TestCase):
 
     @staticmethod
     def _synthetic_docx(*, tracked=False, external_image=False, zip_slip=False, include_image=False,
-                        comments=False, xxe=False, macro=False, zip_bomb=False):
+                        comments=False, xxe=False, macro=False, zip_bomb=False,
+                        image_extension="png", image_bytes=None):
+        image_media_type = "image/tiff" if image_extension == "tiff" else "image/png"
+        image_payload = image_bytes
+        if image_payload is None and image_extension == "tiff":
+            image_payload = base64.b64decode(
+                "SUkqAAgAAAAKAAABBAABAAAAAQAAAAEBBAABAAAAAQAAAAIBAwADAAAAvgAAAAMBAwABAAAABAAAAAYBAwABAAAAAgAAABEBAwABAAAACAAAAAEWBAABAAAAAQAAABcBBAABAAAAAwAAABoBBQABAAAAxAAAABsBBQABAAAAzAAAACgBAwABAAAAAQAAAAAAAAABAAAAAQAAAAEAAAABAAAAAP8A"
+            )
+        elif image_payload is None:
+            image_payload = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
         content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -256,7 +303,7 @@ class ReviewImportTests(unittest.TestCase):
   <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
   %s
 </Types>''' % (
-            '<Default Extension="png" ContentType="image/png"/>' if include_image else '',
+            f'<Default Extension="{image_extension}" ContentType="{image_media_type}"/>' if include_image else '',
             '<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>' if comments else '',
         )
         if macro:
@@ -278,7 +325,7 @@ class ReviewImportTests(unittest.TestCase):
 </Relationships>''' % (
             '<Relationship Id="rIdRemote" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://example.invalid/private.png" TargetMode="External"/>'
             if external_image else '',
-            '<Relationship Id="rIdImage1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/figure.png"/>'
+            f'<Relationship Id="rIdImage1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/figure.{image_extension}"/>'
             if include_image else '',
         )
         styles = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -301,12 +348,12 @@ class ReviewImportTests(unittest.TestCase):
       <wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Synthetic Figure"/>
       <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
         <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
-          <pic:nvPicPr><pic:cNvPr id="0" name="figure.png"/><pic:cNvPicPr/></pic:nvPicPr>
+          <pic:nvPicPr><pic:cNvPr id="0" name="figure.%s"/><pic:cNvPicPr/></pic:nvPicPr>
           <pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rIdImage1"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
           <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
         </pic:pic>
       </a:graphicData></a:graphic>
-    </wp:inline></w:drawing></w:r></w:p>''' if include_image else ''
+    </wp:inline></w:drawing></w:r></w:p>''' % image_extension if include_image else ''
         document = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <w:body>
@@ -332,8 +379,8 @@ class ReviewImportTests(unittest.TestCase):
             archive.writestr("word/_rels/document.xml.rels", document_rels)
             if include_image:
                 archive.writestr(
-                    "word/media/figure.png",
-                    base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="),
+                    f"word/media/figure.{image_extension}",
+                    image_payload,
                 )
             if zip_slip:
                 archive.writestr("../escape.txt", "blocked")

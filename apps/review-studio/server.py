@@ -800,6 +800,56 @@ def _sandbox_path_literal(path: str) -> str:
     return os.path.realpath(path).replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _sips_path() -> str:
+    candidate = shutil.which("sips", path=_cli_search_path())
+    if candidate:
+        return candidate
+    return "/usr/bin/sips" if os.path.isfile("/usr/bin/sips") else ""
+
+
+def _replace_docx_image_reference(markdown: str, import_id: str, name: str,
+                                  replacement: str) -> str:
+    source = re.escape(f"assets/{import_id}/{name}")
+    pattern = re.compile(
+        rf"!\[([^\]]*)\]\((?:<({source})>|({source}))(?:\s+\"[^\"]*\")?\)"
+    )
+    if pattern.search(markdown):
+        return pattern.sub(replacement, markdown)
+    return markdown.replace(f"assets/{import_id}/{name}", replacement)
+
+
+def _docx_image_placeholder(name: str, media_type: str, detail: str) -> str:
+    message = (
+        f"> [Image omitted: {name} ({media_type}). "
+        f"{detail.strip()[:240] or 'conversion unavailable'}]"
+    )
+    return "\n\n" + message + "\n\n"
+
+
+def _convert_tiff_asset_to_png(source_asset: str, output_root: str, name: str) -> tuple[str, str, bytes]:
+    sips = _sips_path()
+    if not sips:
+        raise ValueError("macOS sips is unavailable")
+    output_name = re.sub(r"\.[^.]+$", "", name) + ".png"
+    output_path = os.path.realpath(os.path.join(output_root, "assets", output_name))
+    assets_root = os.path.realpath(os.path.join(output_root, "assets"))
+    if not output_path.startswith(assets_root + os.sep):
+        raise ValueError("converted asset path escaped its output directory")
+    completed = subprocess.run(
+        [sips, "-s", "format", "png", source_asset, "--out", output_path],
+        capture_output=True, text=True, timeout=30, check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if completed.returncode != 0 or not os.path.isfile(output_path):
+        detail = ((completed.stderr or completed.stdout) or "sips conversion failed").strip()
+        raise ValueError(detail[:400])
+    if os.path.getsize(output_path) > _MAX_ASSET_BYTES:
+        raise ValueError("converted PNG asset exceeds size limit")
+    with open(output_path, "rb") as fh:
+        content = fh.read()
+    return output_name, output_path, content
+
+
 def _convert_docx_candidate(source_path: str, import_id: str):
     status = _docx_converter_status()
     if not status["ready"]:
@@ -840,6 +890,8 @@ def _convert_docx_candidate(source_path: str, import_id: str):
         if not markdown.strip():
             raise ValueError("DOCX conversion produced an empty Markdown document")
         assets = []
+        asset_conversions = []
+        messages = [str(item)[:600] for item in (result.get("messages") or []) if str(item).strip()]
         for row in result.get("assets") or []:
             name = str((row or {}).get("name") or "")
             if not name or name != os.path.basename(name) or re.search(r"[\\/\x00-\x1f]", name):
@@ -852,8 +904,57 @@ def _convert_docx_candidate(source_path: str, import_id: str):
             with open(source_asset, "rb") as fh:
                 content = fh.read()
             asset_media_type = str(row.get("media_type") or mimetypes.guess_type(name)[0] or "application/octet-stream")
+            if asset_media_type == "image/tiff":
+                conversion = {
+                    "source_name": name,
+                    "source_media_type": asset_media_type,
+                    "target_media_type": "image/png",
+                    "converter": "sips -s format png",
+                    "status": "pending",
+                }
+                try:
+                    converted_name, _, converted_content = _convert_tiff_asset_to_png(
+                        source_asset, output_root, name)
+                    markdown = _replace_docx_image_reference(
+                        markdown, import_id, name, f"![TIFF image](assets/{import_id}/{converted_name})")
+                    assets.append({
+                        "name": converted_name,
+                        "media_type": "image/png",
+                        "byte_count": len(converted_content),
+                        "sha256": _sha256_bytes(converted_content),
+                        "content": converted_content,
+                    })
+                    conversion.update({
+                        "status": "converted",
+                        "target_name": converted_name,
+                        "target_sha256": _sha256_bytes(converted_content),
+                    })
+                    messages.append(
+                        f"warning: converted DOCX TIFF image {name} to PNG {converted_name}")
+                except Exception as exc:
+                    detail = str(exc)[:400]
+                    placeholder = _docx_image_placeholder(
+                        name, asset_media_type,
+                        "TIFF to PNG conversion failed; the manuscript import continued. " + detail)
+                    markdown = _replace_docx_image_reference(markdown, import_id, name, placeholder)
+                    conversion.update({"status": "placeholder", "error": detail})
+                    messages.append(
+                        f"warning: replaced DOCX TIFF image {name} with a Markdown placeholder: {detail}")
+                asset_conversions.append(conversion)
+                continue
             if asset_media_type not in _ASSET_MIME_TYPES:
-                raise ValueError(f"DOCX image type is not supported by the editor: {asset_media_type}")
+                detail = f"DOCX image type is not supported by the editor: {asset_media_type}"
+                markdown = _replace_docx_image_reference(
+                    markdown, import_id, name,
+                    _docx_image_placeholder(name, asset_media_type, detail))
+                asset_conversions.append({
+                    "source_name": name,
+                    "source_media_type": asset_media_type,
+                    "status": "placeholder",
+                    "error": detail,
+                })
+                messages.append(f"warning: replaced unsupported DOCX image {name} with a Markdown placeholder")
+                continue
             assets.append({
                 "name": name,
                 "media_type": asset_media_type,
@@ -863,9 +964,10 @@ def _convert_docx_candidate(source_path: str, import_id: str):
             })
         return {
             "markdown": markdown,
-            "messages": [str(item)[:600] for item in (result.get("messages") or []) if str(item).strip()],
+            "messages": messages,
             "versions": result.get("versions") or {},
             "assets": assets,
+            "asset_conversions": asset_conversions,
         }
 
 
@@ -931,6 +1033,7 @@ def _stage_docx_import(filename: str, source: bytes, media_type: str = ""):
                 "line_count": markdown.count("\n") + 1,
                 "suggested_target": _suggest_import_target_name(source_filename),
                 "assets": asset_rows,
+                "asset_conversions": converted.get("asset_conversions") or [],
             },
             "normalizations": ["converted DOCX semantic structure to canonical Markdown"],
             "warnings": warnings,
