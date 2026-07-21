@@ -458,8 +458,9 @@ function configureEditorActions() {
   editor.toolbarActions = [
     { id: 'article-overview', label: '文章总览', slot: 'primary', appliesTo: 'document.load' },
     { id: 'ai-review', label: 'AI Review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true }, loading: reviewState.running },
-    { id: 'overall-comment', label: '全文批注', slot: 'primary', appliesTo: 'comments.create' },
+    { id: 'ai-tools', label: 'AI 工具', slot: 'primary', appliesTo: 'document.load' },
     { id: 'comments', label: '批注', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
+    { id: 'overall-comment', label: '全文批注', slot: 'overflow', appliesTo: 'comments.create' },
     { id: 'source-edit', label: '源码编辑', slot: 'overflow', appliesTo: { capability: 'document.save', requiresWritable: true } },
     { id: 'accept-provisional', label: '接受全部暂定', slot: 'overflow', appliesTo: 'comments.update' },
     { id: 'show-withdrawn', label: editor.showWithdrawnComments ? '隐藏已撤回' : '显示已撤回', slot: 'overflow', appliesTo: 'comments.list' },
@@ -479,6 +480,83 @@ function configureEditorActions() {
 
 configureEditorActions();
 
+const HEADER_PRIMARY_ACTION_IDS = ['article-overview', 'ai-review', 'ai-tools', 'comments'];
+
+function visibleHeaderPrimaryIds() {
+  const width = window.innerWidth || 1440;
+  if (width >= 980) return HEADER_PRIMARY_ACTION_IDS;
+  if (width >= 760) return ['ai-review', 'comments'];
+  return ['ai-review'];
+}
+
+function stateAction(actionId) {
+  return editorActionState?.toolbar?.actions?.find((action) => action.id === actionId) || null;
+}
+
+function actionButton(action, className = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  button.dataset.hostToolbarAction = action.id;
+  button.disabled = !action.enabled || action.loading;
+  if (action.title) button.title = action.title;
+  button.append(document.createTextNode(action.loading ? `${action.label}…` : action.label));
+  if (Number.isFinite(action.count)) {
+    const badge = document.createElement('span');
+    badge.className = 'doc-action-count';
+    badge.textContent = String(action.count);
+    button.append(' ', badge);
+  }
+  return button;
+}
+
+function renderHostToolbar() {
+  if (!editorActionState) return;
+  const visibleIds = visibleHeaderPrimaryIds();
+  const primary = HEADER_PRIMARY_ACTION_IDS
+    .map(stateAction)
+    .filter((action) => action && visibleIds.includes(action.id));
+  const foldedPrimary = HEADER_PRIMARY_ACTION_IDS
+    .map(stateAction)
+    .filter((action) => action && !visibleIds.includes(action.id));
+  $('doc-primary-actions').replaceChildren(...primary.map((action) => actionButton(action)));
+  const editorOverflow = [
+    ...foldedPrimary,
+    ...(editorActionState.toolbar?.overflow || []),
+  ];
+  $('doc-more-editor-actions').replaceChildren(...editorOverflow.map((action) => actionButton(action)));
+}
+
+function closeAiToolsPopover() {
+  $('ai-tools-popover').hidden = true;
+}
+
+function openAiToolsPopover() {
+  $('ai-tools-popover').hidden = false;
+}
+
+function toggleAiToolsPopover() {
+  $('ai-tools-popover').hidden ? openAiToolsPopover() : closeAiToolsPopover();
+}
+
+function selectedSourceQuote() {
+  return editor.selectionState || null;
+}
+
+function quickExplainFromToolbar() {
+  const sourceQuote = selectedSourceQuote();
+  if (!sourceQuote?.quoteText) return toast('请先在正文中选择一段原文，再运行快速解释。', true);
+  closeAiToolsPopover();
+  return quickExplain(sourceQuote);
+}
+
+function discussSelectionFromToolbar() {
+  const sourceQuote = selectedSourceQuote();
+  if (!sourceQuote?.quoteText) return toast('请先在正文中选择一段原文，再开始选区讨论。', true);
+  closeAiToolsPopover();
+  return openConversationForQuote(sourceQuote);
+}
+
 function syncDocumentMeta(documentState) {
   const body = String(documentState?.body || '');
   $('doc-name').textContent = documentState?.title || DOC_PATH;
@@ -493,6 +571,7 @@ function syncDocumentMetaFromActionState(state) {
     : state.document.dirty ? '未保存' : state.status?.kind === 'error' ? '需处理' : '已保存';
   $('doc-name').textContent = state.document.title || DOC_PATH;
   $('doc-meta').textContent = `${state.document.lineCount} 行 · ${saveLabel} · rev ${state.document.shortRev || '—'}`;
+  renderHostToolbar();
 }
 
 editor.subscribeActionState(syncDocumentMetaFromActionState);
@@ -681,10 +760,10 @@ editor.addEventListener('comma-selection-action', (event) => {
   if (event.detail?.actionId === 'discuss') openConversationForQuote(sourceQuote);
 });
 
-editor.addEventListener('comma-toolbar-action', (event) => {
-  const action = event.detail?.actionId;
+function runEditorToolbarAction(action) {
   if (action === 'article-overview') openOverview();
   if (action === 'ai-review') editor.requestAiReview();
+  if (action === 'ai-tools') toggleAiToolsPopover();
   if (action === 'overall-comment') editor.openOverallCommentComposer();
   if (action === 'comments') editor.toggleComments();
   if (action === 'source-edit') editor.openSourceEditor();
@@ -693,6 +772,10 @@ editor.addEventListener('comma-toolbar-action', (event) => {
     editor.showWithdrawnComments = !editor.showWithdrawnComments;
     configureEditorActions();
   }
+}
+
+editor.addEventListener('comma-toolbar-action', (event) => {
+  runEditorToolbarAction(event.detail?.actionId);
 });
 
 editor.addEventListener('comma-comment-action', async (event) => {
@@ -2150,6 +2233,19 @@ async function writebackConversationMessage() {
 $('btn-review-history').onclick = async () => { openReviewDrawer(); if (!reviewState.active) await loadReviewSessions(true); };
 $('btn-import').onclick = openImportDialog;
 $('btn-evidence').onclick = openEvidenceDrawer;
+$('btn-quick-explain').onclick = quickExplainFromToolbar;
+$('btn-selection-discuss').onclick = discussSelectionFromToolbar;
+$('doc-primary-actions').onclick = (event) => {
+  const button = event.target.closest('[data-host-toolbar-action]');
+  if (!button || button.disabled) return;
+  runEditorToolbarAction(button.dataset.hostToolbarAction);
+};
+$('doc-more-editor-actions').onclick = (event) => {
+  const button = event.target.closest('[data-host-toolbar-action]');
+  if (!button || button.disabled) return;
+  $('doc-more-menu').open = false;
+  runEditorToolbarAction(button.dataset.hostToolbarAction);
+};
 $('conversation-evidence-open').onclick = openEvidenceDrawer;
 $('evidence-close').onclick = closeEvidenceDrawer;
 $('evidence-scrim').onclick = closeEvidenceDrawer;
@@ -2315,10 +2411,17 @@ $('cli-redetect').onclick = async () => {
 };
 document.addEventListener('click', (event) => {
   if (!event.target.closest('.cli-status-wrap')) closeRuntimePopover();
+  if (!event.target.closest('#ai-tools-popover') && !event.target.closest('[data-host-toolbar-action="ai-tools"]')) closeAiToolsPopover();
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !$('import-modal').hidden) closeImportDialog();
+  if (event.key === 'Escape') {
+    closeAiToolsPopover();
+    $('doc-more-menu').open = false;
+    $('doc-file-menu').open = false;
+  }
 });
+window.addEventListener('resize', renderHostToolbar, { passive: true });
 document.querySelectorAll('input[name="review-tool"], input[name="conversation-tool"]').forEach((input) => {
   input.addEventListener('change', syncRuntimeControls);
 });

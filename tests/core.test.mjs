@@ -80,8 +80,10 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
   assert.match(componentCss, /\.ce-table-scroll[\s\S]*overflow-x:\s*auto/);
   assert.match(componentCss, /\.ce-code-copy/);
   assert.match(componentCss, /\.ce-image-fallback/);
+  assert.match(componentCss, /:host\(\[embedded-chrome\]\) \.ce-shell[\s\S]*box-shadow:\s*none/);
   assert.match(hostCss, /overflow-x:\s*clip/);
-  assert.match(hostCss, /@media \(min-width: 761px\) and \(max-width: 1099px\)[\s\S]*\.doc-actions[\s\S]*flex-wrap:\s*wrap/);
+  assert.match(hostCss, /\.doc-header[\s\S]*grid-template-columns:\s*auto minmax\(190px,\s*1fr\) auto auto/);
+  assert.match(hostCss, /@media \(min-width: 761px\) and \(max-width: 1099px\)[\s\S]*\.doc-header[\s\S]*grid-template-columns:\s*auto minmax\(180px,\s*1fr\) auto auto/);
   assert.match(hostCss, /width:\s*min\(1792px,\s*calc\(100% - 64px\)\)/);
 });
 

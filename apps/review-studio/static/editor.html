@@ -8,15 +8,21 @@
 </head>
 <body>
   <header class="doc-header">
-    <div class="doc-title">
-      <span class="studio-mark" aria-hidden="true">C,</span>
+    <div class="doc-brand" aria-label="Comma Review">
+      <span class="studio-mark" aria-hidden="true">,</span>
       <span class="studio-name">Comma Review</span>
-      <span id="doc-name">paper.md</span>
-      <span id="doc-meta" class="doc-meta"></span>
     </div>
-    <div class="doc-actions">
-      <button id="btn-import" class="primary-action" type="button" title="从 Word 或 Markdown 创建新的评审主稿">导入主稿</button>
-      <button id="btn-evidence" type="button" title="管理与主稿分离的 PDF 参考资料">参考资料 <span id="evidence-count">0</span></button>
+    <details id="doc-file-menu" class="doc-file-menu">
+      <summary aria-label="当前主稿与导入切换">
+        <span id="doc-name">paper.md</span>
+        <span id="doc-meta" class="doc-meta"></span>
+      </summary>
+      <div class="doc-file-menu-panel">
+        <button id="btn-import" type="button" title="从 Word 或 Markdown 创建新的评审主稿">导入/切换主稿</button>
+      </div>
+    </details>
+    <nav id="doc-primary-actions" class="doc-actions" aria-label="高频操作"></nav>
+    <div class="doc-utility-actions">
       <div class="cli-status-wrap">
         <button id="cli-status" class="cli-status checking" type="button" aria-label="查看本机 CLI 状态" aria-haspopup="dialog" aria-expanded="false">
           <i aria-hidden="true"></i><span>CLI · 检测中</span>
@@ -27,12 +33,25 @@
           <footer><button id="cli-redetect" type="button">重新检测</button></footer>
         </aside>
       </div>
-      <button id="btn-versions" type="button" title="查看自动快照、命名版本和冲突草稿">版本 <span id="version-count">0</span></button>
-      <button id="btn-export" type="button" title="导出正文、评审包、DOCX 或 PDF">导出</button>
-      <button id="btn-conversations" type="button" title="查看已建立的选区讨论">讨论记录 <span id="conversation-count">0</span></button>
-      <button id="btn-review-history" type="button">评审记录</button>
+      <details id="doc-more-menu" class="doc-more-menu">
+        <summary aria-label="更多操作">···</summary>
+        <div id="doc-more-actions" class="doc-more-actions">
+          <div id="doc-more-editor-actions" class="doc-more-editor-actions"></div>
+          <button id="btn-versions" type="button" title="查看自动快照、命名版本和冲突草稿">版本 <span id="version-count">0</span></button>
+          <button id="btn-export" type="button" title="导出正文、评审包、DOCX 或 PDF">导出</button>
+          <button id="btn-conversations" type="button" title="查看已建立的选区讨论">讨论记录 <span id="conversation-count">0</span></button>
+          <button id="btn-review-history" type="button">评审记录</button>
+        </div>
+      </details>
     </div>
   </header>
+
+  <aside id="ai-tools-popover" class="ai-tools-popover" aria-label="AI 工具" hidden>
+    <header><strong>AI 工具</strong><small>快捷命令读取当前选区或资料上下文</small></header>
+    <button id="btn-quick-explain" type="button">快速解释</button>
+    <button id="btn-selection-discuss" type="button">选区讨论</button>
+    <button id="btn-evidence" type="button">参考资料 <span id="evidence-count">0</span></button>
+  </aside>
 
   <section id="import-modal" class="import-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="import-title" hidden>
     <header class="import-head">
@@ -99,7 +118,7 @@
 
   <main class="doc-main comma-host-main">
     <section class="doc-pane comma-host-pane">
-      <comma-editor id="comma-editor" actor="June" theme="scientific" lang="zh-CN"></comma-editor>
+      <comma-editor id="comma-editor" actor="June" theme="scientific" lang="zh-CN" embedded-chrome></comma-editor>
     </section>
   </main>
 

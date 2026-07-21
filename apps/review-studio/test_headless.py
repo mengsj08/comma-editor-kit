@@ -182,6 +182,8 @@ def editor_snapshot(page):
         shellBackground: getComputedStyle(root.querySelector('.ce-shell')).backgroundColor,
         paperBackground: getComputedStyle(root.querySelector('.ce-document')).backgroundColor,
         textureDisplay: getComputedStyle(root.querySelector('.ce-shell'), '::before').display,
+        ceHeaderCount: root.querySelectorAll('.ce-header').length,
+        embeddedControls: root.querySelectorAll('[data-el=embedded-controls]').length,
       };
     }""")
 
@@ -232,13 +234,17 @@ def main():
             results["public_component_render"] = first
             results["host_actions"] = page.evaluate("""() => {
               const root = document.querySelector('comma-editor').shadowRoot;
+              const state = document.querySelector('comma-editor').actionState;
               return {
-                primary: Array.from(root.querySelectorAll('[data-el=toolbar-primary] [data-toolbar-action]')).map(button => button.textContent.trim()),
-                overflow: Array.from(root.querySelectorAll('[data-el=toolbar-overflow-menu] [data-toolbar-action]')).map(button => button.textContent.trim()),
+                innerHeaderCount: root.querySelectorAll('.ce-header').length,
+                statePrimary: state.toolbar.primary.map(action => action.label + (Number.isFinite(action.count) ? ` ${action.count}` : '')),
+                primary: Array.from(document.querySelectorAll('#doc-primary-actions [data-host-toolbar-action]')).map(button => button.textContent.trim()),
+                overflow: Array.from(document.querySelectorAll('#doc-more-editor-actions [data-host-toolbar-action]')).map(button => button.textContent.trim()),
+                moreHost: Array.from(document.querySelectorAll('#doc-more-actions > button')).map(button => button.textContent.trim().replace(/\\s+/g, ' ')),
                 panelTitle: root.querySelector('[data-el=comment-panel-title]').textContent,
               };
             }""")
-            page.evaluate("document.querySelector('comma-editor').shadowRoot.querySelector('[data-toolbar-action=article-overview]').click()")
+            page.locator('#doc-primary-actions [data-host-toolbar-action="article-overview"]').click()
             page.wait_for_function("document.querySelector('#overview-drawer').classList.contains('open')")
             results["overview_shell"] = {
                 "title": page.locator("#overview-drawer h2").text_content(),
@@ -247,7 +253,7 @@ def main():
             }
             page.locator("#overview-close").click()
 
-            page.evaluate("document.querySelector('comma-editor').shadowRoot.querySelector('[data-toolbar-action=ai-review]').click()")
+            page.locator('#doc-primary-actions [data-host-toolbar-action="ai-review"]').click()
             page.wait_for_function("!document.querySelector('#review-preflight-modal').hidden && !document.querySelector('#review-preflight-primary').disabled")
             results["review_preflight"] = {
                 "title": page.locator("#review-preflight-title").text_content(),
@@ -519,9 +525,19 @@ def main():
     assert results["public_component_render"]["shellBackground"] == "rgb(255, 255, 255)"
     assert results["public_component_render"]["paperBackground"] == "rgb(255, 255, 255)"
     assert results["public_component_render"]["textureDisplay"] == "none"
+    assert results["public_component_render"]["ceHeaderCount"] == 0
+    assert results["public_component_render"]["embeddedControls"] == 1
     assert results["image_lightbox_opened"] is True
-    assert results["host_actions"]["primary"] == ["文章总览", "AI Review", "全文批注", "批注 0"]
-    assert results["host_actions"]["overflow"] == ["源码编辑", "接受全部暂定", "显示已撤回"]
+    assert results["host_actions"]["innerHeaderCount"] == 0
+    assert results["host_actions"]["statePrimary"] == ["文章总览", "AI Review", "AI 工具", "批注 0"]
+    assert results["host_actions"]["primary"] == ["文章总览", "AI Review", "AI 工具", "批注 0"]
+    assert results["host_actions"]["overflow"] == ["全文批注", "源码编辑", "接受全部暂定", "显示已撤回"]
+    more_host = results["host_actions"]["moreHost"]
+    assert len(more_host) == 4
+    assert more_host[0].startswith("版本 ")
+    assert more_host[1] == "导出"
+    assert more_host[2].startswith("讨论记录 ")
+    assert more_host[3] == "评审记录"
     assert results["host_actions"]["panelTitle"] == "批注"
     assert results["overview_shell"]["title"] == "文章总览"
     assert results["overview_shell"]["claims"] == 3

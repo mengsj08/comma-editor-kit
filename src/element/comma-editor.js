@@ -173,6 +173,10 @@ export class CommaEditorElement extends HTMLElement {
     return normalizeSavePolicy(this.getAttribute('save-policy') || this._capabilities.savePolicy);
   }
 
+  get embeddedChrome() {
+    return this.hasAttribute('embedded-chrome');
+  }
+
   get dirty() {
     return this._dirty;
   }
@@ -258,6 +262,10 @@ export class CommaEditorElement extends HTMLElement {
 
   get actionState() {
     return structuredClone(this._buildActionState());
+  }
+
+  get selectionState() {
+    return this._selection ? structuredClone(this._selection) : null;
   }
 
   subscribeActionState(callback, { emitInitial = true } = {}) {
@@ -466,9 +474,10 @@ export class CommaEditorElement extends HTMLElement {
   }
 
   _renderShell() {
-    this.shadowRoot.innerHTML = `
-      <style>${katexCss}\n${highlightCss}\n${componentCss}</style>
-      <section class="ce-shell" data-el="shell" aria-label="Comma Markdown editor">
+    const header = this.embeddedChrome ? `
+        <div class="ce-embedded-controls" data-el="embedded-controls">
+          <button class="ce-button ce-outline-toggle" type="button" data-action="toggle-outline" data-el="outline-toggle">目录</button>
+        </div>` : `
         <header class="ce-header">
           <div class="ce-identity">
             <div class="ce-kicker">Comma Editor</div>
@@ -484,7 +493,11 @@ export class CommaEditorElement extends HTMLElement {
               <div class="ce-toolbar-overflow-menu" data-el="toolbar-overflow-menu"></div>
             </details>
           </div>
-        </header>
+        </header>`;
+    this.shadowRoot.innerHTML = `
+      <style>${katexCss}\n${highlightCss}\n${componentCss}</style>
+      <section class="ce-shell" data-el="shell" aria-label="Comma Markdown editor">
+        ${header}
         <div class="ce-grid">
           <aside class="ce-outline" data-el="outline" aria-label="Document outline"></aside>
           <main class="ce-document">
@@ -672,16 +685,21 @@ export class CommaEditorElement extends HTMLElement {
 
   _renderMeta() {
     if (!this._connected) return;
-    this._el('title').textContent = this._document.title || 'untitled.md';
+    const title = this._el('title');
+    if (title) title.textContent = this._document.title || 'untitled.md';
     const lines = this._document.body ? this._document.body.split('\n').length : 0;
     const revision = this._document.rev ? this._document.rev.replace('sha256-', '').slice(0, 8) : '—';
     const policy = this.savePolicy === 'explicit' ? 'explicit save' : 'immediate save';
     const mode = this.readonly ? 'read only' : `${policy} · actor ${this.actor}`;
     const dirty = this._dirty ? ' · unsaved' : '';
-    this._el('meta').textContent = `${lines} lines · rev ${revision} · ${mode}${dirty}`;
+    const meta = this._el('meta');
+    if (meta) meta.textContent = `${lines} lines · rev ${revision} · ${mode}${dirty}`;
     const writable = !this.readonly && this._capabilities.document.save;
-    this._el('explicit-save').hidden = this.savePolicy !== 'explicit' || !writable;
-    this._el('explicit-save').disabled = !this._dirty;
+    const explicitSave = this._el('explicit-save');
+    if (explicitSave) {
+      explicitSave.hidden = this.savePolicy !== 'explicit' || !writable;
+      explicitSave.disabled = !this._dirty;
+    }
     this._el('sidebar').hidden = !this._capabilities.comments.list;
     this._el('shell').classList.toggle('comments-open', this._commentsOpen);
     this._el('shell').classList.toggle('outline-open', this._outlineOpen);
@@ -1455,8 +1473,11 @@ export class CommaEditorElement extends HTMLElement {
   }
 
   _renderToolbarActions() {
-    if (!this._connected || !this._el('toolbar-primary')) return;
+    if (!this._connected) return;
     const state = this._notifyActionState();
+    const commentCountAction = state.toolbar.actions.find((action) => action.countSource === 'comments');
+    this._el('comment-panel-title').textContent = commentCountAction?.label || 'Comments';
+    if (!this._el('toolbar-primary')) return;
     const createButton = (actionState, overflow = false) => {
       const button = document.createElement('button');
       button.type = 'button';
@@ -1484,8 +1505,6 @@ export class CommaEditorElement extends HTMLElement {
     this._el('toolbar-primary').replaceChildren(...primary.map((action) => createButton(action)));
     this._el('toolbar-overflow-menu').replaceChildren(...overflow.map((action) => createButton(action, true)));
     this._el('toolbar-overflow').hidden = !overflow.length;
-    const commentCountAction = state.toolbar.actions.find((action) => action.countSource === 'comments');
-    this._el('comment-panel-title').textContent = commentCountAction?.label || 'Comments';
   }
 
   _runToolbarAction(actionId) {

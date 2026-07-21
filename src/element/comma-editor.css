@@ -58,6 +58,12 @@ button { color: inherit; }
   border-radius: 10px;
   background: #fff;
 }
+:host([embedded-chrome]) .ce-shell {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+:host([embedded-chrome]) .ce-shell::before { display: none; }
 :host([theme="scientific"]) .ce-shell::before { display: none; }
 :host([theme="scientific"]) .ce-header { background: rgba(255, 255, 255, 0.96); }
 :host([theme="scientific"]) .ce-document { background: #fff; }
@@ -131,6 +137,20 @@ button { color: inherit; }
 }
 
 .ce-actions, .ce-toolbar-primary { display: flex; align-items: center; gap: 8px; }
+.ce-embedded-controls {
+  position: sticky;
+  top: var(--comma-embedded-sticky-top, 58px);
+  z-index: 5;
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 7px 18px;
+  border-bottom: 1px solid var(--comma-line);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(12px);
+}
+:host([embedded-chrome]) .ce-grid { min-height: 578px; }
 .ce-button {
   min-height: 36px;
   padding: 0 13px;
