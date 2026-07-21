@@ -48,10 +48,26 @@ class _FakeBigAppleHandler(BaseHTTPRequestHandler):
                 },
             }, 201)
         if self.path == "/api/chat":
-            chunk = (
-                "data: " +
-                json.dumps({"role": "assistant", "content": "SSE assistant result"}, ensure_ascii=False) +
-                "\n\n"
+            frames = [
+                {"type": "text", "data": "SSE "},
+                {"type": "text", "data": "assistant "},
+                {"type": "text", "data": "result"},
+                {"type": "final_text", "data": "SSE assistant result"},
+                {
+                    "type": "result",
+                    "data": json.dumps({
+                        "usage": {"input_tokens": 10, "output_tokens": 3},
+                        "is_error": False,
+                        "session_id": "runtime-session",
+                        "provider_key": "fixture-provider",
+                        "provider_debug": {"raw_provider_response": {"ok": True}},
+                    }, ensure_ascii=False),
+                },
+                {"type": "done", "data": ""},
+            ]
+            chunk = "".join(
+                "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
+                for frame in frames
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -87,6 +103,8 @@ class BigAppleGatewayTests(unittest.TestCase):
                 schema={"type": "object"},
             )
         self.assertEqual(result["output"], "SSE assistant result")
+        self.assertNotIn("usage", result["output"])
+        self.assertNotIn("provider_debug", result["output"])
         self.assertEqual(result["session_id"], "session-1")
         chat_payload = next(payload for method, path, payload in _FakeBigAppleHandler.requests
                             if method == "POST" and path == "/api/chat")
@@ -118,6 +136,7 @@ class BigAppleGatewayTests(unittest.TestCase):
             self.assertEqual(receipt["provider"]["transport"], "bigapple_gateway")
             self.assertEqual(receipt["web_policy"], {"mode": "disabled", "web_search_used": False})
             self.assertEqual(result["output"], "SSE assistant result")
+            self.assertNotIn("provider_debug", result["output"])
             self.assertTrue(os.path.isfile(os.path.join(result["trace_root"], "receipt.json")))
             self.assertTrue(receipt["trace"]["events_sha256"].startswith("sha256:"))
 

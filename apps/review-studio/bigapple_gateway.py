@@ -125,19 +125,81 @@ def _event_text(event: Any) -> str:
         return "\n\n".join(text for text in (_event_text(item) for item in event) if text).strip()
     if not isinstance(event, dict):
         return ""
+    event_type = str(event.get("type") or "").lower()
+    if event_type in {"result", "done", "usage", "metadata", "meta"}:
+        return ""
+    if event_type in {"text", "delta", "content_delta", "message_delta"}:
+        data = event.get("data")
+        if isinstance(data, str):
+            return data
+        return str(event.get("text") or event.get("delta") or "")
+    if event_type in {"final_text", "final", "answer"}:
+        for key in ("data", "content", "text", "output"):
+            value = event.get(key)
+            text = _message_text(value) if key == "content" else str(value or "").strip()
+            if text:
+                return text
     if event.get("role") == "assistant":
         return _message_text(event.get("content")) or str(event.get("text") or "").strip()
     for key in ("message", "delta", "data", "event"):
         text = _event_text(event.get(key))
         if text:
             return text
-    event_type = str(event.get("type") or "").lower()
     if any(token in event_type for token in ("final", "answer", "complete", "message")):
         for key in ("content", "text", "output"):
             text = _message_text(event.get(key)) if key == "content" else str(event.get(key) or "").strip()
             if text:
                 return text
     return ""
+
+
+def _result_payload(event: dict) -> dict:
+    if str((event or {}).get("type") or "").lower() != "result":
+        return {}
+    data = event.get("data")
+    if isinstance(data, dict):
+        return data
+    if not isinstance(data, str) or not data.strip():
+        return {}
+    try:
+        loaded = json.loads(data)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _sse_error(events: list[dict]) -> str:
+    for event in reversed(events):
+        payload = _result_payload(event)
+        if not payload or not payload.get("is_error"):
+            continue
+        for key in ("error", "message", "detail"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:2000]
+        provider_debug = payload.get("provider_debug")
+        if isinstance(provider_debug, dict):
+            for key in ("error", "message", "detail"):
+                value = provider_debug.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:2000]
+        return "BigApple task failed"
+    return ""
+
+
+def _assistant_text_from_events(events: list[dict]) -> str:
+    final_text = ""
+    deltas = []
+    for event in events:
+        event_type = str((event or {}).get("type") or "").lower()
+        text = _event_text(event)
+        if not text:
+            continue
+        if event_type in {"final_text", "final", "answer"}:
+            final_text = text
+        else:
+            deltas.append(text)
+    return (final_text or "".join(deltas)).strip()
 
 
 def _read_sse_response(response) -> tuple[str, list[dict]]:
@@ -155,12 +217,10 @@ def _read_sse_response(response) -> tuple[str, list[dict]]:
         data_lines.append(line[5:].strip())
     if data_lines:
         _append_sse_event(events, data_lines)
-    output = ""
-    for event in reversed(events):
-        output = _event_text(event)
-        if output:
-            break
-    return output, events
+    error = _sse_error(events)
+    if error:
+        raise BigAppleGatewayError(error)
+    return _assistant_text_from_events(events), events
 
 
 def _append_sse_event(events: list[dict], data_lines: list[str]) -> None:
