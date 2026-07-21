@@ -7693,7 +7693,9 @@ def print_doctor_report(report):
 
 def _open_browser(url):
     try:
-        if sys.platform == "darwin" and shutil.which("open"):
+        if sys.platform == "win32":
+            os.startfile(url)
+        elif sys.platform == "darwin" and shutil.which("open"):
             subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             print(f"[comma-review] open this URL in your browser: {url}")

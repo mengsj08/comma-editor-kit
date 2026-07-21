@@ -16,6 +16,7 @@ import server
 
 
 GUIDE = "未检测到可用 CLI，请安装并登录 Codex 或 Claude CLI"
+PROJECT_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 class ReviewCliDegradationTests(unittest.TestCase):
@@ -90,6 +91,25 @@ class ReviewCliDegradationTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(payload["code"], "cli_unavailable")
         self.assertIn(GUIDE, payload["error"])
+
+    def test_windows_open_browser_uses_startfile(self):
+        with mock.patch.object(server.sys, "platform", "win32"), \
+                mock.patch.object(server.os, "startfile", create=True) as startfile, \
+                mock.patch.object(server.subprocess, "Popen") as popen:
+            server._open_browser("http://127.0.0.1:8891")
+        startfile.assert_called_once_with("http://127.0.0.1:8891")
+        popen.assert_not_called()
+
+    def test_windows_launchers_match_shell_entrypoint(self):
+        with open(os.path.join(PROJECT_ROOT, "start-review-studio.cmd"), encoding="utf-8") as handle:
+            cmd = handle.read()
+        with open(os.path.join(PROJECT_ROOT, "start-review-studio.ps1"), encoding="utf-8") as handle:
+            ps1 = handle.read()
+        for script in (cmd, ps1):
+            self.assertIn("apps", script)
+            self.assertIn("review-studio", script)
+            self.assertIn("server.py", script)
+            self.assertIn("--doctor --serve --open", script)
 
     def test_all_ai_entrypoints_return_clear_cli_guidance_when_no_cli_is_ready(self):
         body = "# Results\n\nThis selected claim needs context.\n"
