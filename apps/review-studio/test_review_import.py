@@ -4,6 +4,7 @@ import json
 import io
 import base64
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -236,11 +237,12 @@ class ReviewImportTests(unittest.TestCase):
                     self.assertEqual(staged["status"], "staged")
                     conversions = staged["candidate"]["asset_conversions"]
                     self.assertEqual(conversions[0]["source_media_type"], "image/tiff")
-                    if conversions[0]["status"] == "converted":
+                    expected_status = "converted" if server._sips_path() else "placeholder"
+                    self.assertEqual(conversions[0]["status"], expected_status)
+                    if expected_status == "converted":
                         self.assertEqual(staged["candidate"]["assets"][0]["media_type"], "image/png")
                         self.assertIn(".png", staged["preview"])
                     else:
-                        self.assertEqual(conversions[0]["status"], "placeholder")
                         self.assertIn("Image omitted", staged["preview"])
 
                     fallback = self._stage(
@@ -270,6 +272,29 @@ class ReviewImportTests(unittest.TestCase):
         thread.join(timeout=2)
 
     @staticmethod
+    def _synthetic_tiff_bytes():
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        sips = server._sips_path()
+        if not sips:
+            return b"tiff conversion unavailable"
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source.png")
+            target = os.path.join(tmp, "target.tiff")
+            with open(source, "wb") as handle:
+                handle.write(png)
+            completed = subprocess.run(
+                [sips, "-s", "format", "tiff", source, "--out", target],
+                capture_output=True, text=True, timeout=30, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if completed.returncode != 0:
+                return b"tiff conversion failed"
+            with open(target, "rb") as handle:
+                return handle.read()
+
+    @staticmethod
     def _stage(base, filename, content):
         quoted = urllib.parse.quote(filename, safe="")
         request = urllib.request.Request(
@@ -286,9 +311,7 @@ class ReviewImportTests(unittest.TestCase):
         image_media_type = "image/tiff" if image_extension == "tiff" else "image/png"
         image_payload = image_bytes
         if image_payload is None and image_extension == "tiff":
-            image_payload = base64.b64decode(
-                "SUkqAAgAAAAKAAABBAABAAAAAQAAAAEBBAABAAAAAQAAAAIBAwADAAAAvgAAAAMBAwABAAAABAAAAAYBAwABAAAAAgAAABEBAwABAAAACAAAAAEWBAABAAAAAQAAABcBBAABAAAAAwAAABoBBQABAAAAxAAAABsBBQABAAAAzAAAACgBAwABAAAAAQAAAAAAAAABAAAAAQAAAAEAAAABAAAAAP8A"
-            )
+            image_payload = ReviewImportTests._synthetic_tiff_bytes()
         elif image_payload is None:
             image_payload = base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
