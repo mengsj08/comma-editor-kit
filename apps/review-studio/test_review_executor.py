@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import stat
+import sys
 import tempfile
 import textwrap
 import threading
@@ -62,6 +63,31 @@ class ReviewExecutorTests(unittest.TestCase):
             done = executor.wait("run-state", timeout=2)
             self.assertIn("running", observed)
             self.assertEqual(done["state"], "completed")
+
+    def test_invoke_ai_creates_executor_trace_root_for_clean_data_root(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            fake = _write_executable(os.path.join(tmp, "codex"), f"""#!{sys.executable}
+import json
+import sys
+if "--version" in sys.argv:
+    print("fake-codex 1.0")
+    raise SystemExit(0)
+if sys.argv[1:3] == ["login", "status"]:
+    print("logged in")
+    raise SystemExit(0)
+out = sys.argv[sys.argv.index("--output-last-message") + 1]
+open(out, "w").write('{{"summary":"","assistant_text":"","findings":[]}}')
+print(json.dumps({{"type": "thread.started", "thread_id": "thread-trace-root"}}))
+""")
+            trace_parent = os.path.join(tmp, ".comma-review", "executor-traces")
+            with self._store(tmp), mock.patch.dict(os.environ, {"PATH": tmp}, clear=False):
+                self.assertFalse(os.path.exists(trace_parent))
+                result = server._invoke_ai("codex", "prompt", timeout=2)
+                self.assertEqual(result["returncode"], 0)
+                self.assertTrue(os.path.isdir(trace_parent))
+                self.assertTrue(result["trace_root"].startswith(trace_parent + os.sep))
+                self.assertTrue(os.path.isfile(os.path.join(result["trace_root"], "receipt.json")))
 
     def test_timeout_marks_failed_with_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:

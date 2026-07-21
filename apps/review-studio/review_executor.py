@@ -323,6 +323,7 @@ def terminate_process_tree(process: subprocess.Popen, *, grace_seconds: float = 
 class ReviewExecutor:
     def __init__(self, trace_root: str | Path):
         self.trace_root = Path(trace_root)
+        self.trace_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict] = {}
 

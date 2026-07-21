@@ -1448,7 +1448,9 @@ def _safe_asset_path(doc_rel: str, source: str):
 
 def _atomic_write(path: str, content: str) -> None:
     d = os.path.dirname(path)
-    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d or None, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -2136,6 +2138,7 @@ def _append_event(actor: str, action: str, path: str, summary: str) -> None:
         "path": os.path.relpath(path, ROOT) if path else "",
         "summary": (summary or "")[:200],
     }
+    os.makedirs(os.path.dirname(EVENTS_PATH), exist_ok=True)
     with open(EVENTS_PATH, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -5281,6 +5284,7 @@ def _apply_finding_ops(session, ops):
 
 def _executor_trace_root() -> str:
     root = os.path.join(DATA_ROOT, ".comma-review", "executor-traces")
+    os.makedirs(root, exist_ok=True)
     _REVIEW_EXECUTOR.trace_root = root
     return root
 
