@@ -212,7 +212,8 @@ class ReviewEvidenceTests(unittest.TestCase):
             html = fh.read()
         with open(os.path.join(server.STATIC_ROOT, "app.js"), encoding="utf-8") as fh:
             script = fh.read()
-        self.assertIn('id="btn-evidence"', html)
+        self.assertIn("id: 'evidence'", script)
+        self.assertIn("button.id = 'btn-evidence'", script)
         self.assertIn('id="evidence-drawer"', html)
         self.assertIn('id="conversation-evidence-open"', html)
         self.assertIn("/api/evidence-sources?${params}", script)

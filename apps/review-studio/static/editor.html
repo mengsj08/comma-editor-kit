@@ -12,15 +12,12 @@
       <span class="studio-mark" aria-hidden="true">,</span>
       <span class="studio-name">Comma Review</span>
     </div>
-    <details id="doc-file-menu" class="doc-file-menu">
-      <summary aria-label="当前主稿与导入切换">
+    <div id="doc-file-menu" class="doc-file-menu" aria-label="当前主稿">
+      <div class="doc-file-menu-trigger">
         <span id="doc-name">paper.md</span>
         <span id="doc-meta" class="doc-meta"></span>
-      </summary>
-      <div class="doc-file-menu-panel">
-        <button id="btn-import" type="button" title="从 Word 或 Markdown 创建新的评审主稿">导入/切换主稿</button>
       </div>
-    </details>
+    </div>
     <nav id="doc-primary-actions" class="doc-actions" aria-label="高频操作"></nav>
     <div class="doc-utility-actions">
       <div class="cli-status-wrap">
@@ -46,11 +43,8 @@
     </div>
   </header>
 
-  <aside id="ai-tools-popover" class="ai-tools-popover" aria-label="AI 工具" hidden>
-    <header><strong>AI 工具</strong><small>快捷命令读取当前选区或资料上下文</small></header>
-    <button id="btn-quick-explain" type="button">快速解释</button>
-    <button id="btn-selection-discuss" type="button">选区讨论</button>
-    <button id="btn-evidence" type="button">参考资料 <span id="evidence-count">0</span></button>
+  <aside id="ai-tools-popover" class="ai-tools-popover" aria-label="AI 工具" data-disabled-until="SKL-101" hidden>
+    <header><strong>AI 工具</strong><small>SKL-101 命令模板落地后恢复。</small></header>
   </aside>
 
   <section id="import-modal" class="import-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="import-title" hidden>
@@ -349,7 +343,7 @@
       </div>
       <div id="conversation-empty" class="conversation-empty">
         <strong>先在正文选中一段内容</strong>
-        <p>选择“深入讨论”后，这里会保留引用、多轮追问和分支；只有明确点击“写回批注”才会进入文档。</p>
+        <p>选择“选区讨论”后，这里会保留引用、多轮追问和分支；只有明确点击“写回批注”才会进入文档。</p>
       </div>
       <div id="conversation-tree" class="conversation-tree" hidden></div>
       <section id="conversation-writeback-editor" class="conversation-writeback-editor" hidden>
@@ -376,7 +370,7 @@
     <header><div><span>QUICK EXPLAIN</span><strong>快速解释</strong></div><button id="quick-close" type="button">×</button></header>
     <q id="quick-quote"></q>
     <div id="quick-output" class="quick-output"></div>
-    <footer><button id="quick-deepen" type="button">转入深入讨论 →</button></footer>
+    <footer><button id="quick-deepen" type="button">转入选区讨论 →</button></footer>
   </section>
 
   <script type="module" src="/static/app.js"></script>

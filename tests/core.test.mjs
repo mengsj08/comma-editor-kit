@@ -92,15 +92,17 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
 
 test('review studio AI surfaces keep Slice C placeholders disciplined', () => {
   const html = readFileSync(new URL('../apps/review-studio/static/editor.html', import.meta.url), 'utf8');
+  const script = readFileSync(new URL('../apps/review-studio/static/app.js', import.meta.url), 'utf8');
   const header = html.match(/<header class="doc-header">[\s\S]*?<\/header>/)?.[0] || '';
   const aiTools = html.match(/<aside id="ai-tools-popover"[\s\S]*?<\/aside>/)?.[0] || '';
   const reviewLauncher = html.match(/<div class="review-launcher">[\s\S]*?<div id="review-run-state"/)?.[0] || '';
-  assert.deepEqual([...aiTools.matchAll(/<button id="([^"]+)"/g)].map((match) => match[1]), [
-    'btn-quick-explain',
-    'btn-selection-discuss',
-    'btn-evidence',
-  ]);
-  assert.doesNotMatch(aiTools, /SKL-101|Zotero|Obsidian|改写|生成摘要|新建评审Agent/i);
+  assert.deepEqual([...aiTools.matchAll(/<button id="([^"]+)"/g)].map((match) => match[1]), []);
+  assert.match(aiTools, /data-disabled-until="SKL-101"/);
+  assert.match(script, /id:\s*'import-manuscript'[\s\S]*label:\s*'导入'/);
+  assert.match(script, /id:\s*'evidence'[\s\S]*label:\s*'参考资料'/);
+  assert.doesNotMatch(script, /id:\s*'ai-tools'[\s\S]*label:\s*'AI 工具'/);
+  assert.doesNotMatch(aiTools, /Zotero|Obsidian|改写|生成摘要|新建评审Agent/i);
+  assert.doesNotMatch(header, /btn-import|btn-evidence|btn-quick-explain|btn-selection-discuss/);
   assert.doesNotMatch(header, /Zotero|Obsidian/i);
   assert.deepEqual([...reviewLauncher.matchAll(/name="review-tool" value="([^"]+)"/g)].map((match) => match[1]), [
     'claude',

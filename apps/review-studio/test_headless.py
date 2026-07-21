@@ -315,11 +315,15 @@ def main():
                 innerHeaderCount: root.querySelectorAll('.ce-header').length,
                 statePrimary: state.toolbar.primary.map(action => action.label + (Number.isFinite(action.count) ? ` ${action.count}` : '')),
                 primary: Array.from(document.querySelectorAll('#doc-primary-actions [data-host-toolbar-action]')).map(button => button.textContent.trim()),
+                primaryIds: Array.from(document.querySelectorAll('#doc-primary-actions [data-host-toolbar-action]')).map(button => button.dataset.hostToolbarAction),
                 overflow: Array.from(document.querySelectorAll('#doc-more-editor-actions [data-host-toolbar-action]')).map(button => button.textContent.trim()),
+                overflowIds: Array.from(document.querySelectorAll('#doc-more-editor-actions [data-host-toolbar-action]')).map(button => button.dataset.hostToolbarAction),
                 moreHost: Array.from(document.querySelectorAll('#doc-more-actions > button')).map(button => button.textContent.trim().replace(/\\s+/g, ' ')),
+                aiToolsHidden: document.querySelector('#ai-tools-popover').hidden,
+                aiToolsButtons: document.querySelector('#ai-tools-popover').querySelectorAll('button').length,
                 panelTitle: root.querySelector('[data-el=comment-panel-title]').textContent,
               };
-            }""")
+	            }""")
             page.locator('#doc-primary-actions [data-host-toolbar-action="article-overview"]').click()
             page.wait_for_function("document.querySelector('#overview-drawer').classList.contains('open')")
             results["overview_shell"] = {
@@ -328,6 +332,20 @@ def main():
                 "revision": page.locator("#overview-rev").text_content(),
             }
             page.locator("#overview-close").click()
+
+            page.locator('#doc-primary-actions [data-host-toolbar-action="import-manuscript"]').click()
+            page.wait_for_function("!document.querySelector('#import-modal').hidden")
+            results["import_primary"] = {
+                "modalTitle": page.locator("#import-title").text_content(),
+            }
+            page.locator("#import-close").click()
+
+            page.locator('#doc-primary-actions [data-host-toolbar-action="evidence"]').click()
+            page.wait_for_function("document.querySelector('#evidence-drawer').getAttribute('aria-hidden') === 'false'")
+            results["evidence_primary"] = {
+                "drawerTitle": page.locator("#evidence-drawer h2").text_content(),
+            }
+            page.locator("#evidence-close").click()
 
             page.locator('#doc-primary-actions [data-host-toolbar-action="ai-review"]').click()
             page.wait_for_function("!document.querySelector('#review-preflight-modal').hidden && !document.querySelector('#review-preflight-primary').disabled")
@@ -627,8 +645,11 @@ def main():
     assert results["outline_drawer_jump"] == {"open": False, "focusEl": "outline-toggle"}
     assert results["image_lightbox_opened"] is True
     assert results["host_actions"]["innerHeaderCount"] == 0
-    assert results["host_actions"]["statePrimary"] == ["文章总览", "AI Review", "AI 工具", "批注 0"]
-    assert results["host_actions"]["primary"] == ["文章总览", "AI Review", "AI 工具", "批注 0"]
+    assert results["host_actions"]["statePrimary"] == ["文章总览", "AI Review", "导入", "参考资料", "批注 0"]
+    assert results["host_actions"]["primaryIds"] == ["article-overview", "ai-review", "import-manuscript", "evidence", "comments"]
+    assert results["host_actions"]["primary"] == ["文章总览", "AI Review", "导入", "参考资料", "批注 0"]
+    assert results["host_actions"]["aiToolsHidden"] is True
+    assert results["host_actions"]["aiToolsButtons"] == 0
     assert results["host_actions"]["overflow"] == ["全文批注", "源码编辑", "接受全部暂定", "显示已撤回"]
     more_host = results["host_actions"]["moreHost"]
     assert len(more_host) == 4
@@ -640,6 +661,8 @@ def main():
     assert results["overview_shell"]["title"] == "文章总览"
     assert results["overview_shell"]["claims"] == 3
     assert results["overview_shell"]["revision"] == results["public_component_render"]["rev"]
+    assert results["import_primary"]["modalTitle"] == "导入科研主稿"
+    assert results["evidence_primary"]["drawerTitle"] == "参考资料"
     assert results["review_preflight"]["title"] == "复审预检"
     assert results["review_preflight"]["route"] in {"FIRST PASS", "NO DELTA", "LOCAL DELTA", "GLOBAL RISK"}
     assert results["review_preflight"]["primary"] in {"开始首次评审", "查看最近评审", "增量复审", "全文复审"}

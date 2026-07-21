@@ -195,7 +195,8 @@ function evidenceStatusLabel(source) {
 
 function renderEvidenceSources() {
   const root = $('evidence-list');
-  $('evidence-count').textContent = String(evidenceState.sources.length);
+  const evidenceCount = $('evidence-count');
+  if (evidenceCount) evidenceCount.textContent = String(evidenceState.sources.length);
   const validIds = new Set(evidenceState.sources
     .filter((source) => ['usable', 'partial'].includes(source.extraction_status))
     .map((source) => source.id));
@@ -451,14 +452,15 @@ const adapter = new HttpDocumentAdapter({
 editor.adapter = adapter;
 editor.selectionActions = [
   { id: 'quick-explain', label: '快速解释', title: '临时解释，不保存到讨论记录' },
-  { id: 'discuss', label: '深入讨论', title: '围绕这段原文开始可分支的审阅对话' },
+  { id: 'discuss', label: '选区讨论', title: '围绕这段原文开始可分支的审阅对话' },
 ];
 
 function configureEditorActions() {
   editor.toolbarActions = [
     { id: 'article-overview', label: '文章总览', slot: 'primary', appliesTo: 'document.load' },
     { id: 'ai-review', label: 'AI Review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true }, loading: reviewState.running },
-    { id: 'ai-tools', label: 'AI 工具', slot: 'primary', appliesTo: 'document.load' },
+    { id: 'import-manuscript', label: '导入', title: '从 Word 或 Markdown 创建新的评审主稿', slot: 'primary', appliesTo: 'document.load' },
+    { id: 'evidence', label: '参考资料', title: '管理当前主稿的上下文资料', slot: 'primary', appliesTo: 'document.load' },
     { id: 'comments', label: '批注', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
     { id: 'overall-comment', label: '全文批注', slot: 'overflow', appliesTo: 'comments.create' },
     { id: 'source-edit', label: '源码编辑', slot: 'overflow', appliesTo: { capability: 'document.save', requiresWritable: true } },
@@ -480,7 +482,7 @@ function configureEditorActions() {
 
 configureEditorActions();
 
-const HEADER_PRIMARY_ACTION_IDS = ['article-overview', 'ai-review', 'ai-tools', 'comments'];
+const HEADER_PRIMARY_ACTION_IDS = ['article-overview', 'ai-review', 'import-manuscript', 'evidence', 'comments'];
 
 function visibleHeaderPrimaryIds() {
   const width = window.innerWidth || 1440;
@@ -498,6 +500,8 @@ function actionButton(action, className = '') {
   button.type = 'button';
   button.className = className;
   button.dataset.hostToolbarAction = action.id;
+  if (action.id === 'import-manuscript') button.id = 'btn-import';
+  if (action.id === 'evidence') button.id = 'btn-evidence';
   button.disabled = !action.enabled || action.loading;
   if (action.title) button.title = action.title;
   button.append(document.createTextNode(action.loading ? `${action.label}…` : action.label));
@@ -528,11 +532,13 @@ function renderHostToolbar() {
 }
 
 function closeAiToolsPopover() {
-  $('ai-tools-popover').hidden = true;
+  const popover = $('ai-tools-popover');
+  if (popover) popover.hidden = true;
 }
 
 function openAiToolsPopover() {
-  $('ai-tools-popover').hidden = false;
+  const popover = $('ai-tools-popover');
+  if (popover && popover.querySelector('button')) popover.hidden = false;
 }
 
 function toggleAiToolsPopover() {
@@ -763,7 +769,9 @@ editor.addEventListener('comma-selection-action', (event) => {
 function runEditorToolbarAction(action) {
   if (action === 'article-overview') openOverview();
   if (action === 'ai-review') editor.requestAiReview();
-  if (action === 'ai-tools') toggleAiToolsPopover();
+  if (action === 'import-manuscript') openImportDialog();
+  if (action === 'evidence') openEvidenceDrawer();
+  if (action === 'ai-tools') return;
   if (action === 'overall-comment') editor.openOverallCommentComposer();
   if (action === 'comments') editor.toggleComments();
   if (action === 'source-edit') editor.openSourceEditor();
@@ -2231,10 +2239,8 @@ async function writebackConversationMessage() {
 }
 
 $('btn-review-history').onclick = async () => { openReviewDrawer(); if (!reviewState.active) await loadReviewSessions(true); };
-$('btn-import').onclick = openImportDialog;
-$('btn-evidence').onclick = openEvidenceDrawer;
-$('btn-quick-explain').onclick = quickExplainFromToolbar;
-$('btn-selection-discuss').onclick = discussSelectionFromToolbar;
+$('btn-quick-explain')?.addEventListener('click', quickExplainFromToolbar);
+$('btn-selection-discuss')?.addEventListener('click', discussSelectionFromToolbar);
 $('doc-primary-actions').onclick = (event) => {
   const button = event.target.closest('[data-host-toolbar-action]');
   if (!button || button.disabled) return;

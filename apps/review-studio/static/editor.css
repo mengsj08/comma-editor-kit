@@ -11,17 +11,17 @@ body { margin: 0; overflow-x: clip; font: 15px/1.6 -apple-system, BlinkMacSystem
 .studio-mark { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 50%;
   background: var(--accent-dark); color: #fffaf1; font: 700 18px/1 Georgia, serif; }
 .studio-name { color: var(--accent-dark); font: 600 14px Georgia, "Songti SC", serif; white-space: nowrap; }
-.doc-file-menu { position: relative; min-width: 0; }
-.doc-file-menu > summary { display: flex; min-width: 0; align-items: baseline; gap: 8px; list-style: none; cursor: pointer; }
-.doc-file-menu > summary::-webkit-details-marker, .doc-more-menu > summary::-webkit-details-marker { display: none; }
+.doc-file-menu { min-width: 0; }
+.doc-file-menu-trigger { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
+.doc-more-menu > summary::-webkit-details-marker { display: none; }
 #doc-name { min-width: 0; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .doc-meta { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
-.doc-file-menu-panel, .doc-more-actions { position: absolute; z-index: 95; top: calc(100% + 9px); right: 0; display: grid; min-width: 210px;
+.doc-more-actions { position: absolute; z-index: 95; top: calc(100% + 9px); right: 0; display: grid; min-width: 210px;
   padding: 6px; border: 1px solid #d2cec4; border-radius: 8px; background: #fffefa; box-shadow: 0 18px 54px rgba(42,35,28,.18); }
-.doc-file-menu-panel button, .doc-actions button, .doc-more-actions button, .ai-tools-popover button {
+.doc-actions button, .doc-more-actions button, .ai-tools-popover button {
   border: 1px solid var(--line); background: #fff; padding: 6px 10px; border-radius: 6px; color: #3f4440; cursor: pointer; font-size: 12px;
 }
-.doc-file-menu-panel button:hover, .doc-actions button:hover, .doc-more-actions button:hover, .ai-tools-popover button:hover { border-color: var(--accent); color: var(--accent); }
+.doc-actions button:hover, .doc-more-actions button:hover, .ai-tools-popover button:hover { border-color: var(--accent); color: var(--accent); }
 .doc-actions { display: flex; gap: 6px; align-items: center; min-width: 0; }
 .doc-actions button { min-height: 32px; white-space: nowrap; }
 .doc-actions button[data-host-toolbar-action="ai-review"] { border-color: var(--accent-dark); background: var(--accent-dark); color: #fffaf1; font-weight: 650; }

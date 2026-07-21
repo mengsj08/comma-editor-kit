@@ -148,7 +148,8 @@ class ReviewImportTests(unittest.TestCase):
             html = fh.read()
         with open(os.path.join(server.STATIC_ROOT, "app.js"), encoding="utf-8") as fh:
             script = fh.read()
-        self.assertIn('id="btn-import"', html)
+        self.assertIn("id: 'import-manuscript'", script)
+        self.assertIn("button.id = 'btn-import'", script)
         self.assertIn('id="import-modal"', html)
         self.assertIn('id="import-commit"', html)
         self.assertIn("/api/imports?${params}", script)
