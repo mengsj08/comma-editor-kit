@@ -183,6 +183,31 @@ def main() -> None:
             )
             page.locator("comma-editor").evaluate("el => el.shadowRoot.querySelector('[data-action=save-comment]').click()")
             page.wait_for_function("document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=comment-count]').textContent === '1'")
+            action_projection_state = page.locator("comma-editor").evaluate(
+                """el => {
+                  const state = el.actionState;
+                  const primaryButtons = Array.from(el.shadowRoot.querySelectorAll('[data-el=toolbar-primary] [data-toolbar-action]'));
+                  const overflowButtons = Array.from(el.shadowRoot.querySelectorAll('[data-el=toolbar-overflow-menu] [data-toolbar-action]'));
+                  return {
+                    schemaVersion: state.schemaVersion,
+                    stateCommentCount: state.comments.count,
+                    domCommentCount: Number(el.shadowRoot.querySelector('[data-el=comment-count]').textContent),
+                    primaryIds: state.toolbar.primary.map(action => action.id),
+                    primaryDomIds: primaryButtons.map(button => button.dataset.toolbarAction),
+                    overflowIds: state.toolbar.overflow.map(action => action.id),
+                    overflowDomIds: overflowButtons.map(button => button.dataset.toolbarAction),
+                    disabledMatch: [...primaryButtons, ...overflowButtons].every(button => {
+                      const action = state.toolbar.actions.find(item => item.id === button.dataset.toolbarAction);
+                      return action && button.disabled === (!action.enabled || action.loading);
+                    })
+                  };
+                }"""
+            )
+            assert action_projection_state["schemaVersion"] == "comma-action-state/v1"
+            assert action_projection_state["stateCommentCount"] == action_projection_state["domCommentCount"] == 1
+            assert action_projection_state["primaryIds"] == action_projection_state["primaryDomIds"]
+            assert action_projection_state["overflowIds"] == action_projection_state["overflowDomIds"]
+            assert action_projection_state["disabledMatch"] is True
             anchor_state = page.locator("comma-editor").evaluate(
                 "el => el.shadowRoot.querySelector('.ce-comment-state').textContent"
             )
@@ -319,6 +344,7 @@ def main() -> None:
                 "native_multiblock_state": native_multiblock_state,
                 "native_multiblock_resolution": native_multiblock_resolution,
                 "selection_priority_state": selection_priority_state,
+                "action_projection_state": action_projection_state,
                 "anchor_state": anchor_state,
                 "batch_ready": batch_preview["counts"]["ready"],
                 "batch_missing": batch_preview["counts"]["missing"],

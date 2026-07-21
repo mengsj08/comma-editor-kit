@@ -13,6 +13,7 @@ import {
 } from '../core/models.js';
 import { RevisionConflictError } from '../core/revision.js';
 import { MarkdownRenderer } from './markdown-renderer.js';
+import { buildCommaActionState } from './action-state.js';
 
 const EMPTY_DOCUMENT = { title: 'untitled.md', body: '', rev: '' };
 
@@ -121,6 +122,8 @@ export class CommaEditorElement extends HTMLElement {
     this._commentBatchPreview = null;
     this._loading = false;
     this._connected = false;
+    this._statusState = { kind: '', text: 'Waiting' };
+    this._lastActionStateJson = '';
     this._sectionIndex = [];
     this._activeSectionId = '';
     this._outlineOpen = false;
@@ -185,7 +188,10 @@ export class CommaEditorElement extends HTMLElement {
       label: String(action?.label || action?.id || '').trim(),
       title: String(action?.title || '').trim(),
     })).filter((action) => action.id && action.label);
-    if (this._connected) this._renderSelectionActions();
+    if (this._connected) {
+      this._renderSelectionActions();
+      this._notifyActionState();
+    }
   }
 
   get selectionActions() {
@@ -200,7 +206,11 @@ export class CommaEditorElement extends HTMLElement {
       title: String(action?.title || '').trim(),
       slot: action?.slot === 'overflow' ? 'overflow' : 'primary',
       appliesTo: structuredClone(action?.appliesTo ?? null),
-      count: String(action?.count || '').trim(),
+      count: action?.count === 'comments' ? 'comments' : Number.isFinite(Number(action?.count)) && action?.count !== ''
+        ? Number(action.count)
+        : String(action?.count || '').trim(),
+      enabled: action?.enabled === false ? false : true,
+      loading: Boolean(action?.loading),
     })).filter((action) => action.id && action.label);
     if (this._connected) this._renderToolbarActions();
   }
@@ -230,6 +240,7 @@ export class CommaEditorElement extends HTMLElement {
       this._renderComments();
       this._applyCommentAnchors();
       this._renderMeta();
+      this._notifyActionState();
     }
   }
 
@@ -245,6 +256,18 @@ export class CommaEditorElement extends HTMLElement {
     return structuredClone({ ...this._document, dirty: this._dirty, savePolicy: this.savePolicy });
   }
 
+  get actionState() {
+    return structuredClone(this._buildActionState());
+  }
+
+  subscribeActionState(callback, { emitInitial = true } = {}) {
+    if (typeof callback !== 'function') throw new TypeError('subscribeActionState(callback) requires a function');
+    const listener = (event) => callback(structuredClone(event.detail.state));
+    this.addEventListener('comma-action-state-change', listener);
+    if (emitInitial) callback(this.actionState);
+    return () => this.removeEventListener('comma-action-state-change', listener);
+  }
+
   openSourceEditor() {
     this._enterSource();
   }
@@ -258,12 +281,14 @@ export class CommaEditorElement extends HTMLElement {
     this._commentsOpen = typeof force === 'boolean' ? force : !this._commentsOpen;
     this._el('shell').classList.toggle('comments-open', this._commentsOpen);
     this._el('sidebar').hidden = false;
+    this._notifyActionState();
     return this._commentsOpen;
   }
 
   toggleOutline(force) {
     this._outlineOpen = typeof force === 'boolean' ? force : !this._outlineOpen;
     this._el('shell').classList.toggle('outline-open', this._outlineOpen);
+    this._notifyActionState();
     return this._outlineOpen;
   }
 
@@ -525,6 +550,37 @@ export class CommaEditorElement extends HTMLElement {
 
   _el(name) {
     return this.shadowRoot.querySelector(`[data-el="${name}"]`);
+  }
+
+  _buildActionState() {
+    return buildCommaActionState({
+      document: this._document,
+      dirty: this._dirty,
+      readonly: this.readonly,
+      actor: this.actor,
+      savePolicy: this.savePolicy,
+      capabilities: this._capabilities,
+      toolbarActions: this._toolbarActions,
+      selectionActions: this._selectionActions,
+      selection: this._selection,
+      comments: this._comments,
+      commentsRev: this._commentsRev,
+      showWithdrawnComments: this._showWithdrawnComments,
+      commentsOpen: this._commentsOpen,
+      outlineOpen: this._outlineOpen,
+      sectionIndex: this._sectionIndex,
+      activeSectionId: this._activeSectionId,
+      status: this._statusState,
+    });
+  }
+
+  _notifyActionState() {
+    const state = this._buildActionState();
+    const json = JSON.stringify(state);
+    if (json === this._lastActionStateJson) return state;
+    this._lastActionStateJson = json;
+    if (this._connected) this._emit('comma-action-state-change', { state: structuredClone(state) });
+    return state;
   }
 
   _bind() {
@@ -938,6 +994,7 @@ export class CommaEditorElement extends HTMLElement {
     if (!captured) {
       this._selection = null;
       bar.hidden = true;
+      this._notifyActionState();
       return;
     }
     const blockElement = captured.startElement.closest('.ce-block');
@@ -962,6 +1019,7 @@ export class CommaEditorElement extends HTMLElement {
     bar.style.left = `${Math.min(globalThis.innerWidth - 24, Math.max(24, rect.left + rect.width / 2))}px`;
     bar.style.top = `${Math.max(44, rect.top)}px`;
     bar.hidden = false;
+    this._notifyActionState();
   }
 
   _openCommentComposer(selection) {
@@ -1203,6 +1261,7 @@ export class CommaEditorElement extends HTMLElement {
     this._el('shell').classList.remove('outline-open');
     block.scrollIntoView({ behavior: 'smooth', block: 'start' });
     this._renderOutline();
+    this._notifyActionState();
     return true;
   }
 
@@ -1397,42 +1456,42 @@ export class CommaEditorElement extends HTMLElement {
 
   _renderToolbarActions() {
     if (!this._connected || !this._el('toolbar-primary')) return;
-    const available = this._toolbarActions.filter((action) => this._toolbarActionAvailable(action));
-    const createButton = (action, overflow = false) => {
+    const state = this._notifyActionState();
+    const createButton = (actionState, overflow = false) => {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = overflow ? '' : 'ce-button';
       button.dataset.action = 'toolbar-action';
-      button.dataset.toolbarAction = action.id;
-      button.append(document.createTextNode(action.label));
-      if (action.count === 'comments') {
-        const count = this._comments.filter((comment) => isCommentVisible(comment, {
-          showWithdrawn: this._showWithdrawnComments,
-        })).length;
+      button.dataset.toolbarAction = actionState.id;
+      button.append(document.createTextNode(actionState.loading ? `${actionState.label}…` : actionState.label));
+      if (Number.isFinite(actionState.count)) {
         const badge = document.createElement('span');
         badge.className = 'ce-count';
-        badge.dataset.el = 'comment-count';
-        badge.dataset.commentCount = '';
-        badge.textContent = String(count);
+        if (actionState.countSource === 'comments') {
+          badge.dataset.el = 'comment-count';
+          badge.dataset.commentCount = '';
+        }
+        badge.textContent = String(actionState.count);
         button.append(' ', badge);
       }
-      if (action.title) button.title = action.title;
-      const rules = typeof action.appliesTo === 'object' ? action.appliesTo : {};
-      button.disabled = Boolean(rules.requiresCleanDocument && this._dirty);
+      if (actionState.title) button.title = actionState.title;
+      button.disabled = !actionState.enabled || actionState.loading;
+      if (actionState.loading) button.setAttribute('aria-busy', 'true');
       return button;
     };
-    const primary = available.filter((action) => action.slot === 'primary');
-    const overflow = available.filter((action) => action.slot === 'overflow');
+    const primary = state.toolbar.primary;
+    const overflow = state.toolbar.overflow;
     this._el('toolbar-primary').replaceChildren(...primary.map((action) => createButton(action)));
     this._el('toolbar-overflow-menu').replaceChildren(...overflow.map((action) => createButton(action, true)));
     this._el('toolbar-overflow').hidden = !overflow.length;
-    const commentCountAction = available.find((action) => action.count === 'comments');
+    const commentCountAction = state.toolbar.actions.find((action) => action.countSource === 'comments');
     this._el('comment-panel-title').textContent = commentCountAction?.label || 'Comments';
   }
 
   _runToolbarAction(actionId) {
     const action = this._toolbarActions.find((candidate) => candidate.id === actionId);
-    if (!action || !this._toolbarActionAvailable(action)) return;
+    const actionState = this._buildActionState().toolbar.actions.find((candidate) => candidate.id === actionId);
+    if (!action || !actionState?.enabled || actionState.loading) return;
     this._el('toolbar-overflow').removeAttribute('open');
     this._emit('comma-toolbar-action', {
       actionId: action.id,
@@ -1527,9 +1586,11 @@ export class CommaEditorElement extends HTMLElement {
 
   _setStatus(kind, text) {
     if (!this._connected) return;
+    this._statusState = { kind: kind || '', text: text || '' };
     const status = this._el('status');
     status.className = `ce-status ${kind || ''}`;
     this._el('status-text').textContent = text || '';
+    this._notifyActionState();
   }
 
   _emit(name, detail) {

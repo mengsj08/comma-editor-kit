@@ -22,6 +22,7 @@ const conversationState = {
 };
 const importState = { record: null, busy: false };
 const evidenceState = { sources: [], selectedIds: new Set(), loading: false, uploading: false };
+let editorActionState = null;
 let runtimeCapabilities = null;
 let runtimeLoading = null;
 let toastTimer = null;
@@ -456,7 +457,7 @@ editor.selectionActions = [
 function configureEditorActions() {
   editor.toolbarActions = [
     { id: 'article-overview', label: '文章总览', slot: 'primary', appliesTo: 'document.load' },
-    { id: 'ai-review', label: 'AI Review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true } },
+    { id: 'ai-review', label: 'AI Review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true }, loading: reviewState.running },
     { id: 'overall-comment', label: '全文批注', slot: 'primary', appliesTo: 'comments.create' },
     { id: 'comments', label: '批注', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
     { id: 'source-edit', label: '源码编辑', slot: 'overflow', appliesTo: { capability: 'document.save', requiresWritable: true } },
@@ -483,6 +484,18 @@ function syncDocumentMeta(documentState) {
   $('doc-name').textContent = documentState?.title || DOC_PATH;
   $('doc-meta').textContent = `${body.split('\n').length} 行 · rev ${String(documentState?.rev || '').slice(0, 16)}`;
 }
+
+function syncDocumentMetaFromActionState(state) {
+  if (!state?.document) return;
+  editorActionState = state;
+  const saveLabel = state.status?.kind === 'saving'
+    ? '保存中'
+    : state.document.dirty ? '未保存' : state.status?.kind === 'error' ? '需处理' : '已保存';
+  $('doc-name').textContent = state.document.title || DOC_PATH;
+  $('doc-meta').textContent = `${state.document.lineCount} 行 · ${saveLabel} · rev ${state.document.shortRev || '—'}`;
+}
+
+editor.subscribeActionState(syncDocumentMetaFromActionState);
 
 function summaryListHtml(rows, empty = '未提供') {
   const values = Array.isArray(rows) ? rows.filter(Boolean) : [];
@@ -1105,6 +1118,7 @@ function setReviewRunning(running, message = '', isError = false) {
   stateElement.hidden = !message;
   stateElement.textContent = message;
   stateElement.classList.toggle('error', Boolean(isError));
+  configureEditorActions();
   syncRuntimeControls();
 }
 

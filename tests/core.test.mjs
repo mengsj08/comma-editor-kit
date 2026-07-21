@@ -12,6 +12,7 @@ import { replaceBlock, segmentMarkdown } from '../src/core/blocks.js';
 import { previewCommentBatch } from '../src/core/comment-batch.js';
 import { buildSectionIndex, sectionForBlock } from '../src/core/section-index.js';
 import { stabilizeImageLabelBackticks } from '../src/element/markdown-renderer.js';
+import { buildCommaActionState } from '../src/element/action-state.js';
 import { revisionOf } from '../src/core/revision.js';
 import {
   isCommentVisible,
@@ -231,6 +232,40 @@ test('adapter capabilities expose asset resolution only when implemented', () =>
   };
   assert.equal(resolveAdapterCapabilities(adapter).assets.resolve, true);
   assert.equal(resolveAdapterCapabilities({ capabilities: { assets: { resolve: true } } }).assets.resolve, false);
+});
+
+test('comma action state projects toolbar availability and comment counts from one source', () => {
+  const state = buildCommaActionState({
+    document: { title: 'paper.md', body: '# Title\n\nBody.', rev: 'sha256-abcdef123456' },
+    dirty: true,
+    readonly: false,
+    savePolicy: 'immediate',
+    capabilities: {
+      document: { load: true, save: true },
+      comments: { list: true, create: true, update: false },
+    },
+    toolbarActions: [
+      { id: 'overview', label: '文章总览', slot: 'primary', appliesTo: 'document.load' },
+      { id: 'ai-review', label: 'AI Review', slot: 'primary', appliesTo: { capability: 'document.load', requiresCleanDocument: true }, loading: true },
+      { id: 'comments', label: '批注', slot: 'primary', appliesTo: 'comments.list', count: 'comments' },
+      { id: 'accept-provisional', label: '接受暂定', slot: 'overflow', appliesTo: 'comments.update' },
+    ],
+    comments: [
+      normalizeComment({ id: 'c1', content: 'Visible.' }),
+      normalizeComment({ id: 'c2', content: 'Hidden.', lifecycle_state: 'withdrawn' }),
+    ],
+    commentsRev: 'comments-2',
+    status: { kind: 'saving', text: 'Saving' },
+  });
+  assert.equal(state.schemaVersion, 'comma-action-state/v1');
+  assert.equal(state.document.shortRev, 'abcdef12');
+  assert.equal(state.document.lineCount, 3);
+  assert.equal(state.comments.count, 1);
+  assert.deepEqual(state.toolbar.primary.map((action) => action.id), ['overview', 'ai-review', 'comments']);
+  assert.equal(state.toolbar.primary.find((action) => action.id === 'comments').count, 1);
+  assert.equal(state.toolbar.primary.find((action) => action.id === 'ai-review').enabled, false);
+  assert.equal(state.toolbar.primary.find((action) => action.id === 'ai-review').reason, 'dirty');
+  assert.equal(state.toolbar.actions.some((action) => action.id === 'accept-provisional'), false);
 });
 
 test('comment lifecycle capabilities require the declared adapter methods', () => {
