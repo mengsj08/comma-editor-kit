@@ -41,6 +41,60 @@ class ReviewExecutorTests(unittest.TestCase):
                 mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")):
             yield
 
+    def test_windows_platform_command_wraps_cmd_and_bat_launchers(self):
+        with mock.patch.object(review_executor, "_is_windows", return_value=True), \
+                mock.patch.dict(review_executor.os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}):
+            command = review_executor.platform_command(
+                [r"C:\Users\june\AppData\Roaming\npm\codex.cmd", "exec", "prompt"])
+        self.assertEqual(
+            command,
+            [
+                r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c",
+                r"C:\Users\june\AppData\Roaming\npm\codex.cmd", "exec", "prompt",
+            ],
+        )
+
+    def test_windows_invoke_provider_uses_process_group_and_taskkill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            metadata = {
+                "run_id": "run-windows",
+                "trace_root": os.path.join(tmp, "trace-windows"),
+                "queued_at": "2026-07-21T10:00:00",
+                "adapter": {"id": "legacy"},
+                "profile": {"id": "legacy"},
+                "skill": {"id": "test"},
+                "provider": {"tool": "codex"},
+                "input_manifest": {"document": {"path": "paper.md"}},
+                "prompt_template_hash": "sha256:template",
+                "prompt_hash": "sha256:prompt",
+            }
+            process = mock.Mock()
+            process.pid = 4321
+            process.returncode = 0
+            process.communicate.return_value = (
+                json.dumps({"type": "thread.started", "thread_id": "thread-windows"}) + "\n",
+                "",
+            )
+            process.poll.return_value = None
+            process.wait.return_value = None
+            version_result = mock.Mock(stdout="fake-codex 1.0\n", stderr="", returncode=0)
+            creation_flag = 0x00000200
+            with mock.patch.object(review_executor, "_is_windows", return_value=True), \
+                    mock.patch.object(review_executor.subprocess, "CREATE_NEW_PROCESS_GROUP", creation_flag, create=True), \
+                    mock.patch.object(review_executor.subprocess, "Popen", return_value=process) as popen, \
+                    mock.patch.object(review_executor.subprocess, "run", return_value=version_result) as run, \
+                    mock.patch.dict(review_executor.os.environ, {"COMSPEC": "cmd.exe"}):
+                result = review_executor.invoke_provider(
+                    "codex", "prompt", timeout=2, schema=None,
+                    executable=r"C:\Tools\codex.cmd", cwd=tmp, metadata=metadata)
+                review_executor.terminate_process_tree(process)
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(popen.call_args.args[0][:5], ["cmd.exe", "/d", "/s", "/c", r"C:\Tools\codex.cmd"])
+            self.assertEqual(popen.call_args.kwargs["creationflags"], creation_flag)
+            self.assertNotIn("start_new_session", popen.call_args.kwargs)
+            taskkill_args = run.call_args_list[-1].args[0]
+            self.assertEqual(taskkill_args, ["taskkill", "/PID", "4321", "/T", "/F"])
+
     def test_state_machine_reaches_running_and_completed(self):
         with tempfile.TemporaryDirectory() as tmp:
             executor = review_executor.ReviewExecutor(os.path.join(tmp, "traces"))

@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -78,6 +79,10 @@ def _task_context():
     return getattr(_TASK_CONTEXT, "value", None)
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def provider_command(tool: str, executable: str, prompt: str, schema: dict | None = None,
                      output_path: str = "", schema_path: str = "") -> list[str]:
     if tool == "claude":
@@ -139,14 +144,34 @@ def provider_command(tool: str, executable: str, prompt: str, schema: dict | Non
     raise ValueError(f"unknown provider tool: {tool}")
 
 
-def _provider_version(executable: str) -> str:
+def platform_command(command: list[str]) -> list[str]:
+    """Adapt Windows launcher scripts while avoiding an interactive shell."""
+    if not _is_windows() or not command:
+        return command
+    executable = command[0]
+    suffix = Path(executable).suffix.lower()
+    if suffix in {".cmd", ".bat"}:
+        return [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", *command]
+    if suffix not in {".exe", ".com"}:
+        try:
+            with open(executable, "rb") as handle:
+                first_line = handle.readline(512).decode("utf-8", errors="ignore").lower()
+            if first_line.startswith("#!") and "python" in first_line:
+                return [sys.executable, *command]
+        except OSError:
+            pass
+    return command
+
+
+def _provider_version(executable: str, env: dict | None = None) -> str:
     try:
         completed = subprocess.run(
-            [executable, "--version"],
+            platform_command([executable, "--version"]),
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
+            env=env,
         )
         return (completed.stdout or completed.stderr or "unknown").strip()[:240] or "unknown"
     except (OSError, subprocess.TimeoutExpired):
@@ -204,7 +229,8 @@ def _default_receipt(metadata: dict, *, status: str, started_at: str = "",
 
 
 def invoke_provider(tool: str, prompt: str, *, timeout: int, schema: dict | None,
-                    executable: str, cwd: str, metadata: dict) -> dict:
+                    executable: str, cwd: str, metadata: dict,
+                    env: dict | None = None) -> dict:
     started_at = now()
     start = time.monotonic()
     trace_root = Path(metadata["trace_root"])
@@ -230,21 +256,27 @@ def invoke_provider(tool: str, prompt: str, *, timeout: int, schema: dict | None
         "tool": tool,
         "transport": f"{tool}_cli",
         "executable": executable,
-        "version": _provider_version(executable),
+        "version": _provider_version(executable, env=env),
         "command_shape": command[:3],
     }
 
     context = _task_context()
     process = None
     try:
+        popen_options = (
+            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
+            if _is_windows()
+            else {"start_new_session": True}
+        )
         process = subprocess.Popen(
-            command,
+            platform_command(command),
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True,
-            start_new_session=True,
+            env=env,
+            **popen_options,
         )
         if context:
             context["executor"].register_process(context["task_id"], process)
@@ -315,6 +347,28 @@ def invoke_provider(tool: str, prompt: str, *, timeout: int, schema: dict | None
 
 def terminate_process_tree(process: subprocess.Popen, *, grace_seconds: float = 1.0) -> None:
     if process.poll() is not None:
+        return
+    if _is_windows():
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(2.0, grace_seconds + 1.0),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
