@@ -79,7 +79,7 @@ def _task_context():
 
 
 def provider_command(tool: str, executable: str, prompt: str, schema: dict | None = None,
-                     output_path: str = "") -> list[str]:
+                     output_path: str = "", schema_path: str = "") -> list[str]:
     if tool == "claude":
         command = [
             executable,
@@ -131,7 +131,9 @@ def provider_command(tool: str, executable: str, prompt: str, schema: dict | Non
         if output_path:
             command.extend(["--output-last-message", output_path])
         if schema:
-            command.extend(["--output-schema", json.dumps(schema, ensure_ascii=False)])
+            if not schema_path:
+                raise ValueError("codex output schema requires a schema file path")
+            command.extend(["--output-schema", schema_path])
         command.append(prompt)
         return command
     raise ValueError(f"unknown provider tool: {tool}")
@@ -156,6 +158,7 @@ def _default_receipt(metadata: dict, *, status: str, started_at: str = "",
                      returncode: int | None = None, error: str = "") -> dict:
     trace = metadata.get("trace") or {}
     result_path = metadata.get("result_path") or ""
+    schema_path = metadata.get("schema_path") or ""
     events_path = trace.get("events_path") or ""
     stderr_path = trace.get("stderr_path") or ""
     return {
@@ -184,6 +187,11 @@ def _default_receipt(metadata: dict, *, status: str, started_at: str = "",
             "sha256": sha256_path(result_path),
             "bytes": file_size(result_path),
         },
+        "output_schema": {
+            "path": schema_path,
+            "sha256": sha256_path(schema_path),
+            "bytes": file_size(schema_path),
+        },
         "trace": {
             "events_path": events_path,
             "events_sha256": sha256_path(events_path),
@@ -202,14 +210,21 @@ def invoke_provider(tool: str, prompt: str, *, timeout: int, schema: dict | None
     trace_root = Path(metadata["trace_root"])
     trace_root.mkdir(parents=True, exist_ok=True)
     result_path = trace_root / "result.txt"
+    schema_path = trace_root / "output_schema.json" if schema and tool == "codex" else None
     events_path = trace_root / "provider_events.jsonl"
     stderr_path = trace_root / "provider_stderr.log"
+    if schema_path is not None:
+        write_json(schema_path, schema)
     metadata = {
         **metadata,
         "result_path": str(result_path),
+        "schema_path": str(schema_path) if schema_path is not None else "",
         "trace": {"events_path": str(events_path), "stderr_path": str(stderr_path)},
     }
-    command = provider_command(tool, executable, prompt, schema=schema, output_path=str(result_path))
+    command = provider_command(
+        tool, executable, prompt, schema=schema, output_path=str(result_path),
+        schema_path=str(schema_path) if schema_path is not None else "",
+    )
     metadata["provider"] = {
         **(metadata.get("provider") or {}),
         "tool": tool,

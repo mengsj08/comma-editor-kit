@@ -198,6 +198,45 @@ print(json.dumps({"type": "response.web_search_call.completed"}))
             self.assertEqual(ctx.exception.receipt["status"], "failed")
             self.assertTrue(ctx.exception.receipt["web_policy"]["web_search_used"])
 
+    def test_codex_schema_is_passed_as_trace_file_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _write_executable(os.path.join(tmp, "fake-codex"), """#!/usr/bin/env python3
+import json, os, sys
+if "--version" in sys.argv:
+    print("fake-codex 1.0")
+    raise SystemExit(0)
+schema = sys.argv[sys.argv.index("--output-schema") + 1]
+if schema.lstrip().startswith("{") or not os.path.isfile(schema):
+    print(f"schema was not a file path: {schema}", file=sys.stderr)
+    raise SystemExit(2)
+with open(schema, encoding="utf-8") as handle:
+    loaded = json.load(handle)
+out = sys.argv[sys.argv.index("--output-last-message") + 1]
+open(out, "w", encoding="utf-8").write(json.dumps({"schema_type": loaded["type"]}))
+print(json.dumps({"type": "thread.started", "thread_id": "thread-schema-file"}))
+""")
+            metadata = {
+                "run_id": "run-schema",
+                "trace_root": os.path.join(tmp, "trace-schema"),
+                "queued_at": "2026-07-21T10:00:00",
+                "adapter": {"id": "legacy"},
+                "profile": {"id": "legacy"},
+                "skill": {"id": "test"},
+                "provider": {"tool": "codex"},
+                "input_manifest": {"document": {"path": "paper.md"}},
+                "prompt_template_hash": "sha256:template",
+                "prompt_hash": "sha256:prompt",
+            }
+            result = review_executor.invoke_provider(
+                "codex", "prompt", timeout=2,
+                schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                executable=fake, cwd=tmp, metadata=metadata)
+            receipt = result["receipt"]
+            self.assertEqual(receipt["status"], "completed")
+            self.assertTrue(receipt["output_schema"]["path"].endswith("output_schema.json"))
+            self.assertTrue(receipt["output_schema"]["sha256"].startswith("sha256:"))
+            self.assertEqual(json.loads(result["output"])["schema_type"], "object")
+
     def test_receipt_contains_workbench_parity_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake = _write_executable(os.path.join(tmp, "fake-codex"), """#!/usr/bin/env python3

@@ -3,6 +3,8 @@
 import json
 import io
 import os
+import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -13,6 +15,14 @@ import zipfile
 from unittest import mock
 
 import server
+
+
+def _write_executable(path, source):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(source)
+    mode = os.stat(path).st_mode
+    os.chmod(path, mode | stat.S_IXUSR)
+    return path
 
 
 class ReviewEvidenceTests(unittest.TestCase):
@@ -204,6 +214,95 @@ class ReviewEvidenceTests(unittest.TestCase):
                     self.assertEqual(len(summarized["summary"]["summary_3_6"]), 3)
                     self.assertEqual(summarized["source"]["summaries"][0]["tool"], "codex")
                     self.assertIn("[PDF page 2]", captured_prompts[2])
+                finally:
+                    self._stop_server(httpd, thread)
+
+    def test_evidence_summary_codex_schema_uses_file_path_from_http_entrypoint(self):
+        with tempfile.TemporaryDirectory() as raw_tmp, tempfile.TemporaryDirectory() as raw_bin:
+            tmp = os.path.realpath(raw_tmp)
+            fake_codex = _write_executable(os.path.join(raw_bin, "codex"), f"""#!{sys.executable}
+import json
+import os
+import sys
+if "--version" in sys.argv:
+    print("fake-codex 1.0")
+    raise SystemExit(0)
+if sys.argv[1:3] == ["login", "status"]:
+    raise SystemExit(0)
+schema = sys.argv[sys.argv.index("--output-schema") + 1]
+if schema.lstrip().startswith("{{") or not os.path.isfile(schema):
+    print(f"Failed to read output schema file {{schema}}: No such file or directory (os error 2)", file=sys.stderr)
+    raise SystemExit(1)
+with open(schema, encoding="utf-8") as handle:
+    loaded = json.load(handle)
+if "summary_3_6" not in loaded.get("properties", {{}}):
+    raise SystemExit(3)
+out = sys.argv[sys.argv.index("--output-last-message") + 1]
+open(out, "w", encoding="utf-8").write(json.dumps({{
+    "summary_3_6": ["证据摘要一 [p.1]", "证据摘要二 [p.1]", "证据摘要三 [p.1]"]
+}}, ensure_ascii=False))
+print(json.dumps({{"type": "thread.started", "thread_id": "thread-schema-file"}}))
+""")
+            with open(os.path.join(tmp, "paper.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Manuscript\n\nThe canonical Markdown remains separate.\n")
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")), \
+                    mock.patch.dict(os.environ, {"COMMA_REVIEW_CODEX_BIN": fake_codex}, clear=False):
+                doc = os.path.join(tmp, "paper.md")
+                evidence_id = "evidence-1234567890abcdef"
+                root = server._evidence_root(doc, evidence_id)
+                os.makedirs(root, exist_ok=True)
+                server._atomic_write_json(os.path.join(root, "pages.json"), [
+                    {"page": 1, "text": "Controlled extracted PDF evidence. " * 90},
+                ])
+                source_bytes = b"%PDF-1.4\nsynthetic local pdf\n"
+                server._atomic_write_bytes(os.path.join(root, "source.pdf"), source_bytes)
+                server._atomic_write_json(server._evidence_record_path(doc, evidence_id), {
+                    "schema_version": "comma-review-evidence-source/v1",
+                    "id": evidence_id,
+                    "doc_path": "paper.md",
+                    "attached_rev": server._rev("# Manuscript\n\nThe canonical Markdown remains separate.\n"),
+                    "kind": "pdf",
+                    "state": "active",
+                    "access_level": "uploaded_pdf",
+                    "extraction_status": "usable",
+                    "full_text_confirmed": True,
+                    "source": {
+                        "filename": "context.pdf",
+                        "media_type": "application/pdf",
+                        "byte_count": len(source_bytes),
+                        "sha256": server._sha256_bytes(source_bytes),
+                        "archive_path": os.path.relpath(os.path.join(root, "source.pdf"), tmp),
+                    },
+                    "extractor": {"id": "fixture", "version": "1", "components": {}},
+                    "metadata": {},
+                    "metrics": {
+                        "page_count": 1,
+                        "total_non_whitespace_chars": 2700,
+                        "text_usable_pages": 1,
+                        "text_usable_ratio": 1.0,
+                        "page_metrics": [{"page": 1, "non_whitespace_chars": 2700, "text_usable": True}],
+                    },
+                    "warnings": [],
+                    "created_at": "2026-07-21T10:00:00",
+                    "updated_at": "2026-07-21T10:00:00",
+                    "record_version": 1,
+                })
+                httpd, thread, base = self._start_server()
+                try:
+                    summarized = self._json_request(
+                        base + f"/api/evidence-sources/{evidence_id}/summary", "POST",
+                        {"path": "paper.md", "tool": "codex", "confirmed_data_transfer": True},
+                    )
+                    self.assertEqual(len(summarized["summary"]["summary_3_6"]), 3)
+                    trace_root = os.path.join(tmp, ".comma-review", "executor-traces")
+                    schema_files = []
+                    for dirpath, _dirnames, filenames in os.walk(trace_root):
+                        schema_files.extend(
+                            os.path.join(dirpath, name)
+                            for name in filenames if name == "output_schema.json"
+                        )
+                    self.assertEqual(len(schema_files), 1)
                 finally:
                     self._stop_server(httpd, thread)
 
