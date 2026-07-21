@@ -248,6 +248,11 @@ class ReviewApiTests(unittest.TestCase):
 
     def test_runtime_capabilities_report_provider_readiness(self):
         statuses = {
+            "bigapple": {
+                "id": "bigapple", "label": "BigApple Gateway", "available": False,
+                "ready": False, "auth_state": "not_running", "version": "",
+                "detail": "gateway fixture", "gateway_url": "",
+            },
             "codex": {
                 "id": "codex", "label": "Codex CLI", "available": True,
                 "ready": True, "auth_state": "ready", "version": "codex-cli fixture",
@@ -269,6 +274,8 @@ class ReviewApiTests(unittest.TestCase):
                 )
                 self.assertEqual(result["schema_version"], "comma-review-runtime-capabilities/v1")
                 tools = {item["id"]: item for item in result["tools"]}
+                self.assertFalse(tools["bigapple"]["capabilities"]["conversation"])
+                self.assertEqual(tools["bigapple"]["auth_state"], "not_running")
                 self.assertTrue(tools["codex"]["capabilities"]["conversation"])
                 self.assertFalse(tools["claude"]["capabilities"]["quick_explain"])
                 self.assertEqual(tools["claude"]["auth_state"], "not_authenticated")

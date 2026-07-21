@@ -28,7 +28,7 @@ let editorActionState = null;
 let runtimeCapabilities = null;
 let runtimeLoading = null;
 let toastTimer = null;
-const CLI_UNAVAILABLE_GUIDE = '未检测到可用 CLI，请安装并登录 Codex 或 Claude CLI';
+const CLI_UNAVAILABLE_GUIDE = '未检测到可用 AI provider，请启动并登录 BigApple 桌面应用，或安装并登录 Codex/Claude CLI';
 
 function esc(value) {
   return String(value ?? '')
@@ -408,7 +408,7 @@ async function loadRuntimeCapabilities() {
   if (runtimeLoading) return runtimeLoading;
   const badge = $('cli-status');
   badge.className = 'cli-status checking';
-  badge.querySelector('span').textContent = 'CLI · 检测中';
+  badge.querySelector('span').textContent = 'AI · 检测中';
   runtimeLoading = (async () => {
     try {
       const { response, json } = await apiJson('/api/runtime/capabilities', { cache: 'no-store' });
@@ -416,16 +416,16 @@ async function loadRuntimeCapabilities() {
       runtimeCapabilities = json;
       const readyCount = json.tools.filter((item) => item.ready).length;
       badge.className = `cli-status ${readyCount === json.tools.length ? 'ready' : readyCount ? 'partial' : 'offline'}`;
-      badge.querySelector('span').textContent = `CLI · ${readyCount} 可用`;
-      badge.title = readyCount ? `${readyCount} 个本机 CLI 已登录` : CLI_UNAVAILABLE_GUIDE;
+      badge.querySelector('span').textContent = `AI · ${readyCount} 可用`;
+      badge.title = readyCount ? `${readyCount} 个 AI provider 已就绪` : CLI_UNAVAILABLE_GUIDE;
       renderRuntimePopover(false);
       syncRuntimeControls();
       return json;
     } catch (error) {
       runtimeCapabilities = null;
       badge.className = 'cli-status offline';
-      badge.querySelector('span').textContent = 'CLI · 未连接';
-      badge.title = error.message || 'CLI 状态检测失败';
+      badge.querySelector('span').textContent = 'AI · 未连接';
+      badge.title = error.message || 'AI provider 状态检测失败';
       renderRuntimePopover(true);
       syncRuntimeControls();
       return null;

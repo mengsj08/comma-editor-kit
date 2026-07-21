@@ -19,8 +19,8 @@ Endpoint set (minimum needed by the reused frontend, see SPIKE_REPORT.md):
   POST/PATCH/DELETE /api/comments/<id>/replies[/<reply_id>]
   GET /api/comments/<id>/events
                                -> versioned lifecycle + append-only audit
-  POST /api/ai-run            -> optional: shell `claude`|`codex` (tool param);
-                                 codex uses conservative --sandbox read-only;
+  POST /api/ai-run            -> optional: shell `bigapple`|`claude`|`codex`;
+                                 Codex-compatible providers use read-only sandboxing;
                                  --yolo/--dangerously-* flags are forbidden here.
   GET/POST /api/review-sessions
   GET      /api/review-sessions/<id>
@@ -95,9 +95,11 @@ from review_executor import (
     ACTIVE_STATES as EXECUTOR_ACTIVE_STATES,
     ReviewExecutor,
     invoke_provider,
+    platform_command,
     sha256_path as executor_sha256_path,
     sha256_text as executor_sha256_text,
 )
+from bigapple_gateway import gateway_status
 from review_agents import (
     ACADEMIC_ADAPTER_ID,
     default_registry,
@@ -133,10 +135,11 @@ PORT = int(os.environ.get("COMMA_REVIEW_PORT", os.environ.get("SPIKE_PORT", "889
 # rewrite workbench we never bypass the sandbox: codex runs `--sandbox
 # read-only`, and any `--yolo` / `--dangerously-*` style flag is forbidden here.
 AI_TOOLS = {
+    "bigapple": {"label": "BigApple Gateway", "transport": "gateway"},
     "claude": {"label": "Claude CLI", "auth_args": ("auth", "status")},
     "codex": {"label": "Codex CLI", "auth_args": ("login", "status")},
 }
-CLI_UNAVAILABLE_GUIDE = "未检测到可用 CLI，请安装并登录 Codex 或 Claude CLI"
+CLI_UNAVAILABLE_GUIDE = "未检测到可用 AI provider，请启动并登录 BigApple 桌面应用，或安装并登录 Codex/Claude CLI"
 _CLI_FALLBACK_DIRS = (
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -236,23 +239,30 @@ def _cli_search_path(extra_dir=""):
 def _resolve_cli_path(tool):
     if tool not in AI_TOOLS:
         return None
+    if AI_TOOLS[tool].get("transport") == "gateway":
+        return gateway_status().get("gateway_url") or None
     override = (os.environ.get(f"COMMA_REVIEW_{tool.upper()}_BIN") or "").strip()
     if override:
         override = os.path.realpath(os.path.expanduser(override))
-        if os.path.isfile(override) and os.access(override, os.X_OK):
+        if os.path.isfile(override) and (_is_windows() or os.access(override, os.X_OK)):
             return override
         return None
     return shutil.which(tool, path=_cli_search_path())
 
 
-def _cli_env(binpath=""):
+def _cli_env(binpath="", tool=""):
     env = os.environ.copy()
     env["PATH"] = _cli_search_path(os.path.dirname(binpath) if binpath else "")
+    if tool == "bigapple":
+        env["CODEX_HOME"] = os.path.realpath(os.path.expanduser("~/.bigapple/codex-home"))
     return env
 
 
 def _cli_status(tool):
     config = AI_TOOLS[tool]
+    if config.get("transport") == "gateway":
+        status = gateway_status()
+        return {"id": tool, "label": config["label"], **status}
     executable = _resolve_cli_path(tool)
     if not executable:
         return {
@@ -263,17 +273,17 @@ def _cli_status(tool):
     version = ""
     try:
         completed = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=8,
-            check=False, env=_cli_env(executable), stdin=subprocess.DEVNULL,
+            platform_command([executable, "--version"]), capture_output=True, text=True, timeout=8,
+            check=False, env=_cli_env(executable, tool), stdin=subprocess.DEVNULL,
         )
         version = ((completed.stdout or completed.stderr) or "").strip().splitlines()[0]
     except Exception:
         version = "已安装，版本读取失败"
     try:
         auth = subprocess.run(
-            [executable, *config["auth_args"]], stdout=subprocess.DEVNULL,
+            platform_command([executable, *config["auth_args"]]), stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=8, check=False,
-            env=_cli_env(executable), stdin=subprocess.DEVNULL,
+            env=_cli_env(executable, tool), stdin=subprocess.DEVNULL,
         )
         auth_state = "ready" if auth.returncode == 0 else "not_authenticated"
     except Exception:
@@ -299,7 +309,7 @@ def _record_observability_warning(name: str, message: str) -> int:
 
 
 def runtime_capability_manifest():
-    tools = [_cli_status(tool) for tool in ("codex", "claude")]
+    tools = [_cli_status(tool) for tool in ("bigapple", "codex", "claude")]
     return {
         "ok": True,
         "schema_version": "comma-review-runtime-capabilities/v1",
@@ -327,6 +337,8 @@ def _require_cli(tool):
         reason = "已安装但尚未登录"
     elif status["auth_state"] == "check_failed":
         reason = "登录状态检测失败"
+    elif status["auth_state"] == "not_running":
+        reason = "桌面应用或 Gateway 未运行"
     else:
         reason = "未安装或不在可检测路径中"
     raise CliUnavailableError(f"{CLI_UNAVAILABLE_GUIDE}（{status['label']} {reason}）")
@@ -1528,7 +1540,7 @@ def _summarize_evidence_source(doc: str, evidence_id: str, tool: str,
     if not confirmed_data_transfer:
         raise ValueError("explicit confirmation is required before PDF text enters a CLI/provider")
     if tool not in AI_TOOLS:
-        raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
     _require_cli(tool)
     record = _load_evidence_source(doc, evidence_id)
     if record.get("extraction_status") not in {"usable", "partial"}:
@@ -1840,7 +1852,7 @@ def _generate_document_summary(doc: str, *, base_rev: str, tool: str,
             code="document_rev_conflict", rev=current_rev,
         )
     if tool not in AI_TOOLS:
-        raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
     _require_cli(tool)
     with _MUTATION_LOCK:
         existing = [
@@ -5563,7 +5575,7 @@ def _executor_trace_root() -> str:
 
 def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None, metadata=None):
     if tool not in AI_TOOLS:
-        raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
     binpath = _require_cli(tool)
     metadata = metadata if isinstance(metadata, dict) else {}
     trace_root = metadata.get("trace_root") or tempfile.mkdtemp(
@@ -5576,6 +5588,7 @@ def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None, metadata=None):
             schema=schema,
             executable=binpath,
             cwd=DATA_ROOT,
+            env=_cli_env(binpath, tool),
             metadata={
                 "run_id": metadata.get("run_id") or "",
                 "trace_root": trace_root,
@@ -5587,7 +5600,7 @@ def _invoke_ai(tool: str, prompt: str, timeout=300, schema=None, metadata=None):
                 "input_manifest": metadata.get("input_manifest") or {},
                 "prompt_template_hash": metadata.get("prompt_template_hash") or "",
                 "prompt_hash": metadata.get("prompt_hash") or executor_sha256_text(prompt),
-                "sandbox": {"mode": "read-only", "ephemeral": tool == "codex"},
+                "sandbox": {"mode": "read-only", "ephemeral": tool in {"bigapple", "codex"}},
                 "web_policy": {"mode": "disabled", "web_search_used": False},
                 "recovery": {"recovered": False, "reason": ""},
             },
@@ -5732,7 +5745,7 @@ def _review_run_receipt_metadata(session, run, *, tool: str, prompt: str,
             "sha256": rubric_source.get("sha256") or executor_sha256_path(__file__),
             "mode": mode,
         },
-        "provider": {"tool": tool, "transport": f"{tool}_cli"},
+        "provider": {"tool": tool, "transport": AI_TOOLS.get(tool, {}).get("transport") or f"{tool}_cli"},
         "input_manifest": _review_run_input_manifest(session, run, prompt=prompt),
         "prompt_template_hash": _review_prompt_template_hash(mode),
         "prompt_hash": executor_sha256_text(prompt),
@@ -6986,7 +6999,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "message": "document changed since it was opened; reload before review"}, 409)
         tool = _clean_text(payload.get("tool") or "claude", 16).lower()
         if tool not in AI_TOOLS:
-            raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+            raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
         _require_cli(tool)
         rubric = _clean_text(payload.get("rubric") or "scientific peer review and source-check", 2000)
         instruction = _clean_text(payload.get("instruction"), 3000)
@@ -7096,7 +7109,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("mode must be initial, incremental, or forced-full")
         tool = str(payload.get("tool") or "codex").strip().lower()
         if tool not in AI_TOOLS:
-            raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+            raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
         _require_cli(tool)
         agent_identity = _review_agent_identity_from_payload(payload)
         rubric = _clean_text(payload.get("rubric") or "scientific peer review and source-check", 2000)
@@ -7381,7 +7394,7 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             raise ValueError("prompt required")
         if tool not in AI_TOOLS:
-            raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+            raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
         _require_cli(tool)
         full = prompt
         if selection:
@@ -7409,7 +7422,7 @@ class Handler(BaseHTTPRequestHandler):
             }, 409)
         tool = _clean_text(payload.get("tool") or "codex", 16).lower()
         if tool not in AI_TOOLS:
-            raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+            raise ValueError(f"unknown tool '{tool}' (want bigapple|claude|codex)")
         _require_cli(tool)
         message = _clean_text(payload.get("message"), 6000)
         if not message:
@@ -7724,7 +7737,7 @@ def doctor_report():
         "tools": tools,
         "ai_ready": any_ai_ready,
         "ai_message": (
-            "至少一个 AI CLI 已就绪。"
+            "至少一个 AI provider 已就绪。"
             if any_ai_ready else
             "AI 功能不可用，编辑/导入/批注仍可用"
         ),
@@ -7784,7 +7797,8 @@ def main(argv=None):
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     detected = {item["id"]: item for item in runtime_capability_manifest()["tools"]}
     print(f"[comma-review] serving http://{HOST}:{PORT}  "
-          f"(claude={'ready' if detected['claude']['ready'] else detected['claude']['auth_state']} "
+          f"(bigapple={'ready' if detected['bigapple']['ready'] else detected['bigapple']['auth_state']} "
+          f"claude={'ready' if detected['claude']['ready'] else detected['claude']['auth_state']} "
           f"codex={'ready' if detected['codex']['ready'] else detected['codex']['auth_state']})  "
           f"journal={reconciliation['pending']}/{reconciliation['finalized']}/"
           f"{reconciliation['inconsistent']} "

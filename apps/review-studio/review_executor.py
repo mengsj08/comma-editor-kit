@@ -164,6 +164,8 @@ def platform_command(command: list[str]) -> list[str]:
 
 
 def _provider_version(executable: str, env: dict | None = None) -> str:
+    if executable.startswith("http://") or executable.startswith("https://"):
+        return "BigApple Desktop Gateway"
     try:
         completed = subprocess.run(
             platform_command([executable, "--version"]),
@@ -247,6 +249,13 @@ def invoke_provider(tool: str, prompt: str, *, timeout: int, schema: dict | None
         "schema_path": str(schema_path) if schema_path is not None else "",
         "trace": {"events_path": str(events_path), "stderr_path": str(stderr_path)},
     }
+    if tool == "bigapple":
+        return _invoke_bigapple_gateway(
+            prompt, timeout=timeout, schema=schema, executable=executable,
+            cwd=cwd, metadata=metadata, trace_root=trace_root,
+            result_path=result_path, events_path=events_path,
+            stderr_path=stderr_path, started_at=started_at, start=start,
+        )
     command = provider_command(
         tool, executable, prompt, schema=schema, output_path=str(result_path),
         schema_path=str(schema_path) if schema_path is not None else "",
@@ -339,6 +348,89 @@ def invoke_provider(tool: str, prompt: str, *, timeout: int, schema: dict | None
         "tool": tool,
         "output": output,
         "returncode": returncode,
+        "elapsed_ms": elapsed_ms,
+        "receipt": receipt,
+        "trace_root": str(trace_root),
+    }
+
+
+def _invoke_bigapple_gateway(prompt: str, *, timeout: int, schema: dict | None,
+                             executable: str, cwd: str, metadata: dict,
+                             trace_root: Path, result_path: Path,
+                             events_path: Path, stderr_path: Path,
+                             started_at: str, start: float) -> dict:
+    from bigapple_gateway import BigAppleGatewayError, submit_task
+
+    metadata["provider"] = {
+        **(metadata.get("provider") or {}),
+        "tool": "bigapple",
+        "transport": "bigapple_gateway",
+        "gateway_url": executable,
+        "version": _provider_version(executable),
+        "command_shape": ["bigapple_gateway", "/api/chat"],
+    }
+    try:
+        gateway_result = submit_task(
+            prompt, working_directory=cwd, timeout=timeout, schema=schema,
+            base_url=executable)
+        output = gateway_result["output"]
+        result_path.write_text(output, encoding="utf-8")
+        trace_events = [
+            {
+                "type": "bigapple.gateway.task",
+                "gateway_url": gateway_result.get("gateway_url") or executable,
+                "session_id": gateway_result.get("session_id") or "",
+                "request_id": gateway_result.get("request_id") or "",
+                "provider_id": gateway_result.get("provider_id") or "",
+                "model": gateway_result.get("model") or "",
+            },
+            *list(gateway_result.get("events") or []),
+        ]
+        events_path.write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in trace_events),
+            encoding="utf-8",
+        )
+        stderr_path.write_text("", encoding="utf-8")
+    except BigAppleGatewayError as exc:
+        stderr_path.write_text(str(exc), encoding="utf-8")
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        receipt = _default_receipt(
+            metadata, status="failed", started_at=started_at, completed_at=now(),
+            elapsed_ms=elapsed_ms, returncode=None, error=str(exc)[:2000],
+        )
+        write_json(trace_root / "receipt.json", receipt)
+        raise ProviderExecutionError(receipt["error"], receipt=receipt) from exc
+
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    receipt = _default_receipt(
+        {
+            **metadata,
+            "provider": {
+                **metadata["provider"],
+                "gateway_url": gateway_result.get("gateway_url") or executable,
+                "session_id": gateway_result.get("session_id") or "",
+                "request_id": gateway_result.get("request_id") or "",
+                "provider_id": gateway_result.get("provider_id") or "",
+                "model": gateway_result.get("model") or "",
+            },
+            "web_policy": {
+                **(metadata.get("web_policy") or {}),
+                "mode": "disabled",
+                "web_search_used": False,
+            },
+        },
+        status="completed",
+        started_at=started_at,
+        completed_at=now(),
+        elapsed_ms=elapsed_ms,
+        returncode=0,
+        error="",
+    )
+    write_json(trace_root / "receipt.json", receipt)
+    return {
+        "tool": "bigapple",
+        "output": output,
+        "returncode": 0,
         "elapsed_ms": elapsed_ms,
         "receipt": receipt,
         "trace_root": str(trace_root),

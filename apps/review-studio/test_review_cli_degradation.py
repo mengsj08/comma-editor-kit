@@ -15,7 +15,7 @@ import review_agents
 import server
 
 
-GUIDE = "未检测到可用 CLI，请安装并登录 Codex 或 Claude CLI"
+GUIDE = "未检测到可用 AI provider，请启动并登录 BigApple 桌面应用，或安装并登录 Codex/Claude CLI"
 PROJECT_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
@@ -30,6 +30,14 @@ class ReviewCliDegradationTests(unittest.TestCase):
             mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")),
             mock.patch.object(server, "_REVIEW_EXECUTOR", executor),
             mock.patch.object(server, "_ACTIVE_REVIEW_RUNS", {}),
+            mock.patch.object(server, "gateway_status", return_value={
+                "available": False,
+                "ready": False,
+                "auth_state": "not_running",
+                "version": "",
+                "detail": "未发现正在运行的 BigApple Desktop Gateway",
+                "gateway_url": "",
+            }),
             mock.patch.dict(os.environ, {
                 "COMMA_REVIEW_CODEX_BIN": os.path.join(tmp, "missing-codex"),
                 "COMMA_REVIEW_CLAUDE_BIN": os.path.join(tmp, "missing-claude"),
@@ -170,7 +178,7 @@ class ReviewCliDegradationTests(unittest.TestCase):
         with open(os.path.join(server.STATIC_ROOT, "editor.css"), encoding="utf-8") as handle:
             css = handle.read()
         self.assertIn(GUIDE, script)
-        self.assertIn("CLI · ${readyCount} 可用", script)
+        self.assertIn("AI · ${readyCount} 可用", script)
         self.assertIn("cli-status.offline", css)
 
 
