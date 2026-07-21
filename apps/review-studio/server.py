@@ -1601,6 +1601,114 @@ def _review_meta_root() -> str:
     return os.path.join(DATA_ROOT, ".comma-review")
 
 
+def _document_open_ledger_path() -> str:
+    return os.path.join(_review_meta_root(), "document-opened.json")
+
+
+def _now_precise() -> str:
+    now = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
+
+
+def _record_document_opened(doc: str) -> None:
+    ledger = _read_json_file(_document_open_ledger_path(), {})
+    if not isinstance(ledger, dict):
+        ledger = {}
+    ledger[_doc_rel(doc)] = _now_precise()
+    _atomic_write_json(_document_open_ledger_path(), ledger)
+
+
+def _registered_document_paths() -> set[str]:
+    root = os.path.join(_review_meta_root(), "versions")
+    registered = set()
+    if not os.path.isdir(root):
+        return registered
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if "index.json" not in filenames:
+            continue
+        index = _read_json_file(os.path.join(dirpath, "index.json"), {})
+        doc_path = str((index or {}).get("doc_path") or "").strip()
+        if doc_path and doc_path.endswith(".md"):
+            registered.add(doc_path.replace("\\", "/"))
+    return registered
+
+
+_DOCUMENT_INTERNAL_DIRS = {
+    ".comma-review", "assets", "conversations", "review-sessions",
+    "imports", "executor-traces", "__pycache__",
+}
+
+
+def _document_modified_at(doc: str) -> str:
+    mtimes = [os.path.getmtime(doc)] if os.path.isfile(doc) else []
+    for candidate in (_comments_path(doc), _summary_ledger_path(doc)):
+        if os.path.isfile(candidate):
+            mtimes.append(os.path.getmtime(candidate))
+    root, index_path, _ = _version_paths(doc)
+    if os.path.isfile(index_path):
+        mtimes.append(os.path.getmtime(index_path))
+    elif os.path.isdir(root):
+        mtimes.append(os.path.getmtime(root))
+    if not mtimes:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(max(mtimes)))
+
+
+def _document_menu_item(doc: str, opened: dict) -> dict:
+    rel = _doc_rel(doc)
+    comments = _load_comments(doc)
+    versions = _load_version_index(doc).get("versions") or []
+    modified_at = _document_modified_at(doc)
+    last_opened_at = str(opened.get(rel) or "")
+    last_activity_at = max([item for item in (last_opened_at, modified_at) if item] or [""])
+    return {
+        "path": rel,
+        "display_name": os.path.basename(rel),
+        "version_count": len(versions),
+        "comment_count": len([
+            row for row in comments
+            if row.get("lifecycle_state") != "withdrawn"
+        ]),
+        "last_opened_at": last_opened_at,
+        "modified_at": modified_at,
+        "last_opened_or_modified_at": last_activity_at,
+    }
+
+
+def document_list(current_path: str = "") -> dict:
+    registered = _registered_document_paths()
+    opened = _read_json_file(_document_open_ledger_path(), {})
+    if not isinstance(opened, dict):
+        opened = {}
+    docs = []
+    data_root_real = os.path.realpath(DATA_ROOT)
+    for dirpath, dirnames, filenames in os.walk(DATA_ROOT):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in _DOCUMENT_INTERNAL_DIRS and not name.startswith(".")
+        ]
+        rel_dir = os.path.relpath(dirpath, DATA_ROOT)
+        if rel_dir == ".":
+            rel_dir = ""
+        if rel_dir.split(os.sep, 1)[0] in _DOCUMENT_INTERNAL_DIRS:
+            continue
+        for filename in filenames:
+            if not filename.endswith(".md"):
+                continue
+            path = os.path.realpath(os.path.join(dirpath, filename))
+            if not path.startswith(data_root_real + os.sep):
+                continue
+            rel = _doc_rel(path)
+            if "/" in rel and rel not in registered:
+                continue
+            docs.append(_document_menu_item(path, opened))
+    docs.sort(key=lambda row: (row.get("last_opened_or_modified_at") or "", row["path"]), reverse=True)
+    current = _doc_rel(_safe_doc_path(current_path)) if current_path else ""
+    for row in docs:
+        row["current"] = bool(current and row["path"] == current)
+    return {"ok": True, "schema_version": "comma-review-documents/v1", "current_path": current, "documents": docs}
+
+
 def _doc_store_key(doc: str) -> str:
     return hashlib.sha256(_doc_rel(doc).encode("utf-8")).hexdigest()[:16]
 
@@ -5822,12 +5930,15 @@ class Handler(BaseHTTPRequestHandler):
                 if content_type == "image/svg+xml":
                     headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'"
                 return self._send_file(asset, content_type, headers)
+            if route == "/api/documents":
+                return self._send_json(document_list((qs.get("path") or [""])[0]))
             if route == "/api/doc":
                 doc = _safe_doc_path((qs.get("path") or [""])[0])
                 if not os.path.exists(doc):
                     return self._send_json({"ok": False, "error": "doc not found"}, 404)
                 with _MUTATION_LOCK:
                     body, current_rev, _ = _ensure_current_snapshot(doc)
+                    _record_document_opened(doc)
                 return self._send_json({
                     "ok": True, "path": os.path.relpath(doc, DATA_ROOT),
                     "body": body, "rev": current_rev,

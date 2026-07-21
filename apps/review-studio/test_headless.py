@@ -24,6 +24,9 @@ REVIEW_ROOT = os.path.join(ROOT, "data", "review-sessions")
 SLICE_C_SESSION_ID = "review-c0ffee000001"
 SLICE_C_RUN_ID = "run-c0ffee000001"
 SLICE_C_SESSION = os.path.join(REVIEW_ROOT, SLICE_C_SESSION_ID + ".json")
+DOC_MENU_SWITCH_DOC = os.path.join(ROOT, "data", "headless-switch.md")
+DOC_MENU_NESTED_DOC = os.path.join(ROOT, "data", "headless-nested", "registered.md")
+DOC_MENU_VERSION_INDEX = os.path.join(ROOT, "data", ".comma-review", "versions", "headless-doc-menu", "index.json")
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z9xkAAAAASUVORK5CYII="
 )
@@ -209,6 +212,18 @@ def main():
         handle.write(scientific_fixture)
     with open(ASSET, "wb") as handle:
         handle.write(PNG_1X1)
+    os.makedirs(os.path.dirname(DOC_MENU_NESTED_DOC), exist_ok=True)
+    os.makedirs(os.path.dirname(DOC_MENU_VERSION_INDEX), exist_ok=True)
+    with open(DOC_MENU_SWITCH_DOC, "w", encoding="utf-8") as handle:
+        handle.write("# Headless switch target\n\nThis document exists only for menu switching.\n")
+    with open(DOC_MENU_NESTED_DOC, "w", encoding="utf-8") as handle:
+        handle.write("# Registered nested target\n\nThis subdirectory manuscript is registered.\n")
+    with open(DOC_MENU_VERSION_INDEX, "w", encoding="utf-8") as handle:
+        json.dump({
+            "schema_version": "comma-review-versions/v1",
+            "doc_path": "headless-nested/registered.md",
+            "versions": [{"id": "version-headlessmenu", "rev": "fixture", "kind": "baseline"}],
+        }, handle)
     results = {}
     errors = []
     try:
@@ -324,6 +339,30 @@ def main():
                 panelTitle: root.querySelector('[data-el=comment-panel-title]').textContent,
               };
 	            }""")
+            menu_page = browser.new_page(viewport={"width": 1400, "height": 900})
+            menu_page.goto(URL, wait_until="load")
+            menu_page.locator("comma-editor").locator(".ce-block").first.wait_for(timeout=15000)
+            menu_page.locator("#doc-file-menu summary").click()
+            menu_page.wait_for_function("document.querySelectorAll('#doc-file-list [data-doc-path]').length >= 3")
+            results["document_menu"] = menu_page.evaluate("""() => {
+              const rows = Array.from(document.querySelectorAll('#doc-file-list [data-doc-path]'));
+              const current = rows.find(row => row.getAttribute('aria-current') === 'page');
+              return {
+                open: document.querySelector('#doc-file-menu').open,
+                paths: rows.map(row => row.dataset.docPath),
+                currentPath: current?.dataset.docPath || '',
+                currentCheck: current?.querySelector('.doc-file-check')?.textContent || '',
+              };
+            }""")
+            menu_page.locator('#doc-file-list [data-doc-path="headless-switch.md"]').click()
+            menu_page.wait_for_url("**/?doc=headless-switch.md")
+            menu_page.locator("comma-editor").locator(".ce-block").first.wait_for(timeout=15000)
+            results["document_menu_switch"] = menu_page.evaluate("""() => ({
+              search: location.search,
+              docName: document.querySelector('#doc-name').textContent,
+              editorTitle: document.querySelector('comma-editor').documentState.title,
+            })""")
+            menu_page.close()
             page.locator('#doc-primary-actions [data-host-toolbar-action="article-overview"]').click()
             page.wait_for_function("document.querySelector('#overview-drawer').classList.contains('open')")
             results["overview_shell"] = {
@@ -601,6 +640,15 @@ def main():
             handle.write(original)
         if os.path.exists(ASSET):
             os.remove(ASSET)
+        for path in (DOC_MENU_SWITCH_DOC, DOC_MENU_NESTED_DOC, DOC_MENU_VERSION_INDEX):
+            if os.path.exists(path):
+                os.remove(path)
+        for path in (
+            os.path.dirname(DOC_MENU_NESTED_DOC),
+            os.path.dirname(DOC_MENU_VERSION_INDEX),
+        ):
+            if os.path.isdir(path) and not os.listdir(path):
+                os.rmdir(path)
         reset_comments()
         if original_slice_c_session is None:
             if os.path.exists(SLICE_C_SESSION):
@@ -658,6 +706,16 @@ def main():
     assert more_host[2].startswith("讨论记录 ")
     assert more_host[3] == "评审记录"
     assert results["host_actions"]["panelTitle"] == "批注"
+    assert results["document_menu"]["open"] is True
+    assert results["document_menu"]["currentPath"] == "paper.md"
+    assert results["document_menu"]["currentCheck"] == "✓"
+    assert "headless-switch.md" in results["document_menu"]["paths"]
+    assert "headless-nested/registered.md" in results["document_menu"]["paths"]
+    assert results["document_menu_switch"] == {
+        "search": "?doc=headless-switch.md",
+        "docName": "headless-switch.md",
+        "editorTitle": "headless-switch.md",
+    }
     assert results["overview_shell"]["title"] == "文章总览"
     assert results["overview_shell"]["claims"] == 3
     assert results["overview_shell"]["revision"] == results["public_component_render"]["rev"]

@@ -12,12 +12,16 @@
       <span class="studio-mark" aria-hidden="true">,</span>
       <span class="studio-name">Comma Review</span>
     </div>
-    <div id="doc-file-menu" class="doc-file-menu" aria-label="当前主稿">
-      <div class="doc-file-menu-trigger">
+    <details id="doc-file-menu" class="doc-file-menu" aria-label="切换主稿">
+      <summary class="doc-file-menu-trigger" aria-label="打开主稿菜单">
         <span id="doc-name">paper.md</span>
         <span id="doc-meta" class="doc-meta"></span>
-      </div>
-    </div>
+      </summary>
+      <aside id="doc-file-popover" class="doc-file-popover" aria-label="主稿列表">
+        <header><strong>切换主稿</strong><small>原文稿、批注、版本和讨论会保留在各自文稿下。</small></header>
+        <div id="doc-file-list" class="doc-file-list"><p>正在读取主稿…</p></div>
+      </aside>
+    </details>
     <nav id="doc-primary-actions" class="doc-actions" aria-label="高频操作"></nav>
     <div class="doc-utility-actions">
       <div class="cli-status-wrap">

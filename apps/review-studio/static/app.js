@@ -8,6 +8,7 @@ import {
 registerCommaEditor();
 
 const DOC_PATH = new URLSearchParams(location.search).get('doc') || 'paper.md';
+const DOCUMENT_SWITCH_TOAST_KEY = 'comma-review:document-switch-toast';
 const $ = (id) => document.getElementById(id);
 const editor = $('comma-editor');
 const reviewState = {
@@ -21,6 +22,7 @@ const conversationState = {
   composerMode: 'root', parentMessageId: '', writebackMessageId: '', quickSource: null,
 };
 const importState = { record: null, busy: false };
+const documentMenuState = { documents: [], loading: false };
 const evidenceState = { sources: [], selectedIds: new Set(), loading: false, uploading: false };
 let editorActionState = null;
 let runtimeCapabilities = null;
@@ -33,7 +35,7 @@ function esc(value) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-function toast(message, isError = false) {
+function toast(message, isError = false, duration = 2400) {
   let element = $('toast');
   if (!element) {
     element = document.createElement('div');
@@ -45,7 +47,7 @@ function toast(message, isError = false) {
   element.classList.toggle('err', Boolean(isError));
   element.classList.add('on');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => element.classList.remove('on'), 2400);
+  toastTimer = setTimeout(() => element.classList.remove('on'), duration);
 }
 
 async function apiJson(url, init = {}) {
@@ -179,9 +181,15 @@ async function commitStagedImport() {
   }
   importState.record = json.import;
   $('import-stage-status').textContent = 'COMMITTED';
-  $('import-progress').textContent = json.reused ? '该导入已创建过，正在打开原目标。' : '已创建主稿和首个版本，正在打开。';
+  const previousDoc = DOC_PATH;
+  const targetPath = json.import.target.path;
+  const switchMessage = `已切换到新主稿；原文稿〈${previousDoc}〉及其批注、版本完好，可从文件名菜单随时切回。`;
+  $('import-progress').textContent = json.reused
+    ? `该导入已创建过，正在打开原目标。${switchMessage}`
+    : `已创建主稿和首个版本，正在打开。${switchMessage}`;
+  sessionStorage.setItem(DOCUMENT_SWITCH_TOAST_KEY, switchMessage);
   const next = new URL(location.href);
-  next.searchParams.set('doc', json.import.target.path);
+  next.searchParams.set('doc', targetPath);
   location.assign(next.toString());
 }
 
@@ -561,6 +569,71 @@ function discussSelectionFromToolbar() {
   if (!sourceQuote?.quoteText) return toast('请先在正文中选择一段原文，再开始选区讨论。', true);
   closeAiToolsPopover();
   return openConversationForQuote(sourceQuote);
+}
+
+function formatDocumentTime(value) {
+  if (!value) return '未记录';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function renderDocumentMenu() {
+  const root = $('doc-file-list');
+  if (!root) return;
+  if (documentMenuState.loading) {
+    root.innerHTML = '<p>正在读取主稿…</p>';
+    return;
+  }
+  if (!documentMenuState.documents.length) {
+    root.innerHTML = '<p>没有找到可切换的 Markdown 主稿。</p>';
+    return;
+  }
+  root.innerHTML = documentMenuState.documents.map((doc) => `
+    <button class="doc-file-item ${doc.current ? 'current' : ''}" type="button" data-doc-path="${esc(doc.path)}" ${doc.current ? 'aria-current="page"' : ''}>
+      <span class="doc-file-check" aria-hidden="true">${doc.current ? '✓' : ''}</span>
+      <span class="doc-file-title">${esc(doc.display_name || doc.path)}</span>
+      <span class="doc-file-stats">${Number(doc.version_count || 0)} 版 · ${Number(doc.comment_count || 0)} 批注 · ${esc(formatDocumentTime(doc.last_opened_or_modified_at))}</span>
+      <span class="doc-file-path">${esc(doc.path)}</span>
+    </button>
+  `).join('');
+}
+
+async function loadDocumentMenu() {
+  if (documentMenuState.loading) return;
+  documentMenuState.loading = true;
+  renderDocumentMenu();
+  const params = new URLSearchParams({ path: DOC_PATH });
+  const { response, json } = await apiJson(`/api/documents?${params}`, { cache: 'no-store' });
+  documentMenuState.loading = false;
+  if (!response.ok || !json.ok) {
+    $('doc-file-list').innerHTML = `<p>${esc(json.error || '主稿列表读取失败')}</p>`;
+    return;
+  }
+  documentMenuState.documents = Array.isArray(json.documents) ? json.documents : [];
+  renderDocumentMenu();
+}
+
+async function switchDocument(path) {
+  if (!path || path === DOC_PATH) {
+    $('doc-file-menu').open = false;
+    return;
+  }
+  try {
+    await editor.save();
+  } catch (error) {
+    return toast(error.message || '切换前保存失败；请先处理当前文稿状态。', true, 5200);
+  }
+  const next = new URL(location.href);
+  next.searchParams.set('doc', path);
+  location.assign(next.toString());
+}
+
+function consumePendingDocumentToast() {
+  const message = sessionStorage.getItem(DOCUMENT_SWITCH_TOAST_KEY);
+  if (!message) return;
+  sessionStorage.removeItem(DOCUMENT_SWITCH_TOAST_KEY);
+  toast(message, false, 8200);
 }
 
 function syncDocumentMeta(documentState) {
@@ -2285,6 +2358,14 @@ $('import-another').onclick = async () => {
 };
 $('import-file').onchange = () => stageImportFile($('import-file').files?.[0]);
 $('import-commit').onclick = commitStagedImport;
+$('doc-file-menu').addEventListener('toggle', () => {
+  if ($('doc-file-menu').open) loadDocumentMenu();
+});
+$('doc-file-list').onclick = (event) => {
+  const item = event.target.closest('[data-doc-path]');
+  if (!item) return;
+  switchDocument(item.dataset.docPath || '');
+};
 $('overview-close').onclick = closeOverview;
 $('overview-scrim').onclick = closeOverview;
 $('overview-muted-list').onclick = (event) => {
@@ -2418,6 +2499,7 @@ $('cli-redetect').onclick = async () => {
 document.addEventListener('click', (event) => {
   if (!event.target.closest('.cli-status-wrap')) closeRuntimePopover();
   if (!event.target.closest('#ai-tools-popover') && !event.target.closest('[data-host-toolbar-action="ai-tools"]')) closeAiToolsPopover();
+  if (!event.target.closest('#doc-file-menu')) $('doc-file-menu').open = false;
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !$('import-modal').hidden) closeImportDialog();
@@ -2442,6 +2524,7 @@ window.__COMMA_REVIEW__ = {
   openOverview, closeOverview, renderReviewPreflight, closeReviewPreflight,
   overviewState, loadDocumentSummary, generateDocumentSummary, acceptAllProvisionalComments,
   importState, openImportDialog, closeImportDialog, stageImportFile, commitStagedImport,
+  documentMenuState, loadDocumentMenu, switchDocument,
   evidenceState, openEvidenceDrawer, closeEvidenceDrawer, loadEvidenceSources, attachEvidenceFile,
   reviewItemAttentionState, groupReviewItems, reviewAttentionSummary,
   muteFindingLineage, restoreFindingLineage, confirmCandidateResolved, restoreCandidateResolved,
@@ -2449,6 +2532,8 @@ window.__COMMA_REVIEW__ = {
 window.__SPIKE__ = window.__COMMA_REVIEW__;
 
 loadRuntimeCapabilities();
+consumePendingDocumentToast();
+loadDocumentMenu();
 loadVersions();
 loadReviewSessions(false);
 loadConversationSessions(false);

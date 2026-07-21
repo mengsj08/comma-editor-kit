@@ -15,6 +15,56 @@ import server
 
 
 class ReviewApiTests(unittest.TestCase):
+    def test_documents_api_lists_manuscripts_and_excludes_internal_markdown(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            os.makedirs(os.path.join(tmp, "registered"))
+            os.makedirs(os.path.join(tmp, "scratch"))
+            os.makedirs(os.path.join(tmp, ".comma-review", "imports", "import-aaaaaaaaaaaaaaaa"))
+            with open(os.path.join(tmp, "paper.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Paper\n\nTop-level manuscript.\n")
+            with open(os.path.join(tmp, "second.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Second\n")
+            with open(os.path.join(tmp, "registered", "nested.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Nested\n")
+            with open(os.path.join(tmp, "scratch", "note.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Scratch note\n")
+            with open(os.path.join(tmp, ".comma-review", "imports", "import-aaaaaaaaaaaaaaaa", "candidate.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Internal candidate\n")
+            with mock.patch.object(server, "DATA_ROOT", tmp), \
+                    mock.patch.object(server, "EVENTS_PATH", os.path.join(tmp, "events.jsonl")):
+                server._snapshot_version(
+                    os.path.join(tmp, "registered", "nested.md"),
+                    "# Nested\n", kind="baseline", label="registered fixture")
+                comments = [server._comment_record({
+                    "kind": "anchored", "quote_text": "Top-level manuscript.",
+                    "content": "Check source.", "author": "June",
+                })]
+                server._save_comments(os.path.join(tmp, "paper.md"), comments)
+                httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                try:
+                    self._request(base + "/api/doc?path=registered/nested.md")
+                    listing = self._request(base + "/api/documents?path=paper.md")
+                    self.assertEqual(listing["schema_version"], "comma-review-documents/v1")
+                    paths = [item["path"] for item in listing["documents"]]
+                    self.assertEqual(set(paths), {"paper.md", "second.md", "registered/nested.md"})
+                    self.assertNotIn("scratch/note.md", paths)
+                    self.assertFalse(any(path.startswith(".comma-review/") for path in paths))
+                    by_path = {item["path"]: item for item in listing["documents"]}
+                    self.assertTrue(by_path["paper.md"]["current"])
+                    self.assertEqual(by_path["registered/nested.md"]["display_name"], "nested.md")
+                    self.assertEqual(by_path["paper.md"]["comment_count"], 1)
+                    self.assertEqual(by_path["registered/nested.md"]["version_count"], 1)
+                    self.assertTrue(by_path["registered/nested.md"]["last_opened_at"])
+                    self.assertEqual(paths[0], "registered/nested.md")
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=2)
+
     def test_versions_conflict_recovery_and_portable_exports(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = os.path.realpath(raw_tmp)
@@ -120,6 +170,11 @@ class ReviewApiTests(unittest.TestCase):
         self.assertIn("文章总览", script)
         self.assertIn("源码编辑", script)
         self.assertIn("全文批注", script)
+        self.assertIn('id="doc-file-menu"', html)
+        self.assertIn('id="doc-file-list"', html)
+        self.assertIn("/api/documents", script)
+        self.assertIn("已切换到新主稿；原文稿", script)
+        self.assertIn("switchDocument", script)
         self.assertIn('id="overview-drawer"', html)
         self.assertIn("未读取图片或图表像素", html)
         self.assertIn("未获取或全文核验所引用的文献", html)
