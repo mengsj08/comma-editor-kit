@@ -62,6 +62,9 @@ export function buildCommaActionState(context = {}) {
     .map((action) => buildToolbarActionState(action, context));
   const visibleToolbar = toolbar.filter((action) => action.visible);
   const rev = String(documentState.rev || '');
+  const sectionIndex = Array.isArray(context.sectionIndex) ? context.sectionIndex : [];
+  const activeSectionId = String(context.activeSectionId || '');
+  const activeSection = sectionIndex.find((section) => section.id === activeSectionId);
   return {
     schemaVersion: COMMA_ACTION_STATE_SCHEMA,
     document: {
@@ -87,8 +90,13 @@ export function buildCommaActionState(context = {}) {
     },
     outline: {
       open: Boolean(context.outlineOpen),
-      sectionCount: Array.isArray(context.sectionIndex) ? context.sectionIndex.length : 0,
-      activeSectionId: String(context.activeSectionId || ''),
+      mode: ['expanded', 'collapsed', 'drawer'].includes(context.outlineMode) ? context.outlineMode : 'collapsed',
+      preference: context.outlinePreference === 'open' || context.outlinePreference === 'closed'
+        ? context.outlinePreference
+        : '',
+      sectionCount: sectionIndex.length,
+      activeSectionId,
+      activeSectionTitle: String(activeSection?.title || ''),
     },
     toolbar: {
       actions: visibleToolbar,

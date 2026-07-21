@@ -16,6 +16,14 @@ import { MarkdownRenderer } from './markdown-renderer.js';
 import { buildCommaActionState } from './action-state.js';
 
 const EMPTY_DOCUMENT = { title: 'untitled.md', body: '', rev: '' };
+const OUTLINE_PREFERENCE_KEY = 'comma-editor:outline-preference';
+const OUTLINE_WIDE_MIN = 1600;
+const OUTLINE_DESKTOP_MIN = 1100;
+const OUTLINE_DEFAULTS = {
+  expanded: true,
+  collapsed: false,
+  drawer: false,
+};
 
 const COMMENT_BATCH_SCHEMA = {
   type: 'object',
@@ -96,7 +104,15 @@ function readableBlockText(element) {
 }
 
 export class CommaEditorElement extends HTMLElement {
-  static observedAttributes = ['actor', 'readonly', 'save-policy', 'hide-ai-review'];
+  static observedAttributes = [
+    'actor',
+    'readonly',
+    'save-policy',
+    'hide-ai-review',
+    'outline-wide-default',
+    'outline-desktop-default',
+    'outline-narrow-default',
+  ];
 
   constructor() {
     super();
@@ -127,8 +143,12 @@ export class CommaEditorElement extends HTMLElement {
     this._sectionIndex = [];
     this._activeSectionId = '';
     this._outlineOpen = false;
+    this._outlineMode = 'collapsed';
+    this._outlinePreference = '';
+    this._lastOutlineTrigger = null;
     this._commentsOpen = false;
     this._syncActiveSectionBound = () => this._syncActiveSection();
+    this._syncOutlineViewportBound = () => this._syncOutlineViewport();
   }
 
   connectedCallback() {
@@ -136,19 +156,25 @@ export class CommaEditorElement extends HTMLElement {
     this._connected = true;
     this._renderShell();
     this._bind();
+    this._outlinePreference = this._readOutlinePreference();
+    this._syncOutlineViewport({ force: true });
     window.addEventListener('scroll', this._syncActiveSectionBound, { passive: true });
     window.addEventListener('resize', this._syncActiveSectionBound, { passive: true });
+    window.addEventListener('resize', this._syncOutlineViewportBound, { passive: true });
     if (this._adapter) this.load();
   }
 
   disconnectedCallback() {
     window.removeEventListener('scroll', this._syncActiveSectionBound);
     window.removeEventListener('resize', this._syncActiveSectionBound);
+    window.removeEventListener('resize', this._syncOutlineViewportBound);
     this._connected = false;
   }
 
-  attributeChangedCallback() {
-    if (this._connected) this._renderMeta();
+  attributeChangedCallback(name) {
+    if (!this._connected) return;
+    if (name?.startsWith('outline-')) this._syncOutlineViewport({ force: true });
+    this._renderMeta();
   }
 
   set adapter(value) {
@@ -293,10 +319,11 @@ export class CommaEditorElement extends HTMLElement {
     return this._commentsOpen;
   }
 
-  toggleOutline(force) {
-    this._outlineOpen = typeof force === 'boolean' ? force : !this._outlineOpen;
-    this._el('shell').classList.toggle('outline-open', this._outlineOpen);
-    this._notifyActionState();
+  toggleOutline(force, options = {}) {
+    this._setOutlineOpen(typeof force === 'boolean' ? force : !this._outlineOpen, {
+      persist: true,
+      trigger: options.trigger,
+    });
     return this._outlineOpen;
   }
 
@@ -475,8 +502,8 @@ export class CommaEditorElement extends HTMLElement {
 
   _renderShell() {
     const header = this.embeddedChrome ? `
-        <div class="ce-embedded-controls" data-el="embedded-controls">
-          <button class="ce-button ce-outline-toggle" type="button" data-action="toggle-outline" data-el="outline-toggle">目录</button>
+      <div class="ce-embedded-controls" data-el="embedded-controls">
+          <button class="ce-button ce-outline-toggle" type="button" data-action="toggle-outline" data-el="outline-toggle" aria-expanded="false">目录</button>
         </div>` : `
         <header class="ce-header">
           <div class="ce-identity">
@@ -485,7 +512,7 @@ export class CommaEditorElement extends HTMLElement {
             <div class="ce-meta" data-el="meta">No document loaded</div>
           </div>
           <div class="ce-actions">
-            <button class="ce-button ce-outline-toggle" type="button" data-action="toggle-outline" data-el="outline-toggle">目录</button>
+            <button class="ce-button ce-outline-toggle" type="button" data-action="toggle-outline" data-el="outline-toggle" aria-expanded="false">目录</button>
             <span class="ce-toolbar-primary" data-el="toolbar-primary"></span>
             <button class="ce-button primary" type="button" data-action="explicit-save" data-el="explicit-save" hidden>Save</button>
             <details class="ce-toolbar-overflow" data-el="toolbar-overflow" hidden>
@@ -581,6 +608,8 @@ export class CommaEditorElement extends HTMLElement {
       showWithdrawnComments: this._showWithdrawnComments,
       commentsOpen: this._commentsOpen,
       outlineOpen: this._outlineOpen,
+      outlineMode: this._outlineMode,
+      outlinePreference: this._outlinePreference,
       sectionIndex: this._sectionIndex,
       activeSectionId: this._activeSectionId,
       status: this._statusState,
@@ -623,12 +652,77 @@ export class CommaEditorElement extends HTMLElement {
     });
   }
 
+  _readOutlinePreference() {
+    try {
+      const value = globalThis.localStorage?.getItem(OUTLINE_PREFERENCE_KEY);
+      return value === 'open' || value === 'closed' ? value : '';
+    } catch {
+      return '';
+    }
+  }
+
+  _writeOutlinePreference(open) {
+    this._outlinePreference = open ? 'open' : 'closed';
+    try {
+      globalThis.localStorage?.setItem(OUTLINE_PREFERENCE_KEY, this._outlinePreference);
+    } catch {
+      // Persistence is best effort; the current in-memory state still applies.
+    }
+  }
+
+  _outlineModeForViewport() {
+    const width = Number(globalThis.innerWidth || 0);
+    if (width >= OUTLINE_WIDE_MIN) return 'expanded';
+    if (width >= OUTLINE_DESKTOP_MIN) return 'collapsed';
+    return 'drawer';
+  }
+
+  _outlineDefaultForMode(mode) {
+    const attributeByMode = {
+      expanded: 'outline-wide-default',
+      collapsed: 'outline-desktop-default',
+      drawer: 'outline-narrow-default',
+    };
+    const raw = String(this.getAttribute(attributeByMode[mode]) || '').trim().toLowerCase();
+    if (['open', 'expanded', 'true', '1'].includes(raw)) return true;
+    if (['closed', 'collapsed', 'false', '0'].includes(raw)) return false;
+    return OUTLINE_DEFAULTS[mode] ?? false;
+  }
+
+  _setOutlineOpen(open, { persist = false, trigger = null } = {}) {
+    this._outlineOpen = Boolean(open);
+    if (trigger instanceof HTMLElement) this._lastOutlineTrigger = trigger;
+    if (persist) this._writeOutlinePreference(this._outlineOpen);
+    const shell = this._el('shell');
+    if (shell) {
+      shell.classList.toggle('outline-open', this._outlineOpen);
+      shell.dataset.outlineMode = this._outlineMode;
+    }
+    const toggle = this._el('outline-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(this._outlineOpen));
+    this._renderOutline();
+    this._notifyActionState();
+  }
+
+  _syncOutlineViewport({ force = false } = {}) {
+    if (!this._connected) return;
+    const nextMode = this._outlineModeForViewport();
+    const nextOpen = this._outlinePreference
+      ? this._outlinePreference === 'open'
+      : this._outlineDefaultForMode(nextMode);
+    const changed = force || nextMode !== this._outlineMode || nextOpen !== this._outlineOpen;
+    this._outlineMode = nextMode;
+    const shell = this._el('shell');
+    if (shell) shell.dataset.outlineMode = nextMode;
+    if (changed) this._setOutlineOpen(nextOpen, { persist: false });
+  }
+
   async _onClick(event) {
     const action = event.target.closest('[data-action]')?.dataset.action;
     if (action) {
       if (action !== 'toggle-review-item') event.preventDefault();
       if (action === 'toolbar-action') this._runToolbarAction(event.target.closest('[data-toolbar-action]')?.dataset.toolbarAction);
-      if (action === 'toggle-outline') this.toggleOutline();
+      if (action === 'toggle-outline') this.toggleOutline(undefined, { trigger: event.target.closest('[data-action=toggle-outline]') });
       if (action === 'outline-jump') this._jumpToSection(event.target.closest('[data-section-id]')?.dataset.sectionId);
       if (action === 'comment-action') this._runCommentAction(
         event.target.closest('[data-comment-action]')?.dataset.commentAction,
@@ -701,8 +795,10 @@ export class CommaEditorElement extends HTMLElement {
       explicitSave.disabled = !this._dirty;
     }
     this._el('sidebar').hidden = !this._capabilities.comments.list;
-    this._el('shell').classList.toggle('comments-open', this._commentsOpen);
-    this._el('shell').classList.toggle('outline-open', this._outlineOpen);
+    const shell = this._el('shell');
+    shell.classList.toggle('comments-open', this._commentsOpen);
+    shell.classList.toggle('outline-open', this._outlineOpen);
+    shell.dataset.outlineMode = this._outlineMode;
     this._renderToolbarActions();
   }
 
@@ -1254,8 +1350,11 @@ export class CommaEditorElement extends HTMLElement {
     if (!root) return;
     const counts = this._sectionFindingCounts();
     const active = this._activeSectionId || this._sectionIndex[0]?.id || '';
+    const activeTitle = this._sectionIndex.find((section) => section.id === active)?.title || '';
+    const sectionCount = this._sectionIndex.length;
     root.innerHTML = `<div class="ce-outline-head">
         <strong>Sections</strong>
+        ${activeTitle ? `<span title="${escapeHtml(activeTitle)}">${escapeHtml(activeTitle)}</span>` : ''}
         <button class="ce-outline-close" type="button" data-action="toggle-outline" aria-label="Close document outline">×</button>
       </div>
       <nav class="ce-outline-list">${this._sectionIndex.map((section) => {
@@ -1266,7 +1365,11 @@ export class CommaEditorElement extends HTMLElement {
           ${count ? `<b class="ce-outline-count">${count}</b>` : ''}
         </button>`;
       }).join('')}</nav>`;
-    this._el('outline-toggle').textContent = `目录${this._sectionIndex.length ? ` ${this._sectionIndex.length}` : ''}`;
+    const toggle = this._el('outline-toggle');
+    const hint = activeTitle ? ` · ${activeTitle}` : '';
+    toggle.textContent = `目录${sectionCount ? ` ${sectionCount}` : ''}${hint}`;
+    toggle.title = activeTitle ? `目录 · 当前：${activeTitle}` : '目录';
+    toggle.setAttribute('aria-expanded', String(this._outlineOpen));
   }
 
   _jumpToSection(sectionId) {
@@ -1275,10 +1378,11 @@ export class CommaEditorElement extends HTMLElement {
     const block = this._el('preview').querySelector(`[data-block-index="${section.blockIndex}"]`);
     if (!block) return false;
     this._activeSectionId = section.id;
-    this._outlineOpen = false;
-    this._el('shell').classList.remove('outline-open');
+    const shouldCloseAfterJump = this._outlineMode !== 'expanded';
+    if (shouldCloseAfterJump) this._setOutlineOpen(false, { persist: false });
     block.scrollIntoView({ behavior: 'smooth', block: 'start' });
     this._renderOutline();
+    if (shouldCloseAfterJump) queueMicrotask(() => this._lastOutlineTrigger?.focus());
     this._notifyActionState();
     return true;
   }
@@ -1297,6 +1401,7 @@ export class CommaEditorElement extends HTMLElement {
     if (sectionId && sectionId !== this._activeSectionId) {
       this._activeSectionId = sectionId;
       this._renderOutline();
+      this._notifyActionState();
     }
   }
 

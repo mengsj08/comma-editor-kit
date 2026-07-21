@@ -232,6 +232,82 @@ def main():
               return performance.now() - started;
             }"""))
             results["public_component_render"] = first
+            outline_snapshot = """() => {
+              const editor = document.querySelector('comma-editor');
+              const root = editor.shadowRoot;
+              const grid = root.querySelector('.ce-grid');
+              const outline = root.querySelector('[data-el=outline]');
+              const toggle = root.querySelector('[data-el=outline-toggle]');
+              const state = editor.actionState.outline;
+              return {
+                mode: state.mode,
+                open: state.open,
+                preference: state.preference,
+                shellMode: root.querySelector('[data-el=shell]').dataset.outlineMode,
+                outlineDisplay: getComputedStyle(outline).display,
+                toggleDisplay: getComputedStyle(toggle).display,
+                toggleExpanded: toggle.getAttribute('aria-expanded'),
+                toggleText: toggle.textContent.trim(),
+                activeSectionTitle: state.activeSectionTitle,
+                gridColumns: getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length,
+                storage: localStorage.getItem('comma-editor:outline-preference') || '',
+              };
+            }"""
+            page.set_viewport_size({"width": 1700, "height": 1000})
+            page.evaluate("""() => {
+              localStorage.removeItem('comma-editor:outline-preference');
+              const editor = document.querySelector('comma-editor');
+              editor._outlinePreference = '';
+              editor._syncOutlineViewport({ force: true });
+            }""")
+            page.wait_for_function("document.querySelector('comma-editor').actionState.outline.mode === 'expanded'")
+            results["outline_expanded_default"] = page.evaluate(outline_snapshot)
+            page.evaluate("""() => document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=outline-toggle]').click()""")
+            page.wait_for_function("localStorage.getItem('comma-editor:outline-preference') === 'closed'")
+            page.reload(wait_until="load")
+            page.locator("comma-editor").locator(".ce-block").first.wait_for(timeout=15000)
+            page.wait_for_function("document.querySelector('comma-editor').documentState.rev.length > 0")
+            page.set_viewport_size({"width": 1700, "height": 1000})
+            page.wait_for_function("document.querySelector('comma-editor').actionState.outline.preference === 'closed'")
+            results["outline_persisted_closed"] = page.evaluate(outline_snapshot)
+            page.set_viewport_size({"width": 1400, "height": 900})
+            page.evaluate("""() => {
+              localStorage.removeItem('comma-editor:outline-preference');
+              const editor = document.querySelector('comma-editor');
+              editor._outlinePreference = '';
+              editor._syncOutlineViewport({ force: true });
+            }""")
+            page.wait_for_function("document.querySelector('comma-editor').actionState.outline.mode === 'collapsed'")
+            results["outline_collapsed_default"] = page.evaluate(outline_snapshot)
+            page.set_viewport_size({"width": 820, "height": 900})
+            page.evaluate("""() => {
+              localStorage.removeItem('comma-editor:outline-preference');
+              const editor = document.querySelector('comma-editor');
+              editor._outlinePreference = '';
+              editor._syncOutlineViewport({ force: true });
+            }""")
+            page.wait_for_function("document.querySelector('comma-editor').actionState.outline.mode === 'drawer'")
+            results["outline_drawer_default"] = page.evaluate(outline_snapshot)
+            page.evaluate("""() => document.querySelector('comma-editor').shadowRoot.querySelector('[data-el=outline-toggle]').click()""")
+            page.wait_for_function("document.querySelector('comma-editor').actionState.outline.open === true")
+            results["outline_drawer_open"] = page.evaluate(outline_snapshot)
+            results["outline_drawer_jump"] = page.evaluate("""async () => {
+              const editor = document.querySelector('comma-editor');
+              const root = editor.shadowRoot;
+              root.querySelector('[data-action=outline-jump]').click();
+              await new Promise(resolve => setTimeout(resolve, 80));
+              return {
+                open: editor.actionState.outline.open,
+                focusEl: root.activeElement?.dataset.el || '',
+              };
+            }""")
+            page.set_viewport_size({"width": 1400, "height": 900})
+            page.evaluate("""() => {
+              localStorage.removeItem('comma-editor:outline-preference');
+              const editor = document.querySelector('comma-editor');
+              editor._outlinePreference = '';
+              editor._syncOutlineViewport({ force: true });
+            }""")
             results["host_actions"] = page.evaluate("""() => {
               const root = document.querySelector('comma-editor').shadowRoot;
               const state = document.querySelector('comma-editor').actionState;
@@ -527,6 +603,28 @@ def main():
     assert results["public_component_render"]["textureDisplay"] == "none"
     assert results["public_component_render"]["ceHeaderCount"] == 0
     assert results["public_component_render"]["embeddedControls"] == 1
+    assert results["outline_expanded_default"]["mode"] == "expanded"
+    assert results["outline_expanded_default"]["open"] is True
+    assert results["outline_expanded_default"]["outlineDisplay"] == "block"
+    assert results["outline_expanded_default"]["toggleDisplay"] != "none"
+    assert results["outline_expanded_default"]["gridColumns"] == 3
+    assert results["outline_persisted_closed"]["mode"] == "expanded"
+    assert results["outline_persisted_closed"]["open"] is False
+    assert results["outline_persisted_closed"]["preference"] == "closed"
+    assert results["outline_persisted_closed"]["storage"] == "closed"
+    assert results["outline_persisted_closed"]["gridColumns"] == 2
+    assert results["outline_collapsed_default"]["mode"] == "collapsed"
+    assert results["outline_collapsed_default"]["open"] is False
+    assert results["outline_collapsed_default"]["outlineDisplay"] == "none"
+    assert results["outline_collapsed_default"]["gridColumns"] == 2
+    assert results["outline_collapsed_default"]["toggleText"].startswith("目录 ")
+    assert "·" in results["outline_collapsed_default"]["toggleText"]
+    assert results["outline_drawer_default"]["mode"] == "drawer"
+    assert results["outline_drawer_default"]["open"] is False
+    assert results["outline_drawer_default"]["outlineDisplay"] == "none"
+    assert results["outline_drawer_open"]["open"] is True
+    assert results["outline_drawer_open"]["outlineDisplay"] == "block"
+    assert results["outline_drawer_jump"] == {"open": False, "focusEl": "outline-toggle"}
     assert results["image_lightbox_opened"] is True
     assert results["host_actions"]["innerHeaderCount"] == 0
     assert results["host_actions"]["statePrimary"] == ["文章总览", "AI Review", "AI 工具", "批注 0"]

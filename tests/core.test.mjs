@@ -70,11 +70,14 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
   const componentCss = readFileSync(new URL('../src/element/comma-editor.css', import.meta.url), 'utf8');
   const hostCss = readFileSync(new URL('../apps/review-studio/static/editor.css', import.meta.url), 'utf8');
   assert.match(componentCss, /@media \(min-width: 1600px\)/);
-  assert.match(componentCss, /grid-template-columns:\s*clamp\(180px,\s*11vw,\s*240px\)\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
-  assert.match(componentCss, /@media \(min-width: 1900px\)[\s\S]*grid-template-columns:\s*180px\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
+  assert.match(componentCss, /\.ce-shell\.outline-open\[data-outline-mode="expanded"\] \.ce-grid[\s\S]*grid-template-columns:\s*clamp\(180px,\s*11vw,\s*240px\)\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
+  assert.match(componentCss, /@media \(min-width: 1900px\)[\s\S]*\.ce-shell\.outline-open\[data-outline-mode="expanded"\] \.ce-grid[\s\S]*grid-template-columns:\s*180px\s+minmax\(0,\s*1fr\)\s+clamp\(360px,\s*20vw,\s*420px\)/);
   assert.match(componentCss, /@media \(min-width: 1100px\) and \(max-width: 1599px\)/);
   assert.match(componentCss, /@media \(min-width: 821px\) and \(max-width: 1099px\)/);
   assert.match(componentCss, /@media \(max-width: 820px\)/);
+  assert.match(componentCss, /\.ce-shell\.outline-open\[data-outline-mode="collapsed"\] \.ce-outline[\s\S]*display:\s*block/);
+  assert.match(componentCss, /\.ce-shell\.outline-open\[data-outline-mode="drawer"\] \.ce-outline[\s\S]*display:\s*block/);
+  assert.doesNotMatch(componentCss, /\.ce-outline-toggle\s*\{[^}]*display:\s*none/);
   assert.match(componentCss, /\.ce-outline-item/);
   assert.match(componentCss, /\.ce-block\.ce-breakout[\s\S]*width:\s*min\(1300px,\s*100cqi\)/);
   assert.match(componentCss, /\.ce-table-scroll[\s\S]*overflow-x:\s*auto/);
@@ -85,6 +88,25 @@ test('scientific layout CSS preserves the SKL-100 breakpoint and breakout contra
   assert.match(hostCss, /\.doc-header[\s\S]*grid-template-columns:\s*auto minmax\(190px,\s*1fr\) auto auto/);
   assert.match(hostCss, /@media \(min-width: 761px\) and \(max-width: 1099px\)[\s\S]*\.doc-header[\s\S]*grid-template-columns:\s*auto minmax\(180px,\s*1fr\) auto auto/);
   assert.match(hostCss, /width:\s*min\(1792px,\s*calc\(100% - 64px\)\)/);
+});
+
+test('review studio AI surfaces keep Slice C placeholders disciplined', () => {
+  const html = readFileSync(new URL('../apps/review-studio/static/editor.html', import.meta.url), 'utf8');
+  const header = html.match(/<header class="doc-header">[\s\S]*?<\/header>/)?.[0] || '';
+  const aiTools = html.match(/<aside id="ai-tools-popover"[\s\S]*?<\/aside>/)?.[0] || '';
+  const reviewLauncher = html.match(/<div class="review-launcher">[\s\S]*?<div id="review-run-state"/)?.[0] || '';
+  assert.deepEqual([...aiTools.matchAll(/<button id="([^"]+)"/g)].map((match) => match[1]), [
+    'btn-quick-explain',
+    'btn-selection-discuss',
+    'btn-evidence',
+  ]);
+  assert.doesNotMatch(aiTools, /SKL-101|Zotero|Obsidian|改写|生成摘要|新建评审Agent/i);
+  assert.doesNotMatch(header, /Zotero|Obsidian/i);
+  assert.deepEqual([...reviewLauncher.matchAll(/name="review-tool" value="([^"]+)"/g)].map((match) => match[1]), [
+    'claude',
+    'codex',
+  ]);
+  assert.match(reviewLauncher, /<strong>APR<\/strong>/);
 });
 
 test('renderer preserves image syntax when alt text contains TeX-style backticks', () => {
@@ -257,12 +279,25 @@ test('comma action state projects toolbar availability and comment counts from o
       normalizeComment({ id: 'c2', content: 'Hidden.', lifecycle_state: 'withdrawn' }),
     ],
     commentsRev: 'comments-2',
+    outlineOpen: true,
+    outlineMode: 'expanded',
+    outlinePreference: 'open',
+    sectionIndex: [{ id: 'sec-title', title: 'Title' }],
+    activeSectionId: 'sec-title',
     status: { kind: 'saving', text: 'Saving' },
   });
   assert.equal(state.schemaVersion, 'comma-action-state/v1');
   assert.equal(state.document.shortRev, 'abcdef12');
   assert.equal(state.document.lineCount, 3);
   assert.equal(state.comments.count, 1);
+  assert.deepEqual(state.outline, {
+    open: true,
+    mode: 'expanded',
+    preference: 'open',
+    sectionCount: 1,
+    activeSectionId: 'sec-title',
+    activeSectionTitle: 'Title',
+  });
   assert.deepEqual(state.toolbar.primary.map((action) => action.id), ['overview', 'ai-review', 'comments']);
   assert.equal(state.toolbar.primary.find((action) => action.id === 'comments').count, 1);
   assert.equal(state.toolbar.primary.find((action) => action.id === 'ai-review').enabled, false);
