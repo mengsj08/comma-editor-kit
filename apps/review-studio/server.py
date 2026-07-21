@@ -67,6 +67,7 @@ Data model:
   .comma-review/evidence-sources/<doc-key>/
                               -> immutable PDFs, page text and evidence records
 """
+import argparse
 import hashlib
 import html
 import inspect
@@ -7568,7 +7569,148 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
-def main():
+def _doctor_node_version():
+    node = shutil.which("node", path=os.environ.get("PATH"))
+    if not node:
+        return False, "", "未找到 node 命令"
+    try:
+        completed = subprocess.run(
+            [node, "--version"], capture_output=True, text=True, timeout=8,
+            check=False, stdin=subprocess.DEVNULL,
+        )
+        version = ((completed.stdout or completed.stderr) or "").strip().splitlines()[0]
+        if completed.returncode == 0:
+            return True, version, f"Node.js {version}"
+        return False, version, "node --version 执行失败"
+    except Exception as e:
+        return False, "", f"node 检查失败：{e}"
+
+
+def _doctor_npm_deps():
+    node_modules = os.path.join(_project_root(), "node_modules")
+    package_lock = os.path.join(_project_root(), "package-lock.json")
+    if os.path.isdir(node_modules):
+        return True, node_modules, "node_modules 已安装"
+    hint = "请先在仓库根目录运行 npm install"
+    if os.path.isfile(package_lock):
+        hint += "（会按 package-lock.json 安装）"
+    return False, node_modules, hint
+
+
+def _project_root():
+    return os.path.realpath(os.path.join(ROOT, "..", ".."))
+
+
+def _ensure_frontend_build():
+    entry = os.path.join(KIT_DIST_ROOT, "comma-editor.js")
+    if os.path.isfile(entry):
+        return True, entry, "dist/comma-editor.js 已就绪"
+    npm = shutil.which("npm", path=os.environ.get("PATH"))
+    if not npm:
+        return False, entry, "缺少 dist/comma-editor.js，且未找到 npm，无法自动构建"
+    try:
+        completed = subprocess.run(
+            [npm, "run", "build"], cwd=_project_root(), capture_output=True, text=True,
+            timeout=180, check=False, stdin=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        return False, entry, f"前端构建失败：{e}"
+    if completed.returncode != 0:
+        detail = ((completed.stderr or completed.stdout) or "npm run build failed").strip().splitlines()[-1]
+        return False, entry, f"前端构建失败：{detail}"
+    if os.path.isfile(entry):
+        return True, entry, "dist/comma-editor.js 缺失，已自动运行 npm run build"
+    return False, entry, "npm run build 完成但仍未找到 dist/comma-editor.js"
+
+
+def doctor_report():
+    python_ok = sys.version_info >= (3, 10)
+    node_ok, node_version, node_detail = _doctor_node_version()
+    deps_ok, deps_path, deps_detail = _doctor_npm_deps()
+    build_ok, build_path, build_detail = _ensure_frontend_build() if deps_ok else (
+        False, os.path.join(KIT_DIST_ROOT, "comma-editor.js"), "npm dependencies 未安装，暂不能构建前端"
+    )
+    runtime = runtime_capability_manifest()
+    tools = runtime["tools"]
+    core_checks = [
+        {
+            "id": "python", "label": "Python", "ok": python_ok,
+            "detail": f"{sys.version.split()[0]}（需要 3.10+）",
+        },
+        {
+            "id": "node", "label": "Node.js", "ok": node_ok,
+            "detail": node_detail, "version": node_version,
+        },
+        {
+            "id": "node_modules", "label": "npm dependencies", "ok": deps_ok,
+            "detail": deps_detail, "path": deps_path,
+        },
+        {
+            "id": "frontend_build", "label": "Comma Editor build", "ok": build_ok,
+            "detail": build_detail, "path": build_path,
+        },
+    ]
+    any_ai_ready = any(tool["ready"] for tool in tools)
+    return {
+        "ok": all(item["ok"] for item in core_checks),
+        "schema_version": "comma-review-doctor/v1",
+        "url": f"http://{HOST}:{PORT}",
+        "core_checks": core_checks,
+        "tools": tools,
+        "ai_ready": any_ai_ready,
+        "ai_message": (
+            "至少一个 AI CLI 已就绪。"
+            if any_ai_ready else
+            "AI 功能不可用，编辑/导入/批注仍可用"
+        ),
+    }
+
+
+def print_doctor_report(report):
+    print("Comma Review Studio doctor")
+    for item in report["core_checks"]:
+        status = "OK" if item["ok"] else "FAIL"
+        print(f"- {item['label']}: {status} - {item['detail']}")
+    for tool in report["tools"]:
+        if tool["ready"]:
+            status = "OK"
+        elif tool["available"]:
+            status = "WARN"
+        else:
+            status = "MISSING"
+        print(f"- {tool['label']}: {status} - {tool['auth_state']} - {tool['detail']}")
+    print(report["ai_message"])
+    print(f"Result: {'OK to start Review Studio' if report['ok'] else 'Fix the failed checks above before starting'}")
+
+
+def _open_browser(url):
+    try:
+        if sys.platform == "darwin" and shutil.which("open"):
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            print(f"[comma-review] open this URL in your browser: {url}")
+    except Exception as e:
+        print(f"[comma-review] browser open failed: {e}; open {url}")
+
+
+def main(argv=None):
+    global HOST, PORT
+    parser = argparse.ArgumentParser(description="Run Comma Review Studio.")
+    parser.add_argument("--doctor", action="store_true", help="check local runtime prerequisites")
+    parser.add_argument("--serve", action="store_true", help="start the local Review Studio server after doctor")
+    parser.add_argument("--open", action="store_true", help="open the Review Studio URL in the default browser")
+    parser.add_argument("--host", default=HOST, help="bind host, default 127.0.0.1")
+    parser.add_argument("--port", type=int, default=PORT, help=f"bind port, default {PORT}")
+    args = parser.parse_args(argv)
+    HOST = args.host
+    PORT = args.port
+    if args.doctor:
+        report = doctor_report()
+        print_doctor_report(report)
+        if not report["ok"]:
+            return 1
+        if not args.serve:
+            return 0
     os.makedirs(DATA_ROOT, exist_ok=True)
     stale = _fail_stale_running_reviews()
     reconciliation = _reconcile_operation_journal()
@@ -7580,11 +7722,14 @@ def main():
           f"journal={reconciliation['pending']}/{reconciliation['finalized']}/"
           f"{reconciliation['inconsistent']} "
           f"stale-runs={stale['runs_failed']}/{stale['sessions_failed']}")
+    if args.open:
+        _open_browser(f"http://{HOST}:{PORT}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         srv.shutdown()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
