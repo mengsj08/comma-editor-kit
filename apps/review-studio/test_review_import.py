@@ -178,6 +178,68 @@ class ReviewImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compression ratio"):
             server._inspect_docx(self._synthetic_docx(zip_bomb=True))
 
+    def test_docx_converter_status_supports_windows_without_macos_sandbox(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            node = os.path.join(tmp, "node.exe")
+            with open(node, "w", encoding="utf-8") as handle:
+                handle.write("fake node")
+            for package in ("mammoth", "sanitize-html", "turndown", "turndown-plugin-gfm"):
+                package_dir = os.path.join(tmp, "node_modules", *package.split("/"))
+                os.makedirs(package_dir)
+                with open(os.path.join(package_dir, "package.json"), "w", encoding="utf-8") as handle:
+                    handle.write("{}")
+            real_isfile = os.path.isfile
+
+            def isfile_without_sandbox(path):
+                if path == "/usr/bin/sandbox-exec":
+                    return False
+                return real_isfile(path)
+
+            with mock.patch.object(server.sys, "platform", "win32"), \
+                    mock.patch.object(server.os.path, "isfile", side_effect=isfile_without_sandbox), \
+                    mock.patch.object(server, "_project_root", return_value=tmp), \
+                    mock.patch.dict(os.environ, {"COMMA_REVIEW_NODE_BIN": node}, clear=False):
+                status = server._docx_converter_status()
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["sandbox"], "")
+            self.assertEqual(status["isolation"], "windows-local-pinned-converter")
+
+    def test_docx_windows_converter_runs_without_sandbox_command(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            source = os.path.join(tmp, "source.docx")
+            with open(source, "wb") as handle:
+                handle.write(b"fake")
+            command_rows = []
+
+            def fake_run(command, **_kwargs):
+                command_rows.append(command)
+                output_root = command[-2]
+                os.makedirs(output_root, exist_ok=True)
+                with open(os.path.join(output_root, "result.json"), "w", encoding="utf-8") as handle:
+                    json.dump({
+                        "markdown": "# Converted\n",
+                        "assets": [],
+                        "messages": [],
+                        "versions": {"mammoth": "fake"},
+                    }, handle)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(server, "_docx_converter_status", return_value={
+                "ready": True,
+                "node": r"C:\Tools\node.exe",
+                "sandbox": "",
+                "script": r"C:\Repo\apps\review-studio\importers\docx_to_markdown.mjs",
+                "isolation": "windows-local-pinned-converter",
+                "detail": "ready",
+            }), mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                converted = server._convert_docx_candidate(source, "import-aaaaaaaaaaaaaaaa")
+            self.assertEqual(command_rows[0][0], r"C:\Tools\node.exe")
+            self.assertNotIn("-f", command_rows[0])
+            self.assertEqual(converted["isolation"], "windows-local-pinned-converter")
+            self.assertEqual(converted["markdown"], "# Converted\n")
+
     def test_docx_converts_in_no_network_sandbox_and_commits_assets_contract(self):
         if not server._docx_converter_status()["ready"]:
             self.skipTest(server._docx_converter_status()["detail"])

@@ -79,6 +79,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -654,7 +655,7 @@ def _stage_markdown_import(filename: str, source: bytes, media_type: str = ""):
         _atomic_write_json(_import_receipt_path(import_id), receipt)
     except Exception:
         if os.path.isdir(root):
-            shutil.rmtree(root)
+            _remove_tree(root)
         raise
     return receipt
 
@@ -663,16 +664,44 @@ def _docx_converter_script() -> str:
     return os.path.join(ROOT, "importers", "docx_to_markdown.mjs")
 
 
+def _is_windows() -> bool:
+    return sys.platform == "win32" or os.name == "nt"
+
+
+def _resolve_node_runtime() -> str:
+    override = (os.environ.get("COMMA_REVIEW_NODE_BIN") or "").strip()
+    if override:
+        if os.path.isfile(override) and (_is_windows() or os.access(override, os.X_OK)):
+            return os.path.realpath(override)
+        return ""
+    candidate = shutil.which("node", path=_cli_search_path())
+    if candidate and os.path.isfile(candidate) and (_is_windows() or os.access(candidate, os.X_OK)):
+        return os.path.realpath(candidate)
+    return ""
+
+
+def _docx_dependencies_ready() -> bool:
+    return all(os.path.isfile(os.path.join(
+        _project_root(), "node_modules", *name.split("/"), "package.json",
+    )) for name in ("mammoth", "sanitize-html", "turndown", "turndown-plugin-gfm"))
+
+
 def _docx_converter_status():
-    node = shutil.which("node", path=_cli_search_path())
+    node = _resolve_node_runtime()
     sandbox = "/usr/bin/sandbox-exec" if os.path.isfile("/usr/bin/sandbox-exec") else ""
     script = _docx_converter_script()
-    ready = bool(node and sandbox and os.path.isfile(script))
+    dependencies = _docx_dependencies_ready()
+    platform_supported = bool(sandbox) if sys.platform == "darwin" else _is_windows()
+    ready = bool(node and platform_supported and dependencies and os.path.isfile(script))
     missing = []
     if not node:
         missing.append("Node.js")
-    if not sandbox:
+    if sys.platform == "darwin" and not sandbox:
         missing.append("macOS sandbox-exec")
+    if sys.platform != "darwin" and not _is_windows():
+        missing.append("supported DOCX isolation backend")
+    if not dependencies:
+        missing.append("DOCX converter dependencies")
     if not os.path.isfile(script):
         missing.append("DOCX converter script")
     return {
@@ -680,9 +709,26 @@ def _docx_converter_status():
         "node": node or "",
         "sandbox": sandbox,
         "script": script,
-        "detail": "Mammoth + sanitized HTML + Turndown/GFM; network denied"
+        "isolation": "macos-sandbox-exec" if sandbox else "windows-local-pinned-converter",
+        "detail": (
+            "Mammoth + sanitized HTML + Turndown/GFM; network denied by macOS sandbox"
+            if sandbox else
+            "Mammoth + sanitized HTML + Turndown/GFM; Windows local pinned converter"
+        )
         if ready else "missing " + ", ".join(missing),
     }
+
+
+def _remove_tree(path: str) -> None:
+    """Remove private staging trees that may contain read-only source archives."""
+    if not os.path.isdir(path):
+        return
+
+    def make_writable_and_retry(function, target, _exc_info):
+        os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+        function(target)
+
+    shutil.rmtree(path, onerror=make_writable_and_retry)
 
 
 def _safe_zip_member(name: str) -> str:
@@ -872,11 +918,17 @@ def _convert_docx_candidate(source_path: str, import_id: str):
 (allow file-write* (subpath "{_sandbox_path_literal(temp_root)}"))
 (deny network*)
 '''
-        _atomic_write(profile_path, profile)
-        command = [
-            status["sandbox"], "-f", profile_path, status["node"], status["script"],
-            input_path, output_root, f"assets/{import_id}",
-        ]
+        if status["sandbox"]:
+            _atomic_write(profile_path, profile)
+            command = [
+                status["sandbox"], "-f", profile_path, status["node"], status["script"],
+                input_path, output_root, f"assets/{import_id}",
+            ]
+        else:
+            command = [
+                status["node"], status["script"], input_path, output_root,
+                f"assets/{import_id}",
+            ]
         completed = subprocess.run(
             command, capture_output=True, text=True, timeout=120, check=False,
             stdin=subprocess.DEVNULL, env=_cli_env(status["node"]),
@@ -884,7 +936,7 @@ def _convert_docx_candidate(source_path: str, import_id: str):
         result_path = os.path.join(output_root, "result.json")
         if completed.returncode != 0 or not os.path.isfile(result_path):
             detail = ((completed.stderr or completed.stdout) or "conversion failed").strip()
-            raise ValueError("DOCX conversion failed in no-network sandbox: " + detail[:400])
+            raise ValueError("DOCX conversion failed: " + detail[:400])
         result = _read_json_file(result_path, None)
         if not isinstance(result, dict) or not isinstance(result.get("markdown"), str):
             raise ValueError("DOCX converter returned an invalid result")
@@ -970,6 +1022,7 @@ def _convert_docx_candidate(source_path: str, import_id: str):
             "versions": result.get("versions") or {},
             "assets": assets,
             "asset_conversions": asset_conversions,
+            "isolation": status["isolation"],
         }
 
 
@@ -1024,7 +1077,11 @@ def _stage_docx_import(filename: str, source: bytes, media_type: str = ""):
                 "version": "1",
                 "components": converted["versions"],
                 "parameters": {
-                    "network": "denied-by-macos-sandbox",
+                    "network": (
+                        "denied-by-macos-sandbox"
+                        if converted.get("isolation") == "macos-sandbox-exec"
+                        else "windows-local-pinned-converter"
+                    ),
                     "html": "sanitize allowlist",
                     "markdown": "ATX headings, fenced code, GFM tables",
                 },
@@ -1047,7 +1104,7 @@ def _stage_docx_import(filename: str, source: bytes, media_type: str = ""):
         _atomic_write_json(_import_receipt_path(import_id), receipt)
     except Exception:
         if os.path.isdir(root):
-            shutil.rmtree(root)
+            _remove_tree(root)
         raise
     return receipt
 
@@ -1108,7 +1165,7 @@ def _materialize_import_assets(import_id: str, receipt):
         return final_root
     finally:
         if os.path.isdir(temp_root):
-            shutil.rmtree(temp_root)
+            _remove_tree(temp_root)
 
 
 def _commit_manuscript_import(import_id: str, target_name: str, actor: str = "June"):
@@ -1191,7 +1248,7 @@ def _discard_manuscript_import(import_id: str):
                 code="committed_import_is_immutable",
                 target_path=(receipt.get("target") or {}).get("path"),
             )
-        shutil.rmtree(_import_root(import_id))
+        _remove_tree(_import_root(import_id))
         return receipt
 
 
