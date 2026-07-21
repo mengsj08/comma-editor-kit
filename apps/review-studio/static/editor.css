@@ -68,7 +68,7 @@ body { margin: 0; overflow-x: clip; font: 15px/1.6 -apple-system, BlinkMacSystem
 .cli-status.ready > i, .cli-tool-row.ready > i { background: var(--green); }
 .cli-status.partial { border-color: #d7c39f; color: #89551f; }
 .cli-status.partial > i, .cli-tool-row.needs-login > i, .cli-tool-row.check-failed > i { background: #b7792e; }
-.cli-status.offline { border-color: #dfbbb7; color: var(--stale); }
+.cli-status.offline { border-color: #d69a95; background: #fff5f4; color: var(--stale); box-shadow: 0 0 0 2px rgba(164,61,54,.08); }
 .cli-status.offline > i, .cli-tool-row.missing > i { background: var(--stale); }
 .cli-status.checking > i { animation: cli-pulse .8s ease-in-out infinite alternate; }
 @keyframes cli-pulse { to { opacity: .25; } }

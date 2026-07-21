@@ -1,6 +1,6 @@
 # Comma Review Studio — structured local review workflow
 
-> status: local v0.3 reference host · verified: 2026-07-19 · canonical code: `/Users/a1234/Documents/AI-Agent-Hub/comma-editor-kit/apps/review-studio` · host: `127.0.0.1:8891`
+> status: local v0.3 reference host · verified: 2026-07-19 · example June-local code path: `/Users/a1234/Documents/AI-Agent-Hub/comma-editor-kit/apps/review-studio` · host: `127.0.0.1:8891`
 
 ## What the AI Review button does
 

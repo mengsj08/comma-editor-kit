@@ -28,6 +28,7 @@ let editorActionState = null;
 let runtimeCapabilities = null;
 let runtimeLoading = null;
 let toastTimer = null;
+const CLI_UNAVAILABLE_GUIDE = '未检测到可用 CLI，请安装并登录 Codex 或 Claude CLI';
 
 function esc(value) {
   return String(value ?? '')
@@ -48,6 +49,11 @@ function toast(message, isError = false, duration = 2400) {
   element.classList.add('on');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => element.classList.remove('on'), duration);
+}
+
+function userFacingApiError(json, fallback = '操作失败') {
+  if (json?.code === 'cli_unavailable') return CLI_UNAVAILABLE_GUIDE;
+  return json?.message || json?.error || fallback;
 }
 
 async function apiJson(url, init = {}) {
@@ -319,7 +325,7 @@ async function generateEvidenceSummary(evidenceId) {
       path: DOC_PATH, tool, confirmed_data_transfer: true, actor: 'June',
     }),
   });
-  if (!response.ok || !json.ok) return setEvidenceUploadState(json.error || 'PDF 摘要生成失败', true);
+  if (!response.ok || !json.ok) return setEvidenceUploadState(userFacingApiError(json, 'PDF 摘要生成失败'), true);
   evidenceState.sources = evidenceState.sources.map((item) => item.id === evidenceId ? json.source : item);
   setEvidenceUploadState(json.reused ? '已复用同一来源与 provider 的摘要。' : '摘要已记录；原 PDF 和页码级文本仍保留在本地 EvidenceSource。');
   renderEvidenceSources();
@@ -410,8 +416,8 @@ async function loadRuntimeCapabilities() {
       runtimeCapabilities = json;
       const readyCount = json.tools.filter((item) => item.ready).length;
       badge.className = `cli-status ${readyCount === json.tools.length ? 'ready' : readyCount ? 'partial' : 'offline'}`;
-      badge.querySelector('span').textContent = readyCount ? `CLI · ${readyCount} 可用` : 'CLI · 未就绪';
-      badge.title = readyCount ? `${readyCount} 个本机 CLI 已登录` : 'Codex 与 Claude CLI 均未就绪';
+      badge.querySelector('span').textContent = `CLI · ${readyCount} 可用`;
+      badge.title = readyCount ? `${readyCount} 个本机 CLI 已登录` : CLI_UNAVAILABLE_GUIDE;
       renderRuntimePopover(false);
       syncRuntimeControls();
       return json;
@@ -443,10 +449,8 @@ function closeRuntimePopover() {
 async function requireRuntimeTool(tool, capability) {
   if (!runtimeCapabilities) await loadRuntimeCapabilities();
   if (runtimeToolReady(tool, capability)) return true;
-  const item = runtimeTool(tool);
-  const state = runtimeToolState(item);
   openRuntimePopover();
-  toast(`${item?.label || tool} ${state.label}；请在右上角 CLI 状态中处理后重新检测。`, true);
+  toast(CLI_UNAVAILABLE_GUIDE, true, 5200);
   return false;
 }
 
@@ -756,7 +760,7 @@ async function generateDocumentSummary(regenerate = false) {
   if (!response.ok || !json.ok) {
     if (response.status === 409) await editor.load();
     await loadDocumentSummary();
-    toast(json.message || json.error || '文章总览生成失败', true);
+    toast(userFacingApiError(json, '文章总览生成失败'), true);
     return;
   }
   overviewState.currentRev = json.current_rev || editor.documentState.rev;
@@ -1862,7 +1866,7 @@ async function runReview(mode) {
       evidence_source_ids: [...evidenceState.selectedIds],
     }),
   });
-  if (!json.ok) return setReviewRunning(false, json.message || json.error || `${modeLabel}失败`, true);
+  if (!json.ok) return setReviewRunning(false, userFacingApiError(json, `${modeLabel}失败`), true);
   activateReviewSession(json.session, json.run);
   if (reviewRunActive(json.run)) {
     setReviewRunning(true, json.idempotent
@@ -1893,7 +1897,7 @@ async function continueReview() {
   const { json } = await apiJson(`/api/review-sessions/${encodeURIComponent(session.id)}/messages`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message }),
   });
-  if (!json.ok) return setReviewRunning(false, json.message || json.error || '更新评审失败', true);
+  if (!json.ok) return setReviewRunning(false, userFacingApiError(json, '更新评审失败'), true);
   $('review-message').value = '';
   activateReviewSession(json.session, reviewState.activeRun);
   setReviewRunning(false, '评审清单已更新并停在 preview；批注未发生写入。');
@@ -2126,7 +2130,7 @@ async function quickExplain(sourceQuote) {
   $('quick-explain').hidden = false;
   const tool = selectedConversationTool();
   if (!await requireRuntimeTool(tool, 'quick_explain')) {
-    $('quick-output').textContent = '当前 CLI 未就绪。请在右上角 CLI 状态中检查安装或登录状态，然后点击“重新检测”。';
+    $('quick-output').textContent = CLI_UNAVAILABLE_GUIDE;
     return;
   }
   const { json } = await apiJson('/api/ai-run', {
@@ -2138,7 +2142,7 @@ async function quickExplain(sourceQuote) {
   });
   $('quick-output').textContent = json.ok
     ? (json.output || '（没有返回内容）')
-    : `解释失败：${json.error || '未知错误'}`;
+    : `解释失败：${userFacingApiError(json, '未知错误')}`;
   if (!json.ok && json.code === 'cli_unavailable') await loadRuntimeCapabilities();
 }
 
@@ -2271,8 +2275,9 @@ async function sendConversationMessage() {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   if (!json.ok) {
-    setConversationRunning(false, json.message || json.error || '讨论失败');
-    return toast(json.message || json.error || '讨论失败', true);
+    const message = userFacingApiError(json, '讨论失败');
+    setConversationRunning(false, message);
+    return toast(message, true);
   }
   conversationState.active = normalizeHostConversationSession(json.session);
   setConversationSource(conversationState.active.sourceQuote);

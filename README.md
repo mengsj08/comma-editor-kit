@@ -1,6 +1,6 @@
 # Comma Editor Kit
 
-> Status: `v0.3` private canonical repository. Code home: `/Users/a1234/Documents/AI-Agent-Hub/comma-editor-kit`.
+> Status: `v0.3` private canonical repository. Example local code home on June's Mac: `/Users/a1234/Documents/AI-Agent-Hub/comma-editor-kit`.
 
 Comma Editor Kit is a local-first Markdown review and revision component. It turns the proven editor kernel from `md-collab-editor-spike` into one host-neutral source that can run in a workbench, a normal web page, or a Chrome Side Panel. The repository also contains Comma Review Studio as the feature-complete reference host for structured AI review and native comment writeback.
 

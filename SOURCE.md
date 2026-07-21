@@ -2,8 +2,8 @@
 
 The component boundary was derived from two local, June-owned implementations:
 
-- `/Users/a1234/Documents/TaskSpace/_projects/md-collab-editor-spike`
-- `/Users/a1234/skills/skills/academic-paper-review-workbench/assets/site/editor`
+- Example local source snapshot on June's Mac: `/Users/a1234/Documents/TaskSpace/_projects/md-collab-editor-spike`
+- Example local source snapshot on June's Mac: `/Users/a1234/skills/skills/academic-paper-review-workbench/assets/site/editor`
 
 The source audit on 2026-07-18 found `markdown.js` and `anchor.js` byte-identical across the two implementations while their page assemblers had already diverged. That evidence defined the reusable boundary.
 

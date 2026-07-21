@@ -2,9 +2,9 @@
 
 ## 2026-07-18 promotion
 
-The canonical code home moved from the active TaskSpace prototype at `/Users/a1234/Documents/TaskSpace/_projects/comma-editor-kit` to this independent private repository.
+The canonical code home moved from the active TaskSpace prototype at the June-local path `/Users/a1234/Documents/TaskSpace/_projects/comma-editor-kit` to this independent private repository.
 
-The unique structured-review implementation from `/Users/a1234/Documents/TaskSpace/_projects/md-collab-editor-spike` was copied into `apps/review-studio/` as a reference host. This preserves the working AI Review and comment-writeback workflow while the host is progressively changed to consume the shared `<comma-editor>` component.
+The unique structured-review implementation from the June-local path `/Users/a1234/Documents/TaskSpace/_projects/md-collab-editor-spike` was copied into `apps/review-studio/` as a reference host. This preserves the working AI Review and comment-writeback workflow while the host is progressively changed to consume the shared `<comma-editor>` component.
 
 The migration deliberately excluded:
 

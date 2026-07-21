@@ -4,22 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-ACADEMIC_RUBRIC_PATH = Path(
-    "/Users/a1234/skills/skills/academic-paper-review-workbench/"
-    "references/academic-paper-review.md"
-)
 MANIFEST_ROOT = Path(__file__).with_name("review_agent_manifests")
+BUNDLED_ACADEMIC_RUBRIC_PATH = MANIFEST_ROOT / "rubrics" / "academic-paper-review.md"
+ACADEMIC_RUBRIC_PATH = BUNDLED_ACADEMIC_RUBRIC_PATH
 ACADEMIC_MANIFEST_PATH = MANIFEST_ROOT / "academic-paper-review.json"
 ACADEMIC_ADAPTER_ID = "academic-paper-review"
 ACADEMIC_ADAPTER_VERSION = "internal-gate3"
 ACADEMIC_PROFILE_ID = "primary"
 ACADEMIC_OUTPUT_SCHEMA_VERSION = "academic-paper-review-result/v1"
 REVIEW_AGENT_REGISTRY_VERSION = "comma-review-agent-registry/v1"
+ACADEMIC_RUBRIC_CANONICAL_SHA256 = "sha256:3b247cac76feb8508445cb3b1eaa8d68f4bbb57a8eed74f47e4c512185352a48"
+ACADEMIC_BUNDLED_RUBRIC_SHA256 = "sha256:7ee6f1c778ed2a35fd3ce6d911c802f849d2ad86e87109bd9c8ea8c77bd1da42"
 
 
 class ReviewAgentError(ValueError):
@@ -60,13 +61,75 @@ def _clean_text(value: Any, limit: int = 4000) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _installed_rubric_candidates() -> list[tuple[Path, str]]:
+    candidates: list[tuple[Path, str]] = []
+    workspace_root = _repo_root()
+    for root in (workspace_root, *workspace_root.parents):
+        candidates.extend([
+            (root / ".agents" / "skills" / "academic-paper-review" / "SKILL.md", "installed_skill"),
+            (root / ".claude" / "skills" / "academic-paper-review" / "SKILL.md", "installed_skill"),
+        ])
+    home = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser()
+    candidates.extend([
+        (codex_home / "skills" / "academic-paper-review" / "SKILL.md", "installed_skill"),
+        (home / ".agents" / "skills" / "academic-paper-review" / "SKILL.md", "installed_skill"),
+        (home / "skills" / "skills" / "academic-paper-review" / "SKILL.md", "installed_skill"),
+        (
+            home / "skills" / "skills" / "academic-paper-review-workbench"
+            / "references" / "academic-paper-review.md",
+            "installed_workbench_reference",
+        ),
+    ])
+    return candidates
+
+
+def _rubric_lookup_order() -> list[dict]:
+    rows = [
+        {"mode": mode, "path": str(path)}
+        for path, mode in _installed_rubric_candidates()
+    ]
+    rows.append({
+        "mode": "bundled_compatibility_reference",
+        "path": str(BUNDLED_ACADEMIC_RUBRIC_PATH),
+    })
+    return rows
+
+
 def _rubric_source() -> dict:
-    if not ACADEMIC_RUBRIC_PATH.is_file():
-        raise ReviewAgentError(f"rubric source not found: {ACADEMIC_RUBRIC_PATH}")
-    return {
-        "path": str(ACADEMIC_RUBRIC_PATH),
-        "sha256": sha256_path(ACADEMIC_RUBRIC_PATH),
-    }
+    candidates = [
+        *_installed_rubric_candidates(),
+        (BUNDLED_ACADEMIC_RUBRIC_PATH, "bundled_compatibility_reference"),
+    ]
+    seen: set[Path] = set()
+    mismatches: list[str] = []
+    for candidate, mode in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not resolved.is_file():
+            continue
+        digest = sha256_path(resolved)
+        if digest in {ACADEMIC_RUBRIC_CANONICAL_SHA256, ACADEMIC_BUNDLED_RUBRIC_SHA256}:
+            return {"path": str(resolved), "sha256": digest, "mode": mode}
+        mismatches.append(f"{resolved} ({digest})")
+    raise ReviewAgentError(
+        "academic-paper-review rubric unavailable or hash mismatch; checked "
+        + "; ".join([item["path"] for item in _rubric_lookup_order()])
+        + (f"; mismatches: {'; '.join(mismatches)}" if mismatches else "")
+    )
+
+
+def _manifest_rubric_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = MANIFEST_ROOT / path
+    return path.resolve()
 
 
 def _load_manifest(path: Path) -> dict:
@@ -80,7 +143,6 @@ def _load_manifest(path: Path) -> dict:
 
 
 def academic_paper_review_manifest() -> dict:
-    rubric = _rubric_source()
     manifest = _load_manifest(ACADEMIC_MANIFEST_PATH)
     if manifest.get("adapter_id") != ACADEMIC_ADAPTER_ID:
         raise ReviewAgentError("academic adapter manifest id mismatch")
@@ -90,12 +152,26 @@ def academic_paper_review_manifest() -> dict:
         raise ReviewAgentError("academic adapter profile mismatch")
     if manifest.get("output_schema_version") != ACADEMIC_OUTPUT_SCHEMA_VERSION:
         raise ReviewAgentError("academic adapter output schema mismatch")
-    source = manifest.get("rubric_source") if isinstance(manifest.get("rubric_source"), dict) else {}
-    if source.get("path") != rubric["path"] or source.get("sha256") != rubric["sha256"]:
-        raise ReviewAgentError("academic adapter rubric source mismatch")
-    if manifest.get("rubric_version") != rubric["sha256"]:
+    bundled = manifest.get("rubric_source") if isinstance(manifest.get("rubric_source"), dict) else {}
+    bundled_path = _manifest_rubric_path(str(bundled.get("path") or ""))
+    if not bundled_path.is_file():
+        raise ReviewAgentError(f"bundled academic rubric not found: {bundled_path}")
+    bundled_sha256 = sha256_path(bundled_path)
+    if bundled.get("sha256") != bundled_sha256:
+        raise ReviewAgentError("academic adapter bundled rubric source mismatch")
+    if manifest.get("rubric_version") != ACADEMIC_RUBRIC_CANONICAL_SHA256:
         raise ReviewAgentError("academic adapter rubric version mismatch")
-    return manifest
+    rubric = _rubric_source()
+    return {
+        **manifest,
+        "rubric_source": rubric,
+        "bundled_rubric_source": {
+            "path": str(bundled.get("path") or ""),
+            "resolved_path": str(bundled_path),
+            "sha256": bundled_sha256,
+        },
+        "rubric_lookup_order": _rubric_lookup_order(),
+    }
 
 
 def review_agent_result_schema() -> dict:
@@ -244,15 +320,18 @@ def _evidence_summary(evidence_sources: list[dict]) -> str:
 
 def _build_prompt(*, document_body: str, document_path: str, document_rev: str,
                   instruction: str, review_input: dict, evidence_sources: list[dict]) -> str:
-    rubric_text = ACADEMIC_RUBRIC_PATH.read_text(encoding="utf-8")
+    rubric = _rubric_source()
+    rubric_path = Path(rubric["path"])
+    rubric_text = rubric_path.read_text(encoding="utf-8")
     schema_text = json.dumps(review_agent_result_schema(), ensure_ascii=False, indent=2)
     return f"""You are the internal Academic Paper Review agent for Comma Review Studio.
 The host, not you, owns provider execution, anchoring, finding state, comments, and writeback.
 Do not call tools, shell, web search, public literature lookup, or external connectors.
 Return exactly one JSON object matching ReviewAgentResult and no Markdown fence.
 
-Rubric source: {ACADEMIC_RUBRIC_PATH}
-Rubric sha256: {sha256_path(ACADEMIC_RUBRIC_PATH)}
+Rubric source: {rubric_path}
+Rubric sha256: {rubric["sha256"]}
+Rubric mode: {rubric.get("mode") or "unknown"}
 Output schema version: {ACADEMIC_OUTPUT_SCHEMA_VERSION}
 
 Canonical review input JSON:

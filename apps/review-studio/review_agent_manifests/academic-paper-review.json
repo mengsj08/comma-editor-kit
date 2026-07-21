@@ -13,9 +13,13 @@
   },
   "writeback_default": "preview",
   "rubric_source": {
-    "path": "/Users/a1234/skills/skills/academic-paper-review-workbench/references/academic-paper-review.md",
-    "sha256": "sha256:3b247cac76feb8508445cb3b1eaa8d68f4bbb57a8eed74f47e4c512185352a48"
+    "path": "rubrics/academic-paper-review.md",
+    "sha256": "sha256:7ee6f1c778ed2a35fd3ce6d911c802f849d2ad86e87109bd9c8ea8c77bd1da42"
   },
+  "rubric_lookup_order": [
+    "installed academic-paper-review skill",
+    "bundled manifest rubric copy"
+  ],
   "forbidden_capabilities": [
     "shell",
     "direct_comment_write",

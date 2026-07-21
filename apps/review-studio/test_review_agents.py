@@ -16,6 +16,7 @@ import server
 
 
 RUBRIC_HASH = "sha256:3b247cac76feb8508445cb3b1eaa8d68f4bbb57a8eed74f47e4c512185352a48"
+BUNDLED_RUBRIC_HASH = "sha256:7ee6f1c778ed2a35fd3ce6d911c802f849d2ad86e87109bd9c8ea8c77bd1da42"
 
 
 class ReviewAgentTests(unittest.TestCase):
@@ -91,9 +92,16 @@ class ReviewAgentTests(unittest.TestCase):
         self.assertEqual(manifest["adapter_id"], "academic-paper-review")
         self.assertEqual(manifest["kind"], "declarative-profile")
         self.assertEqual(manifest["trust"], "internal")
-        self.assertEqual(manifest["rubric_source"]["path"], str(review_agents.ACADEMIC_RUBRIC_PATH))
+        with open(review_agents.ACADEMIC_MANIFEST_PATH, encoding="utf-8") as handle:
+            manifest_file = json.load(handle)
+        self.assertEqual(manifest_file["rubric_source"]["path"], "rubrics/academic-paper-review.md")
+        self.assertNotIn("/Users/" + "a1234", manifest_file["rubric_source"]["path"])
+        self.assertEqual(manifest_file["rubric_source"]["sha256"], BUNDLED_RUBRIC_HASH)
         self.assertEqual(manifest["rubric_source"]["sha256"], RUBRIC_HASH)
+        self.assertEqual(manifest["rubric_source"]["mode"], "installed_workbench_reference")
+        self.assertEqual(manifest["bundled_rubric_source"]["sha256"], BUNDLED_RUBRIC_HASH)
         self.assertEqual(manifest["rubric_version"], RUBRIC_HASH)
+        self.assertEqual(manifest["rubric_lookup_order"][-1]["mode"], "bundled_compatibility_reference")
         self.assertEqual(manifest["writeback_default"], "preview")
         self.assertEqual(manifest["reviews"]["canonical_document"], True)
         self.assertEqual(manifest["reviews"]["original_materials"], "optional-evidence-sources")
@@ -124,11 +132,21 @@ class ReviewAgentTests(unittest.TestCase):
         self.assertEqual(prepared.rubric_version, RUBRIC_HASH)
         self.assertEqual(prepared.output_schema_version, "academic-paper-review-result/v1")
         self.assertEqual(prepared.review_input, review_input)
-        self.assertIn(str(review_agents.ACADEMIC_RUBRIC_PATH), prepared.prompt)
+        self.assertIn(str(adapter.manifest["rubric_source"]["path"]), prepared.prompt)
         self.assertIn(RUBRIC_HASH, prepared.prompt)
+        self.assertIn("Rubric mode: installed_workbench_reference", prepared.prompt)
         self.assertIn("ReviewAgentResult JSON schema", prepared.prompt)
         self.assertEqual(prepared.output_schema["properties"]["schema_version"]["const"],
                          "academic-paper-review-result/v1")
+
+    def test_rubric_resolver_falls_back_to_bundled_copy_without_installed_skill(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            with mock.patch.dict(os.environ, {"HOME": tmp, "CODEX_HOME": os.path.join(tmp, ".codex")}):
+                source = review_agents._rubric_source()
+        self.assertEqual(source["mode"], "bundled_compatibility_reference")
+        self.assertEqual(source["sha256"], BUNDLED_RUBRIC_HASH)
+        self.assertTrue(source["path"].endswith("review_agent_manifests/rubrics/academic-paper-review.md"))
 
     def test_review_agent_result_validation_strips_host_state_and_rejects_invalid_input(self):
         valid = {

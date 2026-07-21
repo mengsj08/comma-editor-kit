@@ -135,6 +135,7 @@ AI_TOOLS = {
     "claude": {"label": "Claude CLI", "auth_args": ("auth", "status")},
     "codex": {"label": "Codex CLI", "auth_args": ("login", "status")},
 }
+CLI_UNAVAILABLE_GUIDE = "未检测到可用 CLI，请安装并登录 Codex 或 Claude CLI"
 _CLI_FALLBACK_DIRS = (
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -327,7 +328,7 @@ def _require_cli(tool):
         reason = "登录状态检测失败"
     else:
         reason = "未安装或不在可检测路径中"
-    raise CliUnavailableError(f"{status['label']} {reason}；请从右上角 CLI 状态重新检测。")
+    raise CliUnavailableError(f"{CLI_UNAVAILABLE_GUIDE}（{status['label']} {reason}）")
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
@@ -1471,6 +1472,7 @@ def _summarize_evidence_source(doc: str, evidence_id: str, tool: str,
         raise ValueError("explicit confirmation is required before PDF text enters a CLI/provider")
     if tool not in AI_TOOLS:
         raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+    _require_cli(tool)
     record = _load_evidence_source(doc, evidence_id)
     if record.get("extraction_status") not in {"usable", "partial"}:
         raise ValueError("evidence source has no usable text to summarize")
@@ -1782,6 +1784,7 @@ def _generate_document_summary(doc: str, *, base_rev: str, tool: str,
         )
     if tool not in AI_TOOLS:
         raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+    _require_cli(tool)
     with _MUTATION_LOCK:
         existing = [
             item for item in _load_summary_ledger(doc).get("summaries") or []
@@ -6927,6 +6930,7 @@ class Handler(BaseHTTPRequestHandler):
         tool = _clean_text(payload.get("tool") or "claude", 16).lower()
         if tool not in AI_TOOLS:
             raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        _require_cli(tool)
         rubric = _clean_text(payload.get("rubric") or "scientific peer review and source-check", 2000)
         instruction = _clean_text(payload.get("instruction"), 3000)
         writeback_policy = _clean_text(payload.get("writeback_policy") or "auto-ready", 32)
@@ -7036,6 +7040,7 @@ class Handler(BaseHTTPRequestHandler):
         tool = str(payload.get("tool") or "codex").strip().lower()
         if tool not in AI_TOOLS:
             raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        _require_cli(tool)
         agent_identity = _review_agent_identity_from_payload(payload)
         rubric = _clean_text(payload.get("rubric") or "scientific peer review and source-check", 2000)
         instruction = _clean_text(payload.get("instruction"), 3000)
@@ -7228,6 +7233,8 @@ class Handler(BaseHTTPRequestHandler):
         if not message:
             raise ValueError("message required")
         session = _load_session(session_id)
+        tool = session.get("tool") or "claude"
+        _require_cli(tool)
         doc = _safe_doc_path(session.get("doc_path"))
         with open(doc, encoding="utf-8") as fh:
             body = fh.read()
@@ -7239,7 +7246,7 @@ class Handler(BaseHTTPRequestHandler):
         with _MUTATION_LOCK:
             _save_session(session)
         try:
-            result = _invoke_ai(session.get("tool") or "claude",
+            result = _invoke_ai(tool,
                                 _continue_review_prompt(body, session, message),
                                 schema=_CONTINUE_REVIEW_SCHEMA)
             parsed = _extract_json(result["output"])
@@ -7318,6 +7325,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("prompt required")
         if tool not in AI_TOOLS:
             raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        _require_cli(tool)
         full = prompt
         if selection:
             full = f"Selected passage:\n{selection}\n\nInstruction:\n{prompt}"
@@ -7345,6 +7353,7 @@ class Handler(BaseHTTPRequestHandler):
         tool = _clean_text(payload.get("tool") or "codex", 16).lower()
         if tool not in AI_TOOLS:
             raise ValueError(f"unknown tool '{tool}' (want claude|codex)")
+        _require_cli(tool)
         message = _clean_text(payload.get("message"), 6000)
         if not message:
             raise ValueError("message required")
@@ -7397,6 +7406,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _continue_conversation(self, session_id, payload):
         session = _load_conversation(session_id)
+        tool = session.get("tool") or "codex"
+        _require_cli(tool)
         doc = _safe_doc_path(session.get("doc_path"))
         with open(doc, encoding="utf-8") as fh:
             body = fh.read()
@@ -7438,10 +7449,7 @@ class Handler(BaseHTTPRequestHandler):
         with _MUTATION_LOCK:
             _save_conversation(session)
         try:
-            result = _invoke_ai(
-                session.get("tool") or "codex",
-                _conversation_prompt(session, message, parent_id), timeout=180,
-            )
+            result = _invoke_ai(tool, _conversation_prompt(session, message, parent_id), timeout=180)
             assistant = {
                 "id": _new_id("msg-", 10), "role": "assistant",
                 "author": session.get("tool") or "AI",

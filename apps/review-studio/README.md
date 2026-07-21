@@ -84,6 +84,8 @@ npm run test:review
 CI=true /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python -m pytest apps/review-studio/ -q
 ```
 
+The absolute Python path above is a June-local example; external testers can use any Python 3.10+ interpreter.
+
 `pytest apps/review-studio/` collects the API, orchestrator, and Slice A
 contract tests. It does not run `test_headless.py`: that file is an
 executable Playwright acceptance script with a `main()` entrypoint, not a pytest
@@ -97,11 +99,15 @@ terminal:
 COMMA_REVIEW_PORT=8891 /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python apps/review-studio/server.py
 ```
 
+The absolute Python path above is a June-local example; external testers can use `python3`.
+
 Then run both executable browser acceptance scripts from a second terminal:
 
 ```bash
 CI=true COMMA_REVIEW_PORT=8891 /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python apps/review-studio/test_headless.py
 CI=true COMMA_REVIEW_PORT=8891 /Users/a1234/Documents/AI-Agent-Hub/kanban-personal/shared/toolkit/kanban/.venv/bin/python apps/review-studio/test_blocks.py
 ```
+
+The absolute Python paths above are June-local examples for the existing Playwright environment.
 
 See `REVIEW_WORKFLOW.md` for the API and writeback contract. `SPIKE_REPORT.md` is retained only as migration provenance.
