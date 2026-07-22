@@ -20,6 +20,10 @@ COMMA_REVIEW_DATA_ROOT=/absolute/private/directory COMMA_REVIEW_PORT=8891 python
 
 The server binds only to `127.0.0.1`. It accepts Markdown files only and confines document access to the selected data root. Private documents, comment sidecars, review sessions, quote conversation ledgers, event ledgers, logs, screenshots, and raw model traces must not be committed.
 
+`--host` is intentionally restricted before bind to `127.0.0.1` or
+`localhost`. v0 does not support `::1`, wildcard binds, LAN addresses, or a
+remote Review Studio mode.
+
 ## Version and export center
 
 Every successful immediate save records a content-addressed snapshot under
@@ -60,6 +64,13 @@ Capability detection runs only `--version` and read-only login-status commands;
 their authentication output is discarded and page load never starts a model
 task.
 
+Structured review runs use the local asynchronous executor. Run state includes
+`queued`, `running`, `cancelling`, `cancelled`, `completed`, and `failed`.
+Cancelling a controlled provider run terminates its process tree and records a
+receipt. The queue and active thread registry are in memory: host restart does
+not resume a model call. On startup, persisted active runs are marked failed
+with a host-restart recovery reason.
+
 ## Comment lifecycle migration
 
 Legacy comment sidecars remain readable without a write. Inspect a copied data
@@ -74,6 +85,22 @@ records first and creates byte-identical sidecar/session backups under
 `.comma-review/migration-backups/` before the first normalized write. The
 command reports counts and field names only; it does not print comment or
 manuscript content.
+
+## Store audit
+
+Inspect a data root without writing, reconciling, migrating, or printing private
+body/comment/evidence/trace text:
+
+```bash
+python3 review_store_audit.py --data-root /absolute/path/to/data
+python3 review_store_audit.py --data-root /absolute/path/to/data --json
+```
+
+Exit codes are stable: `0` clean, `1` warnings such as old schemas, orphaned
+sidecars, missing documents, missing version/evidence pairings, or unfinished
+operation journal entries, and `2` errors for data that cannot be safely read
+or parsed. The JSON output carries the same counts, redacted paths, warning
+codes, and error codes as the human output.
 
 ## Verify
 

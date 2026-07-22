@@ -7784,6 +7784,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     HOST = args.host
     PORT = args.port
+    if HOST not in {"127.0.0.1", "localhost"}:
+        parser.error(
+            "--host may only be 127.0.0.1 or localhost; refusing to expose "
+            "the private manuscript service on a non-loopback interface"
+        )
     if args.doctor:
         report = doctor_report()
         print_doctor_report(report)
