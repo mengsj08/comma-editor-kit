@@ -9,6 +9,7 @@ registerCommaEditor();
 
 const DOC_PATH = new URLSearchParams(location.search).get('doc') || 'paper.md';
 const DOCUMENT_SWITCH_TOAST_KEY = 'comma-review:document-switch-toast';
+const DEFAULT_AI_TOOL = 'codex';
 const $ = (id) => document.getElementById(id);
 const editor = $('comma-editor');
 const reviewState = {
@@ -740,7 +741,7 @@ async function loadDocumentSummary() {
 
 async function generateDocumentSummary(regenerate = false) {
   if (overviewState.loading) return;
-  const tool = $('overview-tool').value || 'codex';
+  const tool = $('overview-tool').value || DEFAULT_AI_TOOL;
   if (!await requireRuntimeTool(tool, 'structured_review')) return;
   overviewState.loading = true;
   $('overview-state').hidden = false;
@@ -1263,7 +1264,7 @@ function downloadExport(format) {
 }
 
 function selectedReviewTool() {
-  return document.querySelector('input[name="review-tool"]:checked')?.value || 'codex';
+  return document.querySelector('input[name="review-tool"]:checked')?.value || DEFAULT_AI_TOOL;
 }
 
 function selectedReviewAgentIdentity() {
@@ -2022,7 +2023,7 @@ function resetReviewComposer() {
 }
 
 function selectedConversationTool() {
-  return document.querySelector('input[name="conversation-tool"]:checked')?.value || 'codex';
+  return document.querySelector('input[name="conversation-tool"]:checked')?.value || DEFAULT_AI_TOOL;
 }
 
 function sourceQuotePayload(sourceQuote) {

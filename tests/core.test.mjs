@@ -105,9 +105,11 @@ test('review studio AI surfaces keep Slice C placeholders disciplined', () => {
   assert.doesNotMatch(header, /btn-import|btn-evidence|btn-quick-explain|btn-selection-discuss/);
   assert.doesNotMatch(header, /Zotero|Obsidian/i);
   assert.deepEqual([...reviewLauncher.matchAll(/name="review-tool" value="([^"]+)"/g)].map((match) => match[1]), [
-    'claude',
+    'bigapple',
     'codex',
+    'claude',
   ]);
+  assert.match(reviewLauncher, /name="review-tool" value="codex" checked/);
   assert.match(reviewLauncher, /<strong>APR<\/strong>/);
 });
 

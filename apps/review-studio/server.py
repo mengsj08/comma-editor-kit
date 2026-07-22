@@ -689,6 +689,12 @@ def _resolve_node_runtime() -> str:
     candidate = shutil.which("node", path=_cli_search_path())
     if candidate and os.path.isfile(candidate) and (_is_windows() or os.access(candidate, os.X_OK)):
         return os.path.realpath(candidate)
+    # Windows portable packages place Node beside app/ under payload/runtime/node.
+    portable_candidate = os.path.realpath(os.path.join(
+        _project_root(), "..", "runtime", "node", "node.exe",
+    ))
+    if os.path.isfile(portable_candidate) and (_is_windows() or os.access(portable_candidate, os.X_OK)):
+        return portable_candidate
     return ""
 
 

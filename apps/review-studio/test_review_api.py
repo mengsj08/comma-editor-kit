@@ -295,6 +295,42 @@ class ReviewApiTests(unittest.TestCase):
             self.assertIn(os.path.dirname(executable), child_path)
             self.assertIn("/opt/homebrew/bin", child_path)
 
+    def test_node_runtime_uses_portable_windows_candidate_after_path_lookup(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            app_root = os.path.join(tmp, "payload", "app")
+            portable_node = os.path.join(tmp, "payload", "runtime", "node", "node.exe")
+            os.makedirs(os.path.dirname(portable_node))
+            with open(portable_node, "wb") as fh:
+                fh.write(b"portable node fixture")
+            with mock.patch.dict(server.os.environ, {
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            }, clear=False), \
+                    mock.patch.object(server, "_project_root", return_value=app_root), \
+                    mock.patch.object(server.shutil, "which", return_value=""), \
+                    mock.patch.object(server, "_is_windows", return_value=True):
+                self.assertEqual(server._resolve_node_runtime(), portable_node)
+
+    def test_static_provider_controls_include_bigapple_without_changing_codex_defaults(self):
+        editor_path = os.path.join(server.ROOT, "static", "editor.html")
+        app_path = os.path.join(server.ROOT, "static", "app.js")
+        with open(editor_path, encoding="utf-8") as fh:
+            html = fh.read()
+        with open(app_path, encoding="utf-8") as fh:
+            js = fh.read()
+
+        self.assertIn('<option value="bigapple">BigApple</option>', html)
+        self.assertIn('<select id="evidence-summary-tool"><option value="codex">Codex</option>', html)
+        self.assertIn('<select id="overview-tool" aria-label="文章总览生成工具">\n              <option value="codex">Codex</option>', html)
+        self.assertIn('name="review-tool" value="bigapple"', html)
+        self.assertIn('name="conversation-tool" value="bigapple"', html)
+        self.assertIn('name="review-tool" value="codex" checked', html)
+        self.assertIn('name="conversation-tool" value="codex" checked', html)
+        self.assertIn("const DEFAULT_AI_TOOL = 'codex';", js)
+        self.assertIn("querySelector('input[name=\"review-tool\"]:checked')?.value || DEFAULT_AI_TOOL", js)
+        self.assertIn("querySelector('input[name=\"conversation-tool\"]:checked')?.value || DEFAULT_AI_TOOL", js)
+        self.assertIn("$('overview-tool').value || DEFAULT_AI_TOOL", js)
+
     def test_unavailable_cli_is_a_service_error_not_a_successful_stub(self):
         unavailable = {
             "id": "codex", "label": "Codex CLI", "available": False,

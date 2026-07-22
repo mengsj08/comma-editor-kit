@@ -30,7 +30,7 @@
         </button>
         <aside id="cli-popover" class="cli-popover" aria-label="本机 CLI 状态" hidden>
           <header><div><strong>本机 AI CLI</strong><small>状态与快速解释、讨论和完整评审共用</small></div></header>
-          <div id="cli-popover-list" class="cli-popover-list"><p>正在检测 Codex 与 Claude…</p></div>
+          <div id="cli-popover-list" class="cli-popover-list"><p>正在检测 BigApple、Codex 与 Claude…</p></div>
           <footer><button id="cli-redetect" type="button">重新检测</button></footer>
         </aside>
       </div>
@@ -102,7 +102,7 @@
     </section>
     <section class="evidence-summary-policy">
       <label>AI 摘要工具
-        <select id="evidence-summary-tool"><option value="codex">Codex</option><option value="claude">Claude</option></select>
+        <select id="evidence-summary-tool"><option value="codex">Codex</option><option value="bigapple">BigApple</option><option value="claude">Claude</option></select>
       </label>
       <p>添加 PDF 时不调用 AI。只有逐份点击“生成摘要”并确认后，提取出的 PDF 文本才会交给所选 CLI/provider。</p>
     </section>
@@ -145,6 +145,7 @@
           <label>生成工具
             <select id="overview-tool" aria-label="文章总览生成工具">
               <option value="codex">Codex</option>
+              <option value="bigapple">BigApple</option>
               <option value="claude">Claude</option>
             </select>
           </label>
@@ -203,7 +204,7 @@
     </div>
     <section class="preflight-boundary">
       <div><span>ROUTING BASIS</span><strong id="review-preflight-baseline">尚未确定基线</strong></div>
-      <p id="review-preflight-reason">预检只比较 revision、块 hash、批注事件与锚点；此阶段不调用 Codex 或 Claude。</p>
+      <p id="review-preflight-reason">预检只比较 revision、块 hash、批注事件与锚点；此阶段不调用 BigApple、Codex 或 Claude。</p>
     </section>
     <footer class="preflight-actions">
       <button id="review-preflight-cancel" type="button">取消</button>
@@ -224,8 +225,9 @@
     <div class="review-launcher">
       <div class="review-launch-row">
         <div class="tool-switch" aria-label="AI 工具">
-          <label><input type="radio" name="review-tool" value="claude"><span>Claude</span></label>
+          <label><input type="radio" name="review-tool" value="bigapple"><span>BigApple</span></label>
           <label><input type="radio" name="review-tool" value="codex" checked><span>Codex</span></label>
+          <label><input type="radio" name="review-tool" value="claude"><span>Claude</span></label>
         </div>
         <div class="review-policy"><strong>APR</strong><span>首轮生成预览 · 显式加入主评审</span></div>
       </div>
@@ -339,8 +341,9 @@
       </button>
       <div class="conversation-toolbar">
         <div class="tool-switch conversation-tool-switch" aria-label="讨论所用 AI">
-          <label><input type="radio" name="conversation-tool" value="claude"><span>Claude</span></label>
+          <label><input type="radio" name="conversation-tool" value="bigapple"><span>BigApple</span></label>
           <label><input type="radio" name="conversation-tool" value="codex" checked><span>Codex</span></label>
+          <label><input type="radio" name="conversation-tool" value="claude"><span>Claude</span></label>
         </div>
         <button id="conversation-evidence-open" class="conversation-evidence-open" type="button">+ 参考资料</button>
         <div id="conversation-history" class="conversation-history"></div>
